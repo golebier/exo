@@ -38,6 +38,11 @@ bench/**/*.json
 # tmp
 tmp/models
 /build/exo
+
+# build outputs
+output/
+*.dmg
+*.sha256
 /.agents
 /.claude/skills
 /.claude
