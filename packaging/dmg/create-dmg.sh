@@ -16,6 +16,19 @@ set -euo pipefail
 APP_PATH="${1:?Usage: create-dmg.sh <app-path> <output-dmg> [volume-name]}"
 OUTPUT_DMG="${2:?Usage: create-dmg.sh <app-path> <output-dmg> [volume-name]}"
 VOLUME_NAME="${3:-EXO}"
+shift 3 || true
+
+# Optional flags:
+#   --no-finder  Skip the AppleScript-driven Finder window layout. Useful
+#                for non-interactive shells (CI, agents, remote SSH) where
+#                osascript can't drive Finder.
+CONFIGURE_FINDER=1
+for arg in "$@"; do
+  case "$arg" in
+    --no-finder) CONFIGURE_FINDER=0 ;;
+    *) echo "==> ERROR: unknown flag: $arg"; exit 1 ;;
+  esac
+done
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BACKGROUND_SCRIPT="${SCRIPT_DIR}/generate-background.py"
@@ -44,9 +57,17 @@ cp -R "$APP_PATH" "$DMG_STAGING/"
 ln -s /Applications "$DMG_STAGING/Applications"
 
 # ── Step 3: Create writable DMG ──────────────────────────────────────────────
-# Calculate required size (app size + 20MB headroom)
-APP_SIZE_KB=$(du -sk "$APP_PATH" | cut -f1)
-DMG_SIZE_KB=$((APP_SIZE_KB + 20480))
+# Calculate required size.
+#
+# App size + 200 MB headroom. The 200 MB is generous: HFS+ journals, Finder
+# metadata, the drag-to-Applications layout, and Sparkle XPC services can
+# push the writable mount over the 20 MB "small" headroom. We also pad up to
+# the nearest 64 MiB so the volume doesn't have a weird-looking block count.
+APP_SIZE_BYTES=$(du -sk "$APP_PATH" | cut -f1)
+APP_SIZE_BYTES=$((APP_SIZE_BYTES * 1024))
+DMG_SIZE_BYTES=$((APP_SIZE_BYTES + 200 * 1024 * 1024))
+DMG_SIZE_BYTES=$(((DMG_SIZE_BYTES + 64 * 1024 * 1024 - 1) / (64 * 1024 * 1024) * 64 * 1024 * 1024))
+DMG_SIZE_KB=$((DMG_SIZE_BYTES / 1024))
 
 hdiutil create \
   -volname "$VOLUME_NAME" \
@@ -73,7 +94,13 @@ fi
 # Background image is 1600×740 (2× retina for 800×400 logical window).
 APP_NAME="$(basename "$APP_PATH")"
 
-osascript <<APPLESCRIPT
+if [[ $CONFIGURE_FINDER -eq 0 ]]; then
+  echo "    Skipping Finder layout (--no-finder)"
+else
+  # Drive Finder to set the window layout. The AppleScript can time out in
+  # non-interactive shells (CI, agents, SSH). We use `|| true` so a timeout
+  # is non-fatal; the volume is still usable.
+  if osascript <<APPLESCRIPT
 tell application "Finder"
     tell disk "$VOLUME_NAME"
         open
@@ -98,14 +125,21 @@ tell application "Finder"
     end tell
 end tell
 APPLESCRIPT
-
-echo "    Window layout configured"
+  then
+    echo "    Window layout configured"
+  else
+    echo "    ==> WARNING: Finder configuration timed out. Re-run with --no-finder if needed."
+  fi
+fi
 
 # Ensure Finder updates are flushed
 sync
 
 # ── Step 6: Finalise ─────────────────────────────────────────────────────────
 hdiutil detach "$MOUNT_DIR" -quiet
+
+# Remove the existing output (if any) so `hdiutil convert -o` doesn't refuse.
+rm -f "$OUTPUT_DMG"
 hdiutil convert "$TEMP_DMG" -format UDZO -imagekey zlib-level=9 -o "$OUTPUT_DMG"
 
 echo "==> DMG created: $OUTPUT_DMG"
