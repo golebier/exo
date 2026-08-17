@@ -87,6 +87,122 @@ class HostList(RootModel[list[str]]):
         return cls(root=[str(host) for host in hosts])
 
 
+JACCL_RDMA_PROBE_SCRIPT = """\
+import json, os, tempfile
+import mlx.core as mx
+rank = __RANK__
+iface = __IFACE__
+coordinator = __COORDINATOR__
+coord_file = os.path.join(tempfile.mkdtemp(), f'probe_{rank}_{iface}.json')
+devices = [[None, iface], [iface, None]]
+with open(coord_file, 'w') as f:
+    json.dump(devices, f)
+os.environ['MLX_IBV_DEVICES'] = coord_file
+os.environ['MLX_RANK'] = str(rank)
+os.environ['MLX_JACCL_COORDINATOR'] = coordinator
+group = mx.distributed.init(backend='jaccl', strict=True)
+mx.eval(mx.distributed.all_sum(mx.array(1.0), group=group))
+print('OK')
+"""
+
+
+def _get_available_rdma_devices() -> list[str]:
+    """List available RDMA device names (e.g. rdma_en2, rdma_en3, ...)."""
+    import subprocess
+
+    try:
+        proc = subprocess.run(
+            ["ibv_devices"], capture_output=True, text=True, timeout=5
+        )
+        if proc.returncode != 0:
+            return []
+        devices: list[str] = []
+        for line in proc.stdout.splitlines()[2:]:  # skip header
+            parts = line.split()
+            if parts:
+                devices.append(parts[0])
+        return devices
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _probe_rdma_interface(
+    rank: int,
+    jaccl_devices: list[list[str | None]],
+    jaccl_coordinator: str,
+    tmpdir: str,
+) -> str:
+    """Determine which RDMA interface actually works for JACCL collectives.
+
+    JACCL cannot be re-initialised in-process after a hung collective, so we
+    probe each candidate interface in a **subprocess**.  Both ranks iterate
+    candidates in the same deterministic order and run their probe
+    simultaneously, so the JACCL coordinator and RDMA queue pairs match up.
+
+    Returns the name of the first interface whose warmup ``all_sum`` completes.
+    """
+    import subprocess
+    import sys
+
+    # Build candidate list: interfaces from the placement matrix first (in
+    # order), then any extra ibv devices.  Both ranks see the same ibv device
+    # list so the order is deterministic.
+    candidates: list[str] = []
+    for row in jaccl_devices:
+        for entry in row:
+            if entry is not None and entry not in candidates:
+                candidates.append(entry)
+    for dev in _get_available_rdma_devices():
+        if dev not in candidates:
+            candidates.append(dev)
+
+    logger.info(f"rank {rank} RDMA probe candidates: {candidates}")
+
+    python_exe = sys.executable
+
+    for iface in candidates:
+        logger.info(f"rank {rank} probing RDMA interface {iface}...")
+        # Use -c flag so this works both in dev (python -c) and in the
+        # PyInstaller bundle (exo -c).
+        probe_code = (
+            JACCL_RDMA_PROBE_SCRIPT
+            .replace("__RANK__", str(rank))
+            .replace("__IFACE__", repr(iface))
+            .replace("__COORDINATOR__", repr(jaccl_coordinator))
+        )
+        try:
+            proc = subprocess.run(
+                [python_exe, "-c", probe_code],
+                capture_output=True,
+                text=True,
+                timeout=15.0,
+            )
+        except subprocess.TimeoutExpired:
+            logger.warning(
+                f"rank {rank} probe for {iface} timed out (RDMA data path "
+                "broken on this port), trying next candidate"
+            )
+            continue
+
+        if proc.returncode == 0 and "OK" in proc.stdout:
+            logger.info(
+                f"rank {rank} RDMA interface {iface} probe succeeded"
+            )
+            return iface
+
+        stderr_snippet = (proc.stderr or "")[-500:]
+        logger.warning(
+            f"rank {rank} probe for {iface} failed (rc={proc.returncode}): "
+            f"{stderr_snippet}"
+        )
+
+    raise RuntimeError(
+        f"rank {rank}: no working RDMA interface found among {candidates}. "
+        "All candidates either failed init or hung on the warmup all_sum. "
+        "Check Thunderbolt cabling and `ibv_devinfo` for port state."
+    )
+
+
 def mlx_distributed_init(
     bound_instance: BoundInstance,
 ) -> mx.distributed.Group:
@@ -125,13 +241,29 @@ def mlx_distributed_init(
                 assert all(
                     jaccl_devices[i][i] is None for i in range(len(jaccl_devices))
                 )
-                # Use RDMA connectivity matrix
-                jaccl_devices_json = json.dumps(jaccl_devices)
+                jaccl_coordinator = jaccl_coordinators[bound_instance.bound_node_id]
+
+                # Some Thunderbolt/RDMA ports report PORT_ACTIVE and pass the
+                # TCP side-channel handshake but silently hang on the first
+                # RDMA data transfer.  Probe candidate interfaces in a
+                # subprocess (JACCL cannot be re-initialised in-process) and
+                # use the first one whose warmup all_sum completes.
+                selected_iface = _probe_rdma_interface(
+                    rank=rank,
+                    jaccl_devices=jaccl_devices,
+                    jaccl_coordinator=jaccl_coordinator,
+                    tmpdir=tmpdir,
+                )
+
+                num_nodes = len(jaccl_devices)
+                devices_matrix: list[list[str | None]] = [
+                    [None if i == j else selected_iface for j in range(num_nodes)]
+                    for i in range(num_nodes)
+                ]
+                jaccl_devices_json = json.dumps(devices_matrix)
 
                 with open(coordination_file, "w") as f:
                     _ = f.write(jaccl_devices_json)
-
-                jaccl_coordinator = jaccl_coordinators[bound_instance.bound_node_id]
 
                 logger.info(
                     f"rank {rank} MLX_IBV_DEVICES: {coordination_file} with devices: {jaccl_devices_json}"
@@ -143,6 +275,14 @@ def mlx_distributed_init(
                 group = mx.distributed.init(backend="jaccl", strict=True)
 
         logger.info(f"Rank {rank} mlx distributed initialization complete")
+
+        # Warm up the distributed backend with a trivial collective *before*
+        # the long, collective-free model-loading phase.  This catches a
+        # broken RDMA data path immediately rather than after 78 layers.
+        if isinstance(bound_instance.instance, MlxJacclInstance):
+            logger.info(f"Rank {rank} warming up JACCL data path")
+            mx.eval(mx.distributed.all_sum(mx.array(1.0), group=group))
+            logger.info(f"Rank {rank} JACCL warmup complete")
 
         return group
 
