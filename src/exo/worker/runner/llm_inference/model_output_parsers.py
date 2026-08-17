@@ -476,6 +476,24 @@ def parse_tool_calls(
             continue
 
         if response.finish_reason is not None:
+            # Generation stopped while inside a tool call. This happens when the
+            # tool-call end token is configured as a stop sequence (so the end
+            # marker itself is trimmed from the yielded text). Re-append the end
+            # marker and attempt to parse the complete tool call before falling
+            # back to yielding raw text.
+            combined = "".join(tool_call_text_parts)
+            if not combined.endswith(tool_parser.end_parsing):
+                combined = combined + tool_parser.end_parsing
+            parsed = tool_parser.parse(combined.strip(), tools=tools)
+            if parsed:
+                accumulated_tool_calls.extend(parsed)
+                yield ToolCallResponse(
+                    tool_calls=accumulated_tool_calls,
+                    usage=response.usage,
+                    stats=response.stats,
+                )
+                accumulated_tool_calls.clear()
+                continue
             logger.info(
                 "tool call parsing interrupted, yield partial tool call as text"
             )

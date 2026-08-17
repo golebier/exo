@@ -1,0 +1,22 @@
+model_id = "avlp12/GLM-5.2-Alis-MLX-Dynamic-2.3bpw"
+n_layers = 78
+hidden_size = 6144
+num_key_value_heads = 64
+supports_tensor = true
+tasks = ["TextGeneration"]
+family = "glm"
+quantization = "dynamic-2.3bpw"
+base_model = "GLM-5.2"
+capabilities = ["text", "thinking"]
+reasoning_dialect = "post_last_user"
+context_length = 1048576
+backends = ["MlxMetal", "MlxCuda", "MlxCpu"]
+[storage_size]
+in_bytes = 219751286272
+
+# Source: https://huggingface.co/avlp12/GLM-5.2-Alis-MLX-Dynamic-2.3bpw
+# Source: https://huggingface.co/zai-org/GLM-5.2
+# Source: https://docs.z.ai/api-reference/llm/chat-completion
+[sampling_defaults]
+temperature = 1.0
+top_p = 0.95

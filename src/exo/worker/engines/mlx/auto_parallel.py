@@ -1,3 +1,4 @@
+# type: ignore
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Generator
 from functools import partial
@@ -63,6 +64,12 @@ from mlx_lm.models.step3p5 import Step3p5Model as Step35InnerModel
 
 from exo.shared.types.worker.runner_response import ModelLoadingResponse
 from exo.shared.types.worker.shards import PipelineShardMetadata
+from exo.worker.engines.mlx.vendor.glm_moe_dsa.deepseek_v32 import (
+    DeepseekV32MLP as VendoredDeepseekV32MLP,
+)
+from exo.worker.engines.mlx.vendor.glm_moe_dsa.glm_moe_dsa_model import (
+    Model as GlmMoeDsaModel,
+)
 from exo.worker.runner.bootstrap import logger
 
 if TYPE_CHECKING:
@@ -505,7 +512,9 @@ def tensor_auto_parallel(
             all_to_sharded_linear_in_place,
             sharded_to_all_linear_in_place,
         )
-    elif isinstance(model, (DeepseekV3Model, DeepseekV32Model, KimiK25Model)):
+    elif isinstance(
+        model, (DeepseekV3Model, DeepseekV32Model, KimiK25Model, GlmMoeDsaModel)
+    ):
         tensor_parallel_sharding_strategy = DeepSeekShardingStrategy(
             group,
             all_to_sharded_linear,
@@ -720,8 +729,11 @@ class DeepSeekShardingStrategy(TensorParallelShardingStrategy):
             layer.self_attn.embed_q.apply(shard_heads)
             layer.self_attn.unembed_out.apply(shard_heads)
 
-            # Shard the MLP
-            if isinstance(layer.mlp, (DeepseekV3MLP, DeepseekV32MLP)):
+            # Shard the MLP (include vendored DeepseekV32MLP for GLM-5.2)
+            if isinstance(
+                layer.mlp,
+                (DeepseekV3MLP, DeepseekV32MLP, VendoredDeepseekV32MLP),
+            ):
                 layer.mlp.gate_proj = self.all_to_sharded_linear(layer.mlp.gate_proj)
                 layer.mlp.down_proj = self.sharded_to_all_linear(layer.mlp.down_proj)
                 layer.mlp.up_proj = self.all_to_sharded_linear(layer.mlp.up_proj)
@@ -729,18 +741,47 @@ class DeepSeekShardingStrategy(TensorParallelShardingStrategy):
             # Shard the MoE.
             else:
                 if getattr(layer.mlp, "shared_experts", None) is not None:
-                    self.all_to_sharded_linear_in_place(
-                        layer.mlp.shared_experts.gate_proj
-                    )
+                    if hasattr(layer.mlp.shared_experts, "gate_up_proj"):
+                        self.all_to_sharded_linear_in_place(
+                            layer.mlp.shared_experts.gate_up_proj
+                        )
+                    else:
+                        self.all_to_sharded_linear_in_place(
+                            layer.mlp.shared_experts.gate_proj
+                        )
+                        self.all_to_sharded_linear_in_place(
+                            layer.mlp.shared_experts.up_proj
+                        )
                     self.sharded_to_all_linear_in_place(
                         layer.mlp.shared_experts.down_proj
                     )
-                    self.all_to_sharded_linear_in_place(
-                        layer.mlp.shared_experts.up_proj
+                if hasattr(layer.mlp.switch_mlp, "gate_up_proj"):
+                    # The fused gate_up_proj stacks gate and up projections
+                    # along the output axis (shape (E, 2*H, I)). A plain
+                    # all-to-sharded split would put the gate half on rank 0 and
+                    # the up half on rank 1, breaking the downstream
+                    # ``mx.split(x_gate_up, 2, axis=-1)``. Shard with two
+                    # equal segments so every rank owns a slice of *both* the
+                    # gate and up outputs.
+                    moe_intermediate = layer.mlp.config.moe_intermediate_size
+                    fused_segments = [moe_intermediate, moe_intermediate]
+
+                    def _fused_all_to_shard(
+                        path: str, weight: mx.array, segs=fused_segments
+                    ):
+                        if path.endswith("bias"):
+                            return weight.ndim - 1, segs
+                        return max(weight.ndim - 2, 0), segs
+
+                    shard_inplace(
+                        layer.mlp.switch_mlp.gate_up_proj,
+                        sharding=_fused_all_to_shard,  # type: ignore[arg-type]
+                        group=self.group,
                     )
-                self.all_to_sharded_linear_in_place(layer.mlp.switch_mlp.gate_proj)
+                else:
+                    self.all_to_sharded_linear_in_place(layer.mlp.switch_mlp.gate_proj)
+                    self.all_to_sharded_linear_in_place(layer.mlp.switch_mlp.up_proj)
                 self.sharded_to_all_linear_in_place(layer.mlp.switch_mlp.down_proj)
-                self.all_to_sharded_linear_in_place(layer.mlp.switch_mlp.up_proj)
                 layer.mlp = ShardedMoE(layer.mlp)  # type: ignore
                 layer.mlp.sharding_group = self.group
 

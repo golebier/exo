@@ -55,11 +55,12 @@ def _safe_collect(package_name: str) -> list[str]:
 
 HIDDEN_IMPORTS = sorted(
     set(
-        collect_submodules("mlx")
+        collect_submodules("exo")
+        + collect_submodules("mlx")
         + _safe_collect("mlx_lm")
         + _safe_collect("mlx_vlm")
         + _safe_collect("transformers")
-    )
+    ),
 )
 
 DATAS: list[tuple[str, str]] = [

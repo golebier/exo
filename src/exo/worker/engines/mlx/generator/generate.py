@@ -624,6 +624,14 @@ def mlx_generate(
         if task.stop is not None
         else []
     )
+    # When tools are provided, also stop on the model's tool-call end token so
+    # the generator yields control back to the orchestrator as soon as the model
+    # emits a tool call. Without this, GLM-5.2 keeps generating a hallucinated
+    # ``<|tool_response|>`` block after ``<|/tool_call|>`` instead of stopping.
+    if task.tools:
+        tool_call_end = getattr(tokenizer, "tool_call_end", None)
+        if isinstance(tool_call_end, str) and tool_call_end not in stop_sequences:
+            stop_sequences.append(tool_call_end)
     max_stop_len = max((len(s) for s in stop_sequences), default=0)
 
     maybe_vision_ctx = (

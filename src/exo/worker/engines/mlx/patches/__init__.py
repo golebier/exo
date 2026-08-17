@@ -1,3 +1,4 @@
+from exo.worker.engines.mlx.patches.glm_moe_dsa import apply_glm_moe_dsa_patch
 from exo.worker.engines.mlx.patches.opt_batch_gen import apply_batch_gen_patch
 from exo.worker.engines.mlx.patches.standard_yarn_rope import patch_yarn_rope
 
@@ -11,3 +12,4 @@ def apply_mlx_patches() -> None:
     _applied = True
     patch_yarn_rope()
     apply_batch_gen_patch()
+    apply_glm_moe_dsa_patch()

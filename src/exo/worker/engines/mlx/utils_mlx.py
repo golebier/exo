@@ -400,6 +400,32 @@ def load_tokenizer_for_model_id(
             tool_parser=_parse_kimi_tool_calls,
         )
 
+    # GLM-5.2 (and GLM-5.1) use the same backtick-XCTS tool-call delimiters as
+    # GLM-4.7, but their chat template omits the trailing `XCTS that the
+    # glm47 parser requires. Use the dedicated glm52 parser for these models.
+    if "glm-5.2" in model_id_lower or "glm-5.1" in model_id_lower:
+        from exo.worker.engines.mlx.tool_parsers.glm52 import (
+            parse_tool_call as glm52_parse,
+        )
+        from exo.worker.engines.mlx.tool_parsers.glm52 import (
+            tool_call_end as glm52_end,
+        )
+        from exo.worker.engines.mlx.tool_parsers.glm52 import (
+            tool_call_start as glm52_start,
+        )
+
+        return TokenizerWrapper(
+            load_tokenizer(
+                model_path,
+                tokenizer_config_extra={"trust_remote_code": trust_remote_code},
+                eos_token_ids=eos_token_ids,
+            ),
+            eos_token_ids=eos_token_ids,
+            tool_call_start=glm52_start,
+            tool_call_end=glm52_end,
+            tool_parser=glm52_parse,
+        )
+
     # We should really consider going back to mlx lm load to get tokenizer
     tokenizer = load_tokenizer(
         model_path,
