@@ -70,6 +70,20 @@ class InstanceDeleted(BaseEvent):
     instance_id: InstanceId
 
 
+class InstanceTokensUpdated(BaseEvent):
+    """A completed generation's token delta, attributed to an instance.
+
+    Emitted once per finished request (on the final chunk) by the runner that
+    served it. Folded into
+    :class:`~exo.shared.types.worker.token_usage.InstanceTokenUsage` by
+    :func:`~exo.shared.apply.apply_instance_tokens_updated`.
+    """
+
+    instance_id: InstanceId
+    prompt_tokens: int
+    completion_tokens: int
+
+
 class RunnerStatusUpdated(BaseEvent):
     runner_id: RunnerId
     runner_status: RunnerStatus
@@ -155,6 +169,7 @@ Event = (
     | TaskAcknowledged
     | InstanceCreated
     | InstanceDeleted
+    | InstanceTokensUpdated
     | RunnerStatusUpdated
     | NodeTimedOut
     | NodeGatheredInfo

@@ -228,6 +228,8 @@ interface RawStateResponse {
       MlxJacclInstance?: Instance;
     }
   >;
+  // Cumulative in/out token accounting per instance (creation until deletion).
+  instanceTokenUsage?: Record<string, InstanceTokenUsage>;
   runners?: Record<string, unknown>;
   instanceLinks?: Record<string, RawInstanceLink>;
   downloads?: Record<string, unknown[]>;
@@ -290,6 +292,14 @@ export interface PrefillProgress {
   total: number;
   /** Timestamp (performance.now()) when prefill started. */
   startedAt: number;
+}
+
+export interface InstanceTokenUsage {
+  instanceId: string;
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+  requestCount: number;
 }
 
 export interface Message {
@@ -547,6 +557,7 @@ class AppStore {
   // Topology state
   topologyData = $state<TopologyData | null>(null);
   instances = $state<Record<string, unknown>>({});
+  instanceTokenUsage = $state<Record<string, InstanceTokenUsage>>({});
   runners = $state<Record<string, unknown>>({});
   instanceLinks = $state<Record<string, RawInstanceLink>>({});
   featureFlags = $state<Record<string, boolean>>({});
@@ -1327,6 +1338,7 @@ class AppStore {
         this.instances = data.instances;
         this.refreshConversationModelFromInstances();
       }
+      this.instanceTokenUsage = data.instanceTokenUsage ?? {};
       if (data.runners) {
         this.runners = data.runners;
       }
@@ -3489,6 +3501,7 @@ export const totalTokens = () => appStore.totalTokens;
 export const prefillProgress = () => appStore.prefillProgress;
 export const topologyData = () => appStore.topologyData;
 export const instances = () => appStore.instances;
+export const instanceTokenUsage = () => appStore.instanceTokenUsage;
 export const runners = () => appStore.runners;
 export const instanceLinks = () => appStore.instanceLinks;
 export const featureFlags = () => appStore.featureFlags;

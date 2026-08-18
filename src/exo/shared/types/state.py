@@ -24,6 +24,7 @@ from exo.shared.types.tasks import Task, TaskId
 from exo.shared.types.worker.downloads import DownloadProgress
 from exo.shared.types.worker.instances import Instance, InstanceId
 from exo.shared.types.worker.runners import RunnerId, RunnerStatus
+from exo.shared.types.worker.token_usage import InstanceTokenUsage
 from exo.utils.pydantic_ext import FrozenModel
 
 
@@ -44,6 +45,8 @@ class State(FrozenModel):
         arbitrary_types_allowed=True,
     )
     instances: Mapping[InstanceId, Instance] = {}
+    # Cumulative in/out token accounting per instance (creation until deletion).
+    instance_token_usage: Mapping[InstanceId, InstanceTokenUsage] = {}
     runners: Mapping[RunnerId, RunnerStatus] = {}
     downloads: Mapping[NodeId, Sequence[DownloadProgress]] = {}
     tasks: Mapping[TaskId, Task] = {}

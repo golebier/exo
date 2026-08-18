@@ -17,6 +17,7 @@ from exo.shared.types.events import (
     InstanceDeleted,
     InstanceLinkCreated,
     InstanceLinkDeleted,
+    InstanceTokensUpdated,
     NodeDownloadProgress,
     NodeGatheredInfo,
     NodeTimedOut,
@@ -51,6 +52,7 @@ from exo.shared.types.worker.runners import (
     RunnerShutdown,
     RunnerStatus,
 )
+from exo.shared.types.worker.token_usage import InstanceTokenUsage
 from exo.utils.info_gatherer.info_gatherer import (
     MacmonMetrics,
     MacThunderboltConnections,
@@ -99,6 +101,8 @@ def event_apply(event: Event, state: State) -> State:
             return apply_instance_created(event, state)
         case InstanceDeleted():
             return apply_instance_deleted(event, state)
+        case InstanceTokensUpdated():
+            return apply_instance_tokens_updated(event, state)
         case NodeTimedOut():
             return apply_node_timed_out(event, state)
         case NodeDownloadProgress():
@@ -222,6 +226,12 @@ def apply_instance_deleted(event: InstanceDeleted, state: State) -> State:
     new_instances: Mapping[InstanceId, Instance] = {
         iid: inst for iid, inst in state.instances.items() if iid != event.instance_id
     }
+    # Drop cumulative token accounting for the removed instance.
+    new_token_usage: Mapping[InstanceId, InstanceTokenUsage] = {
+        iid: usage
+        for iid, usage in state.instance_token_usage.items()
+        if iid != event.instance_id
+    }
     new_links: dict[InstanceLinkId, InstanceLink] = {}
     for link_id, link in state.instance_links.items():
         prefill = [i for i in link.prefill_instances if i != event.instance_id]
@@ -237,8 +247,46 @@ def apply_instance_deleted(event: InstanceDeleted, state: State) -> State:
                 update={"prefill_instances": prefill, "decode_instances": decode}
             )
     return state.model_copy(
-        update={"instances": new_instances, "instance_links": new_links}
+        update={
+            "instances": new_instances,
+            "instance_token_usage": new_token_usage,
+            "instance_links": new_links,
+        }
     )
+
+
+def apply_instance_tokens_updated(event: InstanceTokensUpdated, state: State) -> State:
+    """Fold a single completed-generation token delta into the running total.
+
+    Replaying the event log reproduces the same cumulative counts, so the
+    accounting survives master/API restarts.
+    """
+    instance_id = event.instance_id
+    current = state.instance_token_usage.get(instance_id)
+    delta_total = event.prompt_tokens + event.completion_tokens
+    if current is None:
+        new_usage = InstanceTokenUsage(
+            instance_id=instance_id,
+            prompt_tokens=event.prompt_tokens,
+            completion_tokens=event.completion_tokens,
+            total_tokens=delta_total,
+            request_count=1,
+        )
+    else:
+        new_usage = current.model_copy(
+            update={
+                "prompt_tokens": current.prompt_tokens + event.prompt_tokens,
+                "completion_tokens": current.completion_tokens
+                + event.completion_tokens,
+                "total_tokens": current.total_tokens + delta_total,
+                "request_count": current.request_count + 1,
+            }
+        )
+    new_usage_mapping: Mapping[InstanceId, InstanceTokenUsage] = {
+        **state.instance_token_usage,
+        instance_id: new_usage,
+    }
+    return state.model_copy(update={"instance_token_usage": new_usage_mapping})
 
 
 def apply_instance_link_created(event: InstanceLinkCreated, state: State) -> State:

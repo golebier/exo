@@ -7,12 +7,14 @@ from typing import BinaryIO
 
 from anyio import ClosedResourceError, EndOfStream
 
+from exo.api.types import Usage
 from exo.shared.constants import ENABLE_DISAGGREGATION
-from exo.shared.types.chunks import Chunk
+from exo.shared.types.chunks import Chunk, TokenChunk, ToolCallChunk
 from exo.shared.types.common import CommandId
 from exo.shared.types.events import (
     ChunkGenerated,
     Event,
+    InstanceTokensUpdated,
     RunnerStatusUpdated,
     TaskAcknowledged,
     TaskStatusUpdated,
@@ -59,6 +61,24 @@ from exo.worker.runner.bootstrap import logger
 
 PREFILL_PICKUP_TIMEOUT_SECONDS = 3
 PREFILL_FINISH_TIMEOUT_SECONDS = 300
+
+
+def _final_chunk_usage(chunk: Chunk) -> Usage | None:
+    """Return the ``Usage`` from a chunk that terminates a generation, else ``None``.
+
+    Only the final :class:`TokenChunk` (with a ``finish_reason``) and every
+    :class:`ToolCallChunk` carry usage; intermediate tokens, prefill progress,
+    image chunks and error chunks do not.
+    """
+    match chunk:
+        case TokenChunk(usage=usage, finish_reason=finish_reason) if (
+            usage is not None and finish_reason is not None
+        ):
+            return usage
+        case ToolCallChunk(usage=usage) if usage is not None:
+            return usage
+        case _:
+            return None
 
 
 @dataclass
@@ -392,3 +412,16 @@ class Runner:
     ):
         assert isinstance(self.generator, Engine)
         self.event_sender.send(ChunkGenerated(command_id=command_id, chunk=chunk))
+
+        # Attribute cumulative token usage to the instance when the final chunk
+        # of a generation arrives. Engines filter non-rank-0 chunks in `step`,
+        # so each multi-shard instance reports exactly once per request.
+        usage = _final_chunk_usage(chunk)
+        if usage is not None:
+            self.event_sender.send(
+                InstanceTokensUpdated(
+                    instance_id=self.instance.instance_id,
+                    prompt_tokens=usage.prompt_tokens,
+                    completion_tokens=usage.completion_tokens,
+                )
+            )

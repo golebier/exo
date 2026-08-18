@@ -29,6 +29,7 @@
     lastUpdate,
     clearChat,
     instances,
+    instanceTokenUsage,
     runners,
     downloads,
     placementPreviews,
@@ -81,6 +82,7 @@
   const data = $derived(topologyData());
   const update = $derived(lastUpdate());
   const instanceData = $derived(instances());
+  const instanceTokenUsageData = $derived(instanceTokenUsage());
   const runnersData = $derived(runners());
   const downloadsData = $derived(downloads());
   const previewsData = $derived(placementPreviews());
@@ -2156,6 +2158,15 @@
   function formatSpeed(bps: number): string {
     if (!bps || bps <= 0) return "0 B/s";
     return formatBytes(bps, 1) + "/s";
+  }
+
+  function formatTokenCount(tokens: number): string {
+    if (!tokens || tokens <= 0) return "0";
+    if (tokens < 1000) return String(tokens);
+    const units = ["k", "M", "B", "T"];
+    const i = Math.floor(Math.log(tokens) / Math.log(1000)) - 1;
+    const value = tokens / Math.pow(1000, i + 1);
+    return parseFloat(value.toFixed(1)) + units[i];
   }
 
   function getNodeLabel(nodeId: string): string {
@@ -5285,6 +5296,23 @@
                             {instanceInfo.nodeNames.join(", ")}
                           </div>
                         {/if}
+                        {#if isReady || isRunning || isWarmingUp}
+                          {@const tokenUsage = instanceTokenUsageData[id]}
+                          <div
+                            class="mt-1 flex items-center gap-1.5 text-[11px] font-mono text-white/55"
+                          >
+                            <span title="Input tokens">↓ {formatTokenCount(
+                              tokenUsage?.promptTokens ?? 0,
+                            )}</span>
+                            <span class="text-white/20">·</span>
+                            <span title="Output tokens">↑ {formatTokenCount(
+                              tokenUsage?.completionTokens ?? 0,
+                            )}</span>
+                            <span class="text-white/20">·</span>
+                            <span title="Completed requests">{tokenUsage?.requestCount ?? 0}
+                              req</span>
+                          </div>
+                        {/if}
                         {#if debugEnabled && instanceConnections.length > 0}
                           <div class="mt-2 space-y-1">
                             {#each instanceConnections as conn}
@@ -6418,6 +6446,23 @@
                           {#if instanceInfo.nodeNames.length > 0}
                             <div class="text-white/60 text-xs font-mono">
                               {instanceInfo.nodeNames.join(", ")}
+                            </div>
+                          {/if}
+                          {#if isReady || isRunning || isWarmingUp}
+                            {@const tokenUsage = instanceTokenUsageData[id]}
+                            <div
+                              class="mt-1 flex items-center gap-1.5 text-[11px] font-mono text-white/55"
+                            >
+                              <span title="Input tokens">↓ {formatTokenCount(
+                                tokenUsage?.promptTokens ?? 0,
+                              )}</span>
+                              <span class="text-white/20">·</span>
+                              <span title="Output tokens">↑ {formatTokenCount(
+                                tokenUsage?.completionTokens ?? 0,
+                              )}</span>
+                              <span class="text-white/20">·</span>
+                              <span title="Completed requests">{tokenUsage?.requestCount ?? 0}
+                                req</span>
                             </div>
                           {/if}
                           {#if debugEnabled && instanceConnections.length > 0}
