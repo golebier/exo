@@ -32,6 +32,13 @@ build-dashboard:
     npm run build
     popd
 
+# Build the vendored oMLX GLM-5.2 native Metal kernels (Darwin + full Xcode
+# required). Opt-in: set EXO_BUILD_MLX_KERNELS=1 or pass --force. Installs
+# _ext.so + omlx_glm_kernels.metallib next to fast.py so native_available()
+# returns True. See mlx_kernels/README.md.
+mlx-kernels:
+    uv run --extra build python mlx_kernels/build_kernels.py --force
+
 package: build-dashboard
     uv run pyinstaller packaging/pyinstaller/exo.spec
     rm -rf build

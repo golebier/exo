@@ -17,6 +17,9 @@
 #   EXO_VERSION     Override the version (default: `git describe --tags --abbrev=0`).
 #   EXO_OUTPUT_DIR  Where to write the DMG (default: ./output).
 #   EXO_SKIP_DASHBOARD=1  Skip `npm install` + `npm run build` (faster re-builds).
+#   EXO_BUILD_MLX_KERNELS=1  Build the vendored oMLX GLM-5.2 native Metal kernels
+#                           (Darwin + full Xcode required; opt-in). The built
+#                           _ext.so + metallib are bundled by PyInstaller.
 #
 # Usage:
 #   ./BUILD.sh                   # build the app + DMG.
@@ -117,6 +120,22 @@ ok "Rust bindings rebuilt."
 # non-default extras (e.g. `mlx`). Re-sync to put them back.
 say "Re-syncing with --extra mlx (just rust-rebuild reset the venv)..."
 uv sync --all-packages --group dev --extra mlx
+
+# ── 2b. Optional: native Metal kernels (GLM-5.2) ────────────────────────────
+# Opt-in via EXO_BUILD_MLX_KERNELS=1 (Darwin + full Xcode only). Builds the
+# vendored oMLX nanobind _ext + metallib into the source tree so PyInstaller
+# bundles them and `fast.native_available()` returns True at runtime.
+if [[ "${EXO_BUILD_MLX_KERNELS:-0}" == "1" ]]; then
+  if [[ "$(uname)" != "Darwin" ]]; then
+    warn "EXO_BUILD_MLX_KERNELS=1 set but not on Darwin; skipping native kernels."
+  else
+    hr
+    say "Step 2b/5: just mlx-kernels (native Metal GLM-5.2 kernels)"
+    hr
+    uv run --extra build python mlx_kernels/build_kernels.py --force
+    ok "Native Metal kernels built."
+  fi
+fi
 
 # ── 3. Dashboard + PyInstaller bundle ────────────────────────────────────────
 hr

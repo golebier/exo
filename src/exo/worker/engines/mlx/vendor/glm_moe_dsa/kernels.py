@@ -29,39 +29,122 @@ def _detach_import_error(exc: Exception) -> Exception:
     return exc
 
 
-# EXO does not ship oMLX's native GLM kernels. The fast dispatch falls back
-# to mx.fast for the symbols it provides, and returns None for the GLM-specific
-# native kernels (sparse MLA, exact block attention, etc.) so the model code
-# falls through to the standard attention path.
-try:
-    from omlx.custom_kernels.glm_moe_dsa import fast as _native_fast  # type: ignore[import-not-found]  # noqa: F401
-except Exception as exc:  # pragma: no cover - native extension not shipped
-    _native_fast = None
-    _native_import_error = _detach_import_error(exc)
-else:
-    _native_import_error = None
+# EXO vendors oMLX's native GLM kernels under its own namespace
+# (exo.worker.engines.mlx.vendor.omlx_custom_kernels.glm_moe_dsa) and builds
+# the nanobind ``_ext`` extension only when EXO_BUILD_MLX_KERNELS=1 is set
+# (Darwin + Metal toolchain required). When the extension is absent the
+# vendored ``fast`` module still imports, but ``is_native_available()``
+# returns False and ``has_symbol()`` reports only the ``mx.fast`` symbols —
+# so the GLM-specific native kernels (sparse MLA, exact block attention, etc.)
+# report unavailable and the model code falls through to the standard
+# attention path. An upstream ``omlx`` install is also accepted as a fallback
+# so users who pip-installed oMLX with custom kernels get them transparently.
+#
+# The native ``_ext`` import is DEFERRED (lazy) rather than performed at this
+# module's import time. ``_ext.so`` links ``Metal.framework`` + ``libmlx.dylib``
+# and importing it eagerly initialises the Metal device — which MUST NOT happen
+# before ``mx.distributed.init(backend="jaccl")`` in the runner. The jaccl
+# GPU-RDMA backend needs to own the Metal device's first initialisation; an
+# earlier eager import (issue: JACCL warmup all_sum hangs on rank 1, plus Metal
+# command-buffer OOM during prefill) corrupts that setup. The first kernel
+# lookup happens during model load/inference, well after distributed init, so
+# resolving lazily on first access is safe. Set EXO_NATIVE_GLM_KERNELS=0 to
+# force the fallback path (skip the native import entirely).
+_native_fast: Any = None
+_native_import_error: Exception | None = None
+_native_resolved: bool = False
+
+
+def _resolve_native_fast() -> Any:
+    """Lazily import the native GLM ``fast`` module on first access.
+
+    Returns the native ``fast`` module, or ``None`` when unavailable/disabled.
+    Resolution runs at most once; the result is cached module-level.
+    """
+    global _native_fast, _native_import_error, _native_resolved
+    if _native_resolved:
+        return _native_fast
+    _native_resolved = True
+
+    import os
+
+    if os.environ.get("EXO_NATIVE_GLM_KERNELS", "").strip().lower() in (
+        "0",
+        "false",
+        "no",
+        "off",
+    ):
+        logger.info(
+            "EXO_NATIVE_GLM_KERNELS=0: native GLM kernels disabled by env; "
+            "using standard attention fallback path."
+        )
+        return None
+
+    # Prefer EXO's vendored native kernels (built with EXO_BUILD_MLX_KERNELS=1).
+    try:
+        from exo.worker.engines.mlx.vendor.omlx_custom_kernels.glm_moe_dsa import (  # noqa: F401
+            fast as _native_fast,
+        )
+    except Exception as exc:  # pragma: no cover - vendored fast always imports
+        _native_fast = None
+        _native_import_error = _detach_import_error(exc)
+    else:
+        _native_import_error = None
+
+    if _native_fast is None:
+        # Fall back to an upstream omlx install (users who pip-installed oMLX
+        # with custom kernels get them transparently).
+        try:
+            from omlx.custom_kernels.glm_moe_dsa import fast as _native_fast  # type: ignore[import-not-found]  # noqa: F401
+        except Exception as exc:  # pragma: no cover - upstream omlx not installed
+            _native_fast = None
+            _native_import_error = _detach_import_error(exc)
+        else:
+            _native_import_error = None
+
+    # Surface availability once, at first resolution (during model load, after
+    # distributed init — safe to initialise Metal here).
+    if _native_fast is not None and _native_fast.is_native_available():
+        logger.info(
+            "GLM-5.2 native Metal kernels available; all required fast symbols "
+            "resolved (sparse MLA + exact block attention fast path active)"
+        )
+    else:
+        detail = "extension not built"
+        if _native_import_error is not None:
+            detail = str(_native_import_error).splitlines()[0][:160]
+        logger.info(
+            "GLM-5.2 native Metal kernels not available (%s); "
+            "falling back to standard attention path with sparse top-k mask.",
+            detail,
+        )
+
+    return _native_fast
 
 
 class _FastDispatch:
     """Dispatch to native GLM kernels when available, else mlx.fast."""
 
     def __getattr__(self, name: str) -> Any:
-        if _native_fast is not None and _native_fast.has_symbol(name):
+        native_fast = _resolve_native_fast()
+        if native_fast is not None and native_fast.has_symbol(name):
             try:
-                return getattr(_native_fast, name)
+                return getattr(native_fast, name)
             except AttributeError:
                 pass
         return getattr(mx.fast, name)
 
     def __dir__(self) -> list[str]:
         names = set(dir(mx.fast))
-        if _native_fast is not None:
-            names.update(dir(_native_fast))
+        native_fast = _resolve_native_fast()
+        if native_fast is not None:
+            names.update(dir(native_fast))
         return sorted(names)
 
     def has(self, name: str) -> bool:
         """Return True if the symbol is available (native or mlx.fast)."""
-        return (_native_fast is not None and _native_fast.has_symbol(name)) or hasattr(
+        native_fast = _resolve_native_fast()
+        return (native_fast is not None and native_fast.has_symbol(name)) or hasattr(
             mx.fast, name
         )
 
@@ -71,12 +154,14 @@ class _FastDispatch:
 
     def native_available(self) -> bool:
         """Return True if native GLM kernels are available."""
-        return _native_fast is not None and _native_fast.is_native_available()
+        native_fast = _resolve_native_fast()
+        return native_fast is not None and native_fast.is_native_available()
 
     def native_import_error(self) -> Exception | None:
         """Return the import error if native kernels failed to load."""
-        if _native_fast is not None:
-            return _native_fast.import_error()
+        native_fast = _resolve_native_fast()
+        if native_fast is not None:
+            return native_fast.import_error()
         return _native_import_error
 
 

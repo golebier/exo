@@ -26,21 +26,6 @@ NATIVE_KERNELS_PACKAGE = "omlx.custom_kernels.glm_moe_dsa"
 _applied = False
 
 
-def _missing_fast_symbols() -> list[str]:
-    """Return expected fast symbols missing from native or patched MLX runtime."""
-    from exo.worker.engines.mlx.vendor.glm_moe_dsa import kernels
-
-    required = (
-        "dsa_indexer_scores",
-        "dsa_topk_indices",
-        "glm_dsa_sparse_mla_attention",
-        "glm_dsa_exact_block_attention",
-        "glm_dsa_q8_vup_flat",
-        "glm_moe_weighted_sum",
-    )
-    return kernels.fast.missing(required)
-
-
 def _register_module() -> None:
     """Register the vendored GLM-5.2 model as mlx_lm.models.glm_moe_dsa."""
     qualname = "mlx_lm.models.glm_moe_dsa"
@@ -80,15 +65,13 @@ def apply_glm_moe_dsa_patch() -> bool:
 
     _register_module()
 
-    # Log missing native symbols (EXO doesn't ship native GLM kernels, so the
-    # sparse MLA / exact block paths fall back to the standard attention path).
-    missing = _missing_fast_symbols()
-    if missing:
-        logger.info(
-            "GLM-5.2 native kernels not available (%s missing); "
-            "falling back to standard attention path with sparse top-k mask",
-            ", ".join(missing),
-        )
+    # NOTE: native-kernel availability is NOT probed here. apply_glm_moe_patch
+    # runs in the runner BEFORE mx.distributed.init(backend="jaccl"), and
+    # importing the native _ext.so initialises the Metal device — which must
+    # not happen before the jaccl GPU-RDMA backend owns Metal init (else the
+    # JACCL warmup all_sum hangs on rank 1). kernels.fast resolves _ext lazily
+    # on first access (during model load, after distributed init) and logs the
+    # availability then. See docs/omlx-porting/02-native-metal-kernels.md.
 
     _applied = True
     return True

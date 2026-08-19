@@ -70,6 +70,7 @@
         ./dashboard/parts.nix
         ./rust/parts.nix
         ./python/parts.nix
+        ./mlx_kernels/parts.nix
       ];
 
       debug = true; # Enable options autocompletion

@@ -43,6 +43,15 @@ tmp/models
 output/
 *.dmg
 *.sha256
+*.bak
+
+# mlx native kernel build artifacts (built opt-in via EXO_BUILD_MLX_KERNELS=1)
+# — the _ext nanobind extension, kernel ops dylib, compiled metallib, cmake
+# build dir
+mlx_kernels/build/
+**/omlx_custom_kernels/**/_ext*.so
+**/omlx_custom_kernels/**/*.dylib
+**/omlx_custom_kernels/**/*.metallib
 /.agents
 /.claude/skills
 /.claude
