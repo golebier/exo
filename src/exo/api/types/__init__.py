@@ -40,6 +40,7 @@ from .api import InstanceLinkBody as InstanceLinkBody
 from .api import InstanceLinkResponse as InstanceLinkResponse
 from .api import Logprobs as Logprobs
 from .api import LogprobsContentItem as LogprobsContentItem
+from .api import MemoryGuardSetting as MemoryGuardSetting
 from .api import ModelList as ModelList
 from .api import ModelListModel as ModelListModel
 from .api import NodePowerStats as NodePowerStats

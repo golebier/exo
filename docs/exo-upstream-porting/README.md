@@ -36,6 +36,7 @@ This working tree (`golebier/exo`) is **ahead** of upstream on several items peo
 | Rust bindings (`exo_rs`) | ✅ Done | #2131, #2139 |
 | DeepSeek-V4 cache handling | ✅ Done (`_copy_v4_cache`) | (partial upstream) |
 | KV prefix cache (RAM, LRU, SSM snapshots) | ✅ Done | #2251 addresses its prefill OOM gap |
+| Prefill memory guard + near-limit placement | ✅ Done + verified (`memory_guard.py`, `placement_memory.py`) — reclaim-based ceiling (oMLX port), ship default OFF | #2251, #1709; #2240, #2241 |
 
 ---
 

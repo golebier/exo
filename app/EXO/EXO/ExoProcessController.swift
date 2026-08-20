@@ -353,6 +353,7 @@ final class ExoProcessController: ObservableObject {
         var environment = ProcessInfo.processInfo.environment
         environment["EXO_RUNTIME_DIR"] = runtimeURL.path
         environment["EXO_ZENOH_NAMESPACE"] = computeNamespace()
+        environment["EXO_APP_VERSION"] = buildTag()
         if !hfToken.isEmpty {
             environment["HF_TOKEN"] = hfToken
         }

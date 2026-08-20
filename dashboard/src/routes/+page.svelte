@@ -66,6 +66,8 @@
     nodeThunderboltBridge,
     nodeIdentities,
     isConnected,
+    featureFlags,
+    setMemoryGuard,
     type DownloadProgress,
     type PlacementPreview,
   } from "$lib/stores/app.svelte";
@@ -966,6 +968,21 @@
 
   // Advanced options toggle (hides technical jargon for new users)
   let showAdvancedOptions = $state(false);
+
+  // Memory-guard toggle state (task #11)
+  let memoryGuardSaving = $state(false);
+  const memoryGuardEnabled = $derived(
+    featureFlags()["prefillMemoryGuard"] === true,
+  );
+  async function toggleMemoryGuard() {
+    if (memoryGuardSaving) return;
+    memoryGuardSaving = true;
+    try {
+      await setMemoryGuard(!memoryGuardEnabled);
+    } finally {
+      memoryGuardSaving = false;
+    }
+  }
 
   // Favorites state (reactive)
   const favoritesSet = $derived(getFavoritesSet());
@@ -5912,6 +5929,61 @@
                           >
                         </div>
                       {/each}
+                    </div>
+                  </div>
+
+                  <!-- Memory guard (task #11) -->
+                  <div>
+                    <div class="text-xs text-white/50 font-mono mb-2">
+                      Memory Guard:
+                    </div>
+                    <div class="flex gap-2">
+                      <button
+                        onclick={toggleMemoryGuard}
+                        disabled={memoryGuardSaving}
+                        class="flex items-center gap-2 py-1.5 px-3 text-xs font-mono border rounded transition-all duration-200 cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed {memoryGuardEnabled
+                          ? 'bg-transparent text-exo-yellow border-exo-yellow'
+                          : 'bg-transparent text-white/70 border-exo-medium-gray/50 hover:border-exo-yellow/50'}"
+                      >
+                        <span
+                          class="w-3 h-3 rounded-full border-2 flex items-center justify-center {memoryGuardEnabled
+                            ? 'border-exo-yellow'
+                            : 'border-exo-medium-gray'}"
+                        >
+                          {#if memoryGuardEnabled}
+                            <span
+                              class="w-1.5 h-1.5 rounded-full bg-exo-yellow"
+                            ></span>
+                          {/if}
+                        </span>
+                        {memoryGuardSaving ? "…" : "On"}
+                      </button>
+                      <button
+                        onclick={toggleMemoryGuard}
+                        disabled={memoryGuardSaving}
+                        class="flex items-center gap-2 py-1.5 px-3 text-xs font-mono border rounded transition-all duration-200 cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed {!memoryGuardEnabled
+                          ? 'bg-transparent text-exo-yellow border-exo-yellow'
+                          : 'bg-transparent text-white/70 border-exo-medium-gray/50 hover:border-exo-yellow/50'}"
+                      >
+                        <span
+                          class="w-3 h-3 rounded-full border-2 flex items-center justify-center {!memoryGuardEnabled
+                            ? 'border-exo-yellow'
+                            : 'border-exo-medium-gray'}"
+                        >
+                          {#if !memoryGuardEnabled}
+                            <span
+                              class="w-1.5 h-1.5 rounded-full bg-exo-yellow"
+                            ></span>
+                          {/if}
+                        </span>
+                        {memoryGuardSaving ? "…" : "Off"}
+                      </button>
+                    </div>
+                    <div class="text-[10px] text-white/40 font-mono mt-1.5 leading-snug">
+                      Rejects prefills that would exceed the reclaim-based memory
+                      ceiling (phys_footprint + free + inactive + active×reclaim)
+                      instead of OOM-crashing. Ship default: Off. Tier via
+                      <code class="text-exo-yellow/80">EXO_MEMORY_GUARD_TIER</code>.
                     </div>
                   </div>
                 </div>

@@ -1,8 +1,11 @@
 <script lang="ts">
   import { browser } from "$app/environment";
-  import { featureFlags } from "$lib/stores/app.svelte";
+  import { appVersion } from "$lib/stores/app.svelte";
 
-  const showAdvanced = $derived(featureFlags()["disaggregation"] === true);
+  // Advanced is always shown — it hosts the prefill memory-guard toggle
+  // (task #11), which is independent of disaggregation.
+  const showAdvanced = $derived(true);
+  const version = $derived(appVersion());
 
   interface Props {
     showHome?: boolean;
@@ -74,6 +77,14 @@
   <div
     class="absolute left-4 md:left-6 top-1/2 -translate-y-1/2 flex items-center gap-2"
   >
+    {#if version}
+      <span
+        class="text-[10px] font-mono text-white/30 select-none whitespace-nowrap"
+        title="Running build version"
+      >
+        {version}
+      </span>
+    {/if}
     <!-- Mobile sidebar toggle -->
     <button
       onclick={handleToggleMobileMenu}

@@ -327,6 +327,12 @@ class InstanceLinkBody(BaseModel):
     decode_instances: list[InstanceId]
 
 
+class MemoryGuardSetting(BaseModel):
+    """Body for the runtime prefill-memory-guard toggle (task #11)."""
+
+    enabled: bool
+
+
 class InstanceLinkResponse(BaseModel):
     message: str
     command_id: CommandId

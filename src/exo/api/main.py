@@ -84,6 +84,7 @@ from exo.api.types import (
     ImageSize,
     InstanceLinkBody,
     InstanceLinkResponse,
+    MemoryGuardSetting,
     ModelList,
     ModelListModel,
     PlaceInstanceParams,
@@ -129,6 +130,7 @@ from exo.shared.apply import apply
 from exo.shared.constants import (
     DASHBOARD_DIR,
     ENABLE_DISAGGREGATION,
+    EXO_APP_VERSION,
     EXO_CACHE_HOME,
     EXO_EVENT_LOG_DIR,
     EXO_IMAGE_CACHE_DIR,
@@ -206,6 +208,7 @@ from exo.utils.channels import Receiver, Sender, channel
 from exo.utils.disk_event_log import DiskEventLog
 from exo.utils.power_sampler import PowerSampler
 from exo.utils.task_group import TaskGroup
+from exo.worker.engines.mlx import memory_guard
 
 _API_EVENT_LOG_DIR = EXO_EVENT_LOG_DIR / "api"
 ONBOARDING_COMPLETE_FILE = EXO_CACHE_HOME / "onboarding_complete"
@@ -354,6 +357,8 @@ class API:
         self.app.put("/v1/instance-links/{link_id}")(self.update_instance_link)
         self.app.delete("/v1/instance-links/{link_id}")(self.delete_instance_link)
         self.app.get("/v1/feature-flags")(self.get_feature_flags)
+        self.app.put("/v1/memory-guard")(self.set_memory_guard)
+        self.app.get("/v1/version")(self.get_version)
         self.app.get("/models")(self.get_models)
         self.app.get("/v1/models")(self.get_models)
         self.app.post("/models/add")(self.add_custom_model)
@@ -693,7 +698,25 @@ class API:
         )
 
     async def get_feature_flags(self) -> dict[str, bool]:
-        return {"disaggregation": ENABLE_DISAGGREGATION}
+        return {
+            "disaggregation": ENABLE_DISAGGREGATION,
+            "prefillMemoryGuard": memory_guard.is_guard_enabled(),
+        }
+
+    async def set_memory_guard(self, body: MemoryGuardSetting) -> dict[str, bool]:
+        """Runtime toggle for the prefill memory guard (task #11).
+
+        Takes effect on the next prefill without a restart. The env escape
+        hatch ``EXO_DISABLE_PREFILL_GUARD=1`` still wins when the override is
+        cleared, so a process started with the guard forced off cannot be
+        re-enabled via the UI.
+        """
+        memory_guard.set_guard_enabled(body.enabled)
+        return {"prefillMemoryGuard": memory_guard.is_guard_enabled()}
+
+    async def get_version(self) -> dict[str, str]:
+        """App build version for the dashboard top-left badge (task #11)."""
+        return {"version": EXO_APP_VERSION}
 
     async def list_instance_links(self) -> list[InstanceLink]:
         if not ENABLE_DISAGGREGATION:

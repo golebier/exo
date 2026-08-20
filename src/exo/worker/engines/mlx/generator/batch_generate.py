@@ -35,6 +35,7 @@ from exo.worker.engines.mlx.cache import (
 from exo.worker.engines.mlx.constants import DEFAULT_TOP_LOGPROBS, MAX_TOKENS
 from exo.worker.engines.mlx.generator.generate import (
     ban_token_ids,
+    bind_chunk_guard,
     eos_ids_from_tokenizer,
     extract_top_logprobs,
     patch_embed_tokens,
@@ -164,6 +165,10 @@ class ExoBatchGenerator:
         if self.kv_prefix_cache is not None and (
             not is_bench or task_params.use_prefix_cache
         ):
+            # Evict prefix-cache headroom BEFORE lookup + prefill (#2251): trim
+            # the persistent cache down to the prefill watermark so its
+            # allocations can't starve the transient prefill activations.
+            self.kv_prefix_cache.evict_for_prefill_headroom()
             cache, remaining_tokens, matched_index, is_exact_hit = (
                 self.kv_prefix_cache.get_kv_cache(
                     self.model, all_prompt_tokens, media_regions=media_regions
@@ -178,6 +183,16 @@ class ExoBatchGenerator:
                 prompt_tokens = remaining_tokens
         else:
             cache = make_kv_cache(self.model)
+
+        # Preflight admission: reject a prompt whose prefill peak won't fit even
+        # after the headroom eviction above (oMLX raise_if_prefill_exceeds). A
+        # clean rejection instead of an OOM crash.
+        if self.kv_prefix_cache is not None:
+            self.kv_prefix_cache.preflight_or_raise(
+                self.model,
+                num_prompt_tokens=len(all_prompt_tokens),
+                cached_tokens=prefix_hit_length,
+            )
 
         seed = task_params.seed if task_params.seed is not None else 42
         mx.random.seed(seed)
@@ -240,6 +255,7 @@ class ExoBatchGenerator:
                     self.group,
                     on_prefill_progress,
                     distributed_prompt_progress_callback,
+                    chunk_guard=bind_chunk_guard(self.kv_prefix_cache, self.model),
                 )
 
         prefix_cache_hit: Literal["none", "partial", "exact"] = "none"

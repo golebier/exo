@@ -2,6 +2,11 @@ from collections.abc import Generator, Mapping
 
 from loguru import logger
 
+from exo.master.placement_memory import (
+    effective_context_tokens,
+    estimate_kv_bytes,
+    estimate_node_memory_requirement,
+)
 from exo.shared.models.model_cards import ModelCard
 from exo.shared.topology import Topology
 from exo.shared.types.common import Host, NodeId
@@ -106,17 +111,25 @@ def _allocate_and_validate_layers(
         ],
     )
 
-    total_storage = model_card.storage_size
-    total_layers = model_card.n_layers
+    context_tokens = effective_context_tokens(model_card)
     for i, node_id in enumerate(node_ids):
         node_layers = layer_allocations[i]
-        required_memory = (total_storage * node_layers) // total_layers
+        required_memory = estimate_node_memory_requirement(
+            model_card, node_layers=node_layers
+        )
         available_memory = node_memory[node_id].ram_available
         if required_memory > available_memory:
+            kv_bytes = estimate_kv_bytes(
+                model_card, node_layers=node_layers, context_tokens=context_tokens
+            )
             raise ValueError(
                 f"Node {i} ({node_id}) has insufficient memory: "
-                f"requires {required_memory.in_gb:.2f} GB for {node_layers} layers, "
-                f"but only has {available_memory.in_gb:.2f} GB available"
+                f"requires {required_memory.in_gb:.2f} GB for {node_layers} layers "
+                f"(weights + KV for {context_tokens} context tokens + activation "
+                f"margin; KV={kv_bytes.in_gb:.2f} GB), "
+                f"but only has {available_memory.in_gb:.2f} GB available. "
+                f"Set EXO_PLACEMENT_CONTEXT_TOKENS below {context_tokens} to "
+                f"reserve less KV and enable near-limit placement."
             )
 
     return layer_allocations

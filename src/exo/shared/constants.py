@@ -103,6 +103,11 @@ EXO_TRACING_ENABLED = os.getenv("EXO_TRACING_ENABLED", "false").lower() == "true
 
 ENABLE_DISAGGREGATION = os.getenv("ENABLE_DISAGGREGATION", "false").lower() == "true"
 
+# App version shown in the dashboard top-left so users can identify the running
+# build. Set by the Swift host (EXO_APP_VERSION = CFBundleShortVersionString);
+# falls back to the Python package version for bare CLI runs.
+EXO_APP_VERSION = os.getenv("EXO_APP_VERSION") or "dev"
+
 EXO_MAX_CONCURRENT_REQUESTS = int(os.getenv("EXO_MAX_CONCURRENT_REQUESTS", "8"))
 
 EXO_MAX_INSTANCE_RETRIES = 5

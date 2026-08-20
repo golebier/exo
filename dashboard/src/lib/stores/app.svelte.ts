@@ -561,6 +561,7 @@ class AppStore {
   runners = $state<Record<string, unknown>>({});
   instanceLinks = $state<Record<string, RawInstanceLink>>({});
   featureFlags = $state<Record<string, boolean>>({});
+  appVersion = $state<string>("");
   downloads = $state<Record<string, unknown[]>>({});
   nodeDisk = $state<
     Record<
@@ -1295,6 +1296,7 @@ class AppStore {
   startPolling() {
     this.fetchState();
     this.fetchFeatureFlags();
+    this.fetchAppVersion();
     this.fetchInterval = setInterval(() => this.fetchState(), 1000);
   }
 
@@ -1313,6 +1315,17 @@ class AppStore {
       this.featureFlags = await response.json();
     } catch {
       // Silently ignore — defaults to all-disabled.
+    }
+  }
+
+  async fetchAppVersion() {
+    try {
+      const response = await fetch("/v1/version");
+      if (!response.ok) return;
+      const data = (await response.json()) as { version?: string };
+      this.appVersion = data.version ?? "";
+    } catch {
+      // Silently ignore — badge just stays hidden.
     }
   }
 
@@ -3405,6 +3418,25 @@ class AppStore {
   }
 
   /**
+   * Runtime-toggle the prefill memory guard (task #11). Takes effect on the
+   * next prefill without a restart. Refetches feature flags so the UI reflects
+   * the new state immediately.
+   */
+  async setMemoryGuard(enabled: boolean): Promise<void> {
+    const response = await fetch("/v1/memory-guard", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ enabled }),
+    });
+    if (!response.ok) {
+      throw new Error(
+        `Failed to set memory guard: ${response.status} ${await response.text()}`,
+      );
+    }
+    await this.fetchFeatureFlags();
+  }
+
+  /**
    * Delete a downloaded model from a specific node
    */
   async deleteDownload(nodeId: string, modelId: string): Promise<void> {
@@ -3505,6 +3537,7 @@ export const instanceTokenUsage = () => appStore.instanceTokenUsage;
 export const runners = () => appStore.runners;
 export const instanceLinks = () => appStore.instanceLinks;
 export const featureFlags = () => appStore.featureFlags;
+export const appVersion = () => appStore.appVersion;
 export const createInstanceLink = (
   prefillInstances: string[],
   decodeInstances: string[],
@@ -3516,6 +3549,8 @@ export const updateInstanceLink = (
 ) => appStore.updateInstanceLink(linkId, prefillInstances, decodeInstances);
 export const deleteInstanceLink = (linkId: string) =>
   appStore.deleteInstanceLink(linkId);
+export const setMemoryGuard = (enabled: boolean) =>
+  appStore.setMemoryGuard(enabled);
 export const downloads = () => appStore.downloads;
 export const nodeDisk = () => appStore.nodeDisk;
 export const placementPreviews = () => appStore.placementPreviews;

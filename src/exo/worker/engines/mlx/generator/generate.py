@@ -55,6 +55,7 @@ from exo.worker.engines.mlx.constants import (
     KV_GROUP_SIZE,
     MAX_TOKENS,
 )
+from exo.worker.engines.mlx.exceptions import PrefillMemoryExceededError
 from exo.worker.engines.mlx.generator.remote_prefill import remote_prefill
 from exo.worker.engines.mlx.types import KVCacheType, Model
 from exo.worker.engines.mlx.utils_mlx import (
@@ -159,6 +160,30 @@ def _has_pipeline_communication_layer(model: Model):
         if isinstance(layer, (PipelineFirstLayer, PipelineLastLayer)):
             return True
     return False
+
+
+def bind_chunk_guard(
+    kv_prefix_cache: KVPrefixCache | None, model: Model
+) -> Callable[[int, int], None] | None:
+    """Bind the per-chunk prefill guard to ``prefill``'s progress callback.
+
+    Returns ``None`` when there is no prefix cache (bench mode), so the guard
+    is inert. The bound closure captures the cache, model, and the prefill
+    step size so ``prefill`` only has to call ``chunk_guard(processed, total)``.
+    """
+    if kv_prefix_cache is None:
+        return None
+    cache = kv_prefix_cache
+    bound_model = model
+
+    def _guard(processed: int, total: int) -> None:
+        cache.guard_prefill_chunk_or_raise(
+            bound_model,
+            processed=processed,
+            total=total,
+        )
+
+    return _guard
 
 
 def pipeline_parallel_prefill(
@@ -288,11 +313,18 @@ def prefill(
     group: mx.distributed.Group | None,
     on_prefill_progress: Callable[[int, int], None] | None,
     distributed_prompt_progress_callback: Callable[[], None] | None,
+    chunk_guard: Callable[[int, int], None] | None = None,
 ) -> tuple[float, int, list[CacheSnapshot]]:
     """Prefill the KV cache with prompt tokens.
 
     This runs the model over the prompt tokens to populate the cache,
     then trims off the extra generated token.
+
+    ``chunk_guard`` (Phase 2) is called from the progress callback after each
+    prefill chunk; it measures the chunk's footprint delta, feeds the per-model
+    EWMA, and aborts the *next* chunk with ``PrefillMemoryExceededError`` if
+    its predicted peak would trip the Metal OOM cliff. A clean abort instead
+    of an async OOM crash. Pass ``None`` to disable (bench mode / no cache).
 
     Returns:
         (tokens_per_sec, num_tokens, snapshots)
@@ -315,6 +347,12 @@ def prefill(
         )
         if has_ssm:
             snapshots.append(snapshot_ssm_states(cache))
+
+        # Per-chunk guard (Phase 2): measure this chunk, maybe abort the next.
+        # Runs before on_prefill_progress so an abort surfaces cleanly without
+        # emitting a progress event for a chunk that won't run.
+        if chunk_guard is not None:
+            chunk_guard(processed, total)
 
         if on_prefill_progress is not None:
             on_prefill_progress(processed, total)
@@ -364,7 +402,11 @@ def prefill(
                 prompt_progress_callback=combined_progress_callback,
             ):
                 break  # Stop after first iteration - cache is now filled
-    except PrefillCancelled:
+    except (PrefillCancelled, PrefillMemoryExceededError):
+        # Clean up pipeline-parallel state before propagating. A memory abort
+        # mid-prefill must not leave ``is_prefill``/``queue_sends`` set on
+        # pipeline layers — the next request would start in a bad state. Same
+        # cleanup as a user cancellation.
         set_pipeline_queue_sends(model, queue_sends=False)
         set_pipeline_prefill(model, is_prefill=False)
         raise
@@ -585,6 +627,10 @@ def mlx_generate(
         caches = make_kv_cache(model=model)
         prompt_tokens = all_prompt_tokens
     else:
+        # Evict prefix-cache headroom BEFORE lookup + prefill (#2251): trim the
+        # persistent cache down to the prefill watermark so its allocations
+        # can't starve the transient prefill activations and OOM.
+        kv_prefix_cache.evict_for_prefill_headroom()
         caches, prompt_tokens, matched_index, is_exact_hit = (
             kv_prefix_cache.get_kv_cache(
                 model, all_prompt_tokens, media_regions=media_regions
@@ -595,6 +641,16 @@ def mlx_generate(
             logger.info(
                 f"KV cache hit: {prefix_hit_length}/{len(all_prompt_tokens)} tokens cached ({100 * prefix_hit_length / len(all_prompt_tokens):.1f}%)"
             )
+
+    # Preflight admission: reject a prompt whose prefill peak won't fit even
+    # after the headroom eviction above (oMLX raise_if_prefill_exceeds). A
+    # clean rejection instead of an OOM crash.
+    if kv_prefix_cache is not None:
+        kv_prefix_cache.preflight_or_raise(
+            model,
+            num_prompt_tokens=len(all_prompt_tokens),
+            cached_tokens=prefix_hit_length,
+        )
 
     logits_processors: list[Callable[[mx.array, mx.array], mx.array]] = (
         make_logits_processors(
@@ -680,6 +736,7 @@ def mlx_generate(
                 group,
                 on_prefill_progress,
                 distributed_prompt_progress_callback,
+                chunk_guard=bind_chunk_guard(kv_prefix_cache, model),
             )
     cache_snapshots: list[CacheSnapshot] | None = ssm_snapshots_list or None
 

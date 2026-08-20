@@ -600,3 +600,129 @@ class TestKVPrefixCacheWithModel:
         assert len(kv_prefix_cache.prompts) == 1
         # The surviving entry should be the newly added one
         assert get_prefix_length(kv_prefix_cache.prompts[0], tokens) == len(tokens)
+
+    def test_evicts_before_prefill_so_prefill_succeeds_under_pressure(
+        self, model_and_tokenizer
+    ):
+        """#2251 regression: prefix-cache pressure must not starve prefill.
+
+        Before the fix, eviction only ran in ``add_kv_cache`` (after the
+        dangerous prefill allocation). With ``evict_for_prefill_headroom``
+        called before lookup + prefill, the cache is trimmed to the prefill
+        watermark first, so prefill has headroom and succeeds instead of OOMing.
+        """
+        from exo.worker.engines.mlx import cache as cache_mod
+
+        model, tokenizer = model_and_tokenizer
+        kv_prefix_cache = KVPrefixCache(None)
+
+        # Fill the cache with three entries (LRU order: 0 < 1 < 2).
+        prompts = ["First entry", "Second entry", "Third entry"]
+        for i, content in enumerate(prompts):
+            task = TextGenerationTaskParams(
+                model=DEFAULT_GPT_OSS_MODEL_ID,
+                input=[InputMessage(role="user", content=content)],
+                max_output_tokens=1,
+            )
+            prompt = apply_chat_template(tokenizer, task)
+            tokens = encode_prompt(tokenizer, prompt)
+            cache = make_kv_cache(model)
+            prefill(
+                model,
+                tokenizer,
+                make_sampler(0.0),
+                tokens,
+                cache,
+                group=None,
+                on_prefill_progress=None,
+                distributed_prompt_progress_callback=None,
+            )
+            kv_prefix_cache.add_kv_cache(tokens, cache)
+            kv_prefix_cache._last_used[i] = float(i)
+
+        assert len(kv_prefix_cache.prompts) == 3
+
+        # Simulate pressure above the prefill threshold but below the cache
+        # threshold: the post-add path would NOT evict here, but the
+        # before-prefill path must (it targets the tighter watermark).
+        # Readings: stay at 0.75 (between prefill 0.60 and memory 0.80 for a
+        # 16GB box). Each eviction re-measures; keep it high enough that LRU0
+        # and LRU1 are evicted, then drop below the prefill threshold so LRU2
+        # survives and prefill proceeds.
+        readings = iter([0.75, 0.75, 0.55])
+
+        def fake_pressure(_self: KVPrefixCache) -> float:
+            return next(readings)
+
+        with (
+            patch.object(KVPrefixCache, "get_memory_used_percentage", fake_pressure),
+            patch.object(cache_mod, "gc.collect"),
+            patch.object(cache_mod, "mx.clear_cache"),
+        ):
+            # Before the fix this would happen too late (in add_kv_cache);
+            # now it runs before lookup + prefill.
+            evicted = kv_prefix_cache.evict_for_prefill_headroom()
+            # Two LRU entries evicted (readings 0.75, 0.75), then 0.55 stops it.
+            assert evicted == 2
+            assert len(kv_prefix_cache.prompts) == 1
+
+            # Preflight admission must NOT reject a prompt that now fits: the
+            # cache is trimmed and the (real) model dims produce a finite
+            # estimate well under the (real) working-set ceiling.
+            task = TextGenerationTaskParams(
+                model=DEFAULT_GPT_OSS_MODEL_ID,
+                input=[InputMessage(role="user", content="A short new prompt")],
+                max_output_tokens=1,
+            )
+            prompt = apply_chat_template(tokenizer, task)
+            tokens = encode_prompt(tokenizer, prompt)
+            kv_prefix_cache.preflight_or_raise(
+                model,
+                num_prompt_tokens=len(tokens),
+                cached_tokens=0,
+            )
+
+            # And prefill itself completes without OOM.
+            cache = make_kv_cache(model)
+            prefill(
+                model,
+                tokenizer,
+                make_sampler(0.0),
+                tokens,
+                cache,
+                group=None,
+                on_prefill_progress=None,
+                distributed_prompt_progress_callback=None,
+            )
+            assert cache_length(cache) > 0
+
+    def test_preflight_rejects_oversized_prompt_without_oom(self, model_and_tokenizer):
+        """oMLX admission: an impossible prompt is rejected, not OOMed."""
+        from exo.worker.engines.mlx import cache as cache_mod
+        from exo.worker.engines.mlx.exceptions import PrefillMemoryExceededError
+
+        model, tokenizer = model_and_tokenizer
+        kv_prefix_cache = KVPrefixCache(None)
+
+        # A tiny hard limit forces the estimator to reject any non-trivial
+        # prompt. Eviction is a no-op (empty cache); the rejection comes from
+        # the preflight estimate, mirroring oMLX ``raise_if_prefill_exceeds``.
+        task = TextGenerationTaskParams(
+            model=DEFAULT_GPT_OSS_MODEL_ID,
+            input=[InputMessage(role="user", content="Hello, world.")],
+            max_output_tokens=1,
+        )
+        prompt = apply_chat_template(tokenizer, task)
+        tokens = encode_prompt(tokenizer, prompt)
+
+        with (
+            patch.object(KVPrefixCache, "evict_for_prefill_headroom", return_value=0),
+            patch.object(cache_mod, "get_max_working_set_bytes", return_value=1_000),
+            patch.object(cache_mod, "_current_process_usage_bytes", return_value=0),
+            pytest.raises(PrefillMemoryExceededError),
+        ):
+            kv_prefix_cache.preflight_or_raise(
+                model,
+                num_prompt_tokens=len(tokens),
+                cached_tokens=0,
+            )
