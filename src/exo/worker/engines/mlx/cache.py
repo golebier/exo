@@ -22,7 +22,7 @@ from mlx_lm.models.deepseek_v4 import (
 from mlx_lm.tokenizer_utils import TokenizerWrapper
 
 from exo.shared.types.memory import Memory
-from exo.worker.engines.mlx import memory_guard
+from exo.worker.engines.mlx import memory_guard, turboquant
 from exo.worker.engines.mlx.constants import CACHE_GROUP_SIZE, KV_CACHE_BITS
 from exo.worker.engines.mlx.exceptions import PrefillMemoryExceededError
 from exo.worker.engines.mlx.prefill_transient_tracker import PrefillTransientTracker
@@ -95,10 +95,18 @@ _DEFAULT_PREFILL_STEP_SIZE = 4096
 _PREFILL_TRANSIENT_SAFETY = 1.2
 
 # Bytes-per-element for the KV cache and the SDPA score matrix. EXO defaults to
-# fp16/bf16 (2 bytes) for KV; ``KV_CACHE_BITS`` quantizes KV when set. The
-# attention score matrix is the *compute* dtype (fp32 in the unfused fallback),
-# so it is sized separately (see ``_estimate_sdpa_activation_bytes``).
-_KV_BYTES_PER_ELEMENT = (KV_CACHE_BITS / 8.0) if KV_CACHE_BITS is not None else 2.0
+# fp16/bf16 (2 bytes) for KV; ``KV_CACHE_BITS`` quantizes KV when set, and
+# TurboQuant (``turboquant.effective_kv_bits()``) overrides it when enabled.
+# The attention score matrix is the *compute* dtype (fp32 in the unfused
+# fallback), so it is sized separately (see ``_estimate_sdpa_activation_bytes``).
+_TQ_BITS = turboquant.effective_kv_bits()
+_KV_BYTES_PER_ELEMENT = (
+    (_TQ_BITS / 8.0)
+    if _TQ_BITS is not None
+    else (KV_CACHE_BITS / 8.0)
+    if KV_CACHE_BITS is not None
+    else 2.0
+)
 _SCORE_BYTES_PER_ELEMENT = 4.0  # unfused fp32 score matrix — safe upper bound
 
 
@@ -1182,22 +1190,51 @@ def _format_bytes(n: int) -> str:
 def make_kv_cache(
     model: Model, max_kv_size: int | None = None, keep: int = 0
 ) -> KVCacheType:
+    """Construct the per-layer KV cache list.
+
+    TurboQuant (``turboquant.effective_kv_bits()``) takes precedence over the
+    legacy global ``KV_CACHE_BITS`` constant when enabled, mirroring oMLX's
+    per-model ``turboquant_kv_enabled`` / ``turboquant_kv_bits``. The
+    ``turboquant_skip_last`` setting keeps the final layer full precision to
+    prevent corruption on quality-sensitive models (oMLX default: True).
+
+    Qwen3-Next hybrid-cache awareness: models exposing ``make_cache`` (hybrid
+    ``ArraysCache``+``KVCache`` models) defer to their own constructor, so the
+    TurboQuant bits apply only to the plain-KV branches. This is the same
+    seam oMLX's ``type_handlers.py`` keys on.
+    """
     assert hasattr(model, "layers")
 
     if hasattr(model, "make_cache"):
         logger.info("Using MLX LM's make cache")
         return model.make_cache()  # type: ignore
 
+    # TurboQuant overrides the legacy global KV_CACHE_BITS when enabled.
+    tq_bits = turboquant.effective_kv_bits()
+    effective_bits = tq_bits if tq_bits is not None else KV_CACHE_BITS
+    skip_last = turboquant.is_turboquant_enabled() and turboquant.turboquant_skip_last()
+
     if max_kv_size is None:
-        if KV_CACHE_BITS is None:
+        if effective_bits is None:
             logger.info("Using default KV cache")
             return [KVCache() for _ in model.layers]
         else:
-            logger.info("Using quantized KV cache")
-            return [
-                QuantizedKVCache(group_size=CACHE_GROUP_SIZE, bits=KV_CACHE_BITS)
-                for _ in model.layers
-            ]
+            source = "TurboQuant" if tq_bits is not None else "global KV_CACHE_BITS"
+            logger.info(
+                "Using quantized KV cache (source=%s, bits=%d)", source, effective_bits
+            )
+            caches: list[KVCache | QuantizedKVCache] = []
+            for index, _layer in enumerate(model.layers):
+                is_last_layer = index == len(model.layers) - 1
+                if skip_last and is_last_layer:
+                    caches.append(KVCache())
+                else:
+                    caches.append(
+                        QuantizedKVCache(
+                            group_size=CACHE_GROUP_SIZE, bits=effective_bits
+                        )
+                    )
+            return caches
     else:
         logger.info(f"Using rotating KV cache with {max_kv_size=} with {keep=}")
         return [RotatingKVCache(max_size=max_kv_size, keep=keep) for _ in model.layers]

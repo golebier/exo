@@ -333,6 +333,38 @@ class MemoryGuardSetting(BaseModel):
     enabled: bool
 
 
+class TurboQuantSetting(BaseModel):
+    """Body for the runtime TurboQuant KV-cache toggle (#07).
+
+    Mirrors oMLX's ``ModelSettings.turboquant_kv_*`` fields. ``bits`` accepts
+    the oMLX depths (2/2.5/3/3.5/4/6/8); half-step depths round down to the
+    next integer for mlx-lm's ``QuantizedKVCache`` until the native TurboQuant
+    attention kernel is ported. ``skip_last`` keeps the final KVCache layer
+    full precision to prevent corruption on quality-sensitive models.
+    """
+
+    enabled: bool
+    bits: float = 4.0
+    skip_last: bool = True
+
+
+class TieredCacheSetting(BaseModel):
+    """Body for the runtime tiered-KV-cache toggle (#01).
+
+    Mirrors oMLX's ``CacheSettings``. ``ssd_cache_max_size`` and
+    ``hot_cache_max_size`` accept a size string ("auto"/"8GB"/"512MB") or an
+    int byte count; "auto" resolves to 10% of the backing SSD capacity
+    (oMLX default). ``hot_cache_only`` disables the SSD tier entirely (RAM-only,
+    cleared on restart — today's behaviour).
+    """
+
+    enabled: bool
+    hot_cache_only: bool = False
+    ssd_cache_dir: str | None = None
+    ssd_cache_max_size: str | int = "auto"
+    hot_cache_max_size: str | int = "0"
+
+
 class InstanceLinkResponse(BaseModel):
     message: str
     command_id: CommandId

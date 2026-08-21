@@ -52,6 +52,7 @@ from .api import PromptTokensDetails as PromptTokensDetails
 from .api import StartDownloadParams as StartDownloadParams
 from .api import StartDownloadResponse as StartDownloadResponse
 from .api import StreamingChoiceResponse as StreamingChoiceResponse
+from .api import TieredCacheSetting as TieredCacheSetting
 from .api import ToolCall as ToolCall
 from .api import ToolCallItem as ToolCallItem
 from .api import TopLogprobItem as TopLogprobItem
@@ -62,5 +63,6 @@ from .api import TraceListResponse as TraceListResponse
 from .api import TraceRankStats as TraceRankStats
 from .api import TraceResponse as TraceResponse
 from .api import TraceStatsResponse as TraceStatsResponse
+from .api import TurboQuantSetting as TurboQuantSetting
 from .api import Usage as Usage
 from .api import normalize_image_size as normalize_image_size

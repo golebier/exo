@@ -68,6 +68,10 @@
     isConnected,
     featureFlags,
     setMemoryGuard,
+    setTurboQuant,
+    setTieredCache,
+    fetchTieredCacheStatus,
+    clearTieredCache,
     type DownloadProgress,
     type PlacementPreview,
   } from "$lib/stores/app.svelte";
@@ -983,6 +987,276 @@
       memoryGuardSaving = false;
     }
   }
+
+  // TurboQuant KV-cache compression toggle state (#07). Mirrors oMLX's
+  // ``turboquant_kv_enabled`` / ``turboquant_kv_bits`` / ``turboquant_skip_last``.
+  // Defaults match oMLX: bits=4, skip_last=True. The bits/skip-last knobs are
+  // persisted in localStorage so the dashboard remembers the choice across
+  // reloads; the enabled state is the source of truth from feature-flags.
+  const TURBOQUANT_DEFAULTS_KEY = "exo-turboquant-defaults-v1";
+  interface TurboQuantDefaults {
+    bits: number;
+    skipLast: boolean;
+  }
+  const TURBOQUANT_BIT_OPTIONS = [2, 2.5, 3, 3.5, 4, 6, 8];
+  let turboquantSaving = $state(false);
+  let turboquantBits = $state<number>(4);
+  let turboquantSkipLast = $state<boolean>(true);
+  const turboquantEnabled = $derived(featureFlags()["turboquantKv"] === true);
+
+  function loadTurboQuantDefaults(): TurboQuantDefaults {
+    try {
+      const stored = localStorage.getItem(TURBOQUANT_DEFAULTS_KEY);
+      if (stored) {
+        const parsed = JSON.parse(stored) as Partial<TurboQuantDefaults>;
+        return {
+          bits: parsed.bits ?? 4,
+          skipLast: parsed.skipLast ?? true,
+        };
+      }
+    } catch (e) {
+      console.warn("Failed to load TurboQuant defaults:", e);
+    }
+    return { bits: 4, skipLast: true };
+  }
+
+  function saveTurboQuantDefaults(): void {
+    try {
+      localStorage.setItem(
+        TURBOQUANT_DEFAULTS_KEY,
+        JSON.stringify({ bits: turboquantBits, skipLast: turboquantSkipLast }),
+      );
+    } catch (e) {
+      console.warn("Failed to save TurboQuant defaults:", e);
+    }
+  }
+
+  // Initialise from persisted defaults on first render.
+  const _tqDefaults = loadTurboQuantDefaults();
+  turboquantBits = _tqDefaults.bits;
+  turboquantSkipLast = _tqDefaults.skipLast;
+
+  async function toggleTurboQuant(): Promise<void> {
+    if (turboquantSaving) return;
+    turboquantSaving = true;
+    try {
+      await setTurboQuant(
+        !turboquantEnabled,
+        turboquantBits,
+        turboquantSkipLast,
+      );
+    } finally {
+      turboquantSaving = false;
+    }
+  }
+
+  async function applyTurboQuantBits(bits: number): Promise<void> {
+    turboquantBits = bits;
+    saveTurboQuantDefaults();
+    if (turboquantEnabled) {
+      // Re-push the bits change so it takes effect on the next model load.
+      turboquantSaving = true;
+      try {
+        await setTurboQuant(true, bits, turboquantSkipLast);
+      } finally {
+        turboquantSaving = false;
+      }
+    }
+  }
+
+  async function toggleTurboQuantSkipLast(): Promise<void> {
+    turboquantSkipLast = !turboquantSkipLast;
+    saveTurboQuantDefaults();
+    if (turboquantEnabled) {
+      turboquantSaving = true;
+      try {
+        await setTurboQuant(true, turboquantBits, turboquantSkipLast);
+      } finally {
+        turboquantSaving = false;
+      }
+    }
+  }
+
+  // Tiered KV cache (Hot RAM / Cold SSD + persistence) toggle state (#01).
+  // Mirrors oMLX's ``CacheSettings``: enabled / hot_cache_only /
+  // ssd_cache_dir / ssd_cache_max_size / hot_cache_max_size. The dir/size knobs
+  // are persisted in localStorage so the dashboard remembers them across
+  // reloads; the enabled/hot_only state is the source of truth from
+  // feature-flags.
+  const TIERED_CACHE_DEFAULTS_KEY = "exo-tiered-cache-defaults-v1";
+  interface TieredCacheDefaults {
+    ssdCacheDir: string | null;
+    ssdCacheMaxSize: string | number;
+    hotCacheMaxSize: string | number;
+  }
+  let tieredCacheSaving = $state(false);
+  let tieredSsdCacheDir = $state<string>("");
+  let tieredSsdCacheMaxSize = $state<string>("auto");
+  let tieredHotCacheMaxSize = $state<string>("0");
+  const tieredCacheEnabled = $derived(featureFlags()["tieredKvCache"] === true);
+  // hot_cache_only is inferred from the enabled toggle: when the tier is
+  // disabled the cache is effectively RAM-only (today's behaviour). When
+  // enabled, hot_only=False means evicted blocks spill to SSD.
+
+  function loadTieredCacheDefaults(): TieredCacheDefaults {
+    try {
+      const stored = localStorage.getItem(TIERED_CACHE_DEFAULTS_KEY);
+      if (stored) {
+        const parsed = JSON.parse(stored) as Partial<TieredCacheDefaults>;
+        return {
+          ssdCacheDir: parsed.ssdCacheDir ?? "",
+          ssdCacheMaxSize: parsed.ssdCacheMaxSize ?? "auto",
+          hotCacheMaxSize: parsed.hotCacheMaxSize ?? "0",
+        };
+      }
+    } catch (e) {
+      console.warn("Failed to load tiered-cache defaults:", e);
+    }
+    return { ssdCacheDir: "", ssdCacheMaxSize: "auto", hotCacheMaxSize: "0" };
+  }
+
+  function saveTieredCacheDefaults(): void {
+    try {
+      localStorage.setItem(
+        TIERED_CACHE_DEFAULTS_KEY,
+        JSON.stringify({
+          ssdCacheDir: tieredSsdCacheDir,
+          ssdCacheMaxSize: tieredSsdCacheMaxSize,
+          hotCacheMaxSize: tieredHotCacheMaxSize,
+        }),
+      );
+    } catch (e) {
+      console.warn("Failed to save tiered-cache defaults:", e);
+    }
+  }
+
+  const _tcDefaults = loadTieredCacheDefaults();
+  tieredSsdCacheDir = _tcDefaults.ssdCacheDir ?? "";
+  tieredSsdCacheMaxSize = _tcDefaults.ssdCacheMaxSize;
+  tieredHotCacheMaxSize = _tcDefaults.hotCacheMaxSize;
+
+  async function toggleTieredCache(): Promise<void> {
+    if (tieredCacheSaving) return;
+    tieredCacheSaving = true;
+    try {
+      await setTieredCache(
+        !tieredCacheEnabled,
+        false, // hot_cache_only: False = spill to SSD (the whole point)
+        tieredSsdCacheDir || null,
+        tieredSsdCacheMaxSize,
+        tieredHotCacheMaxSize,
+      );
+    } finally {
+      tieredCacheSaving = false;
+    }
+  }
+
+  async function applyTieredCacheSettings(): Promise<void> {
+    saveTieredCacheDefaults();
+    if (tieredCacheEnabled) {
+      tieredCacheSaving = true;
+      try {
+        await setTieredCache(
+          true,
+          false,
+          tieredSsdCacheDir || null,
+          tieredSsdCacheMaxSize,
+          tieredHotCacheMaxSize,
+        );
+      } finally {
+        tieredCacheSaving = false;
+      }
+    }
+    await refreshTieredCacheStatus();
+  }
+
+  // Tiered-cache observability block (mirrors oMLX's runtime-cache stats).
+  // Polls GET /v1/tiered-cache while the advanced panel is open so the SSD
+  // used/total gauge + file count stay live.
+  interface TieredCacheStatus {
+    enabled: boolean;
+    hotCacheOnly: boolean;
+    ssdCacheDir: string;
+    ssdCacheMaxSizeBytes: number;
+    hotCacheMaxSizeBytes: number;
+    hotCacheEntries: number;
+    hotCacheSizeBytes: number;
+    ssdCacheFiles: number;
+    ssdCacheSizeBytes: number;
+    ssdDiskCapacityBytes: number;
+    basePath: string;
+    responseStateDir: string;
+  }
+  let tieredCacheStatus = $state<TieredCacheStatus | null>(null);
+  let tieredCacheStatusLoading = $state(false);
+  let showClearSsdCacheConfirm = $state(false);
+  let clearingSsdCache = $state(false);
+  let tieredCachePollTimer: ReturnType<typeof setInterval> | null = null;
+
+  const ssdCacheUsagePercent = $derived(
+    tieredCacheStatus && tieredCacheStatus.ssdCacheMaxSizeBytes > 0
+      ? Math.min(
+          100,
+          (tieredCacheStatus.ssdCacheSizeBytes /
+            tieredCacheStatus.ssdCacheMaxSizeBytes) *
+            100,
+        )
+      : 0,
+  );
+
+  async function refreshTieredCacheStatus(): Promise<void> {
+    tieredCacheStatusLoading = true;
+    try {
+      const raw =
+        (await fetchTieredCacheStatus()) as Partial<TieredCacheStatus>;
+      tieredCacheStatus = {
+        enabled: raw.enabled ?? false,
+        hotCacheOnly: raw.hotCacheOnly ?? false,
+        ssdCacheDir: raw.ssdCacheDir ?? "",
+        ssdCacheMaxSizeBytes: raw.ssdCacheMaxSizeBytes ?? 0,
+        hotCacheMaxSizeBytes: raw.hotCacheMaxSizeBytes ?? 0,
+        hotCacheEntries: raw.hotCacheEntries ?? 0,
+        hotCacheSizeBytes: raw.hotCacheSizeBytes ?? 0,
+        ssdCacheFiles: raw.ssdCacheFiles ?? 0,
+        ssdCacheSizeBytes: raw.ssdCacheSizeBytes ?? 0,
+        ssdDiskCapacityBytes: raw.ssdDiskCapacityBytes ?? 0,
+        basePath: raw.basePath ?? "",
+        responseStateDir: raw.responseStateDir ?? "",
+      };
+    } catch (e) {
+      console.warn("Failed to refresh tiered-cache status:", e);
+    } finally {
+      tieredCacheStatusLoading = false;
+    }
+  }
+
+  async function confirmClearSsdCache(): Promise<void> {
+    clearingSsdCache = true;
+    try {
+      await clearTieredCache();
+      showClearSsdCacheConfirm = false;
+      await refreshTieredCacheStatus();
+    } catch (e) {
+      console.warn("Failed to clear SSD cache:", e);
+    } finally {
+      clearingSsdCache = false;
+    }
+  }
+
+  // Start/stop polling the status while the advanced panel is open + tier enabled.
+  $effect(() => {
+    if (showAdvancedOptions && tieredCacheEnabled) {
+      refreshTieredCacheStatus();
+      tieredCachePollTimer = setInterval(refreshTieredCacheStatus, 5000);
+      return () => {
+        if (tieredCachePollTimer) {
+          clearInterval(tieredCachePollTimer);
+          tieredCachePollTimer = null;
+        }
+      };
+    }
+    return undefined;
+  });
 
   // Favorites state (reactive)
   const favoritesSet = $derived(getFavoritesSet());
@@ -5318,16 +5592,22 @@
                           <div
                             class="mt-1 flex items-center gap-1.5 text-[11px] font-mono text-white/55"
                           >
-                            <span title="Input tokens">↓ {formatTokenCount(
-                              tokenUsage?.promptTokens ?? 0,
-                            )}</span>
+                            <span title="Input tokens"
+                              >↓ {formatTokenCount(
+                                tokenUsage?.promptTokens ?? 0,
+                              )}</span
+                            >
                             <span class="text-white/20">·</span>
-                            <span title="Output tokens">↑ {formatTokenCount(
-                              tokenUsage?.completionTokens ?? 0,
-                            )}</span>
+                            <span title="Output tokens"
+                              >↑ {formatTokenCount(
+                                tokenUsage?.completionTokens ?? 0,
+                              )}</span
+                            >
                             <span class="text-white/20">·</span>
-                            <span title="Completed requests">{tokenUsage?.requestCount ?? 0}
-                              req</span>
+                            <span title="Completed requests"
+                              >{tokenUsage?.requestCount ?? 0}
+                              req</span
+                            >
                           </div>
                         {/if}
                         {#if debugEnabled && instanceConnections.length > 0}
@@ -5951,8 +6231,7 @@
                             : 'border-exo-medium-gray'}"
                         >
                           {#if memoryGuardEnabled}
-                            <span
-                              class="w-1.5 h-1.5 rounded-full bg-exo-yellow"
+                            <span class="w-1.5 h-1.5 rounded-full bg-exo-yellow"
                             ></span>
                           {/if}
                         </span>
@@ -5971,20 +6250,387 @@
                             : 'border-exo-medium-gray'}"
                         >
                           {#if !memoryGuardEnabled}
-                            <span
-                              class="w-1.5 h-1.5 rounded-full bg-exo-yellow"
+                            <span class="w-1.5 h-1.5 rounded-full bg-exo-yellow"
                             ></span>
                           {/if}
                         </span>
                         {memoryGuardSaving ? "…" : "Off"}
                       </button>
                     </div>
-                    <div class="text-[10px] text-white/40 font-mono mt-1.5 leading-snug">
-                      Rejects prefills that would exceed the reclaim-based memory
-                      ceiling (phys_footprint + free + inactive + active×reclaim)
-                      instead of OOM-crashing. Ship default: Off. Tier via
-                      <code class="text-exo-yellow/80">EXO_MEMORY_GUARD_TIER</code>.
+                    <div
+                      class="text-[10px] text-white/40 font-mono mt-1.5 leading-snug"
+                    >
+                      Rejects prefills that would exceed the reclaim-based
+                      memory ceiling (phys_footprint + free + inactive +
+                      active×reclaim) instead of OOM-crashing. Ship default:
+                      Off. Tier via
+                      <code class="text-exo-yellow/80"
+                        >EXO_MEMORY_GUARD_TIER</code
+                      >.
                     </div>
+                  </div>
+
+                  <!-- TurboQuant KV cache compression (#07) -->
+                  <div>
+                    <div class="text-xs text-white/50 font-mono mb-2">
+                      TurboQuant KV Cache:
+                    </div>
+                    <div class="flex gap-2">
+                      <button
+                        onclick={toggleTurboQuant}
+                        disabled={turboquantSaving}
+                        class="flex items-center gap-2 py-1.5 px-3 text-xs font-mono border rounded transition-all duration-200 cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed {turboquantEnabled
+                          ? 'bg-transparent text-exo-yellow border-exo-yellow'
+                          : 'bg-transparent text-white/70 border-exo-medium-gray/50 hover:border-exo-yellow/50'}"
+                      >
+                        <span
+                          class="w-3 h-3 rounded-full border-2 flex items-center justify-center {turboquantEnabled
+                            ? 'border-exo-yellow'
+                            : 'border-exo-medium-gray'}"
+                        >
+                          {#if turboquantEnabled}
+                            <span class="w-1.5 h-1.5 rounded-full bg-exo-yellow"
+                            ></span>
+                          {/if}
+                        </span>
+                        {turboquantSaving ? "…" : "On"}
+                      </button>
+                      <button
+                        onclick={toggleTurboQuant}
+                        disabled={turboquantSaving}
+                        class="flex items-center gap-2 py-1.5 px-3 text-xs font-mono border rounded transition-all duration-200 cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed {!turboquantEnabled
+                          ? 'bg-transparent text-exo-yellow border-exo-yellow'
+                          : 'bg-transparent text-white/70 border-exo-medium-gray/50 hover:border-exo-yellow/50'}"
+                      >
+                        <span
+                          class="w-3 h-3 rounded-full border-2 flex items-center justify-center {!turboquantEnabled
+                            ? 'border-exo-yellow'
+                            : 'border-exo-medium-gray'}"
+                        >
+                          {#if !turboquantEnabled}
+                            <span class="w-1.5 h-1.5 rounded-full bg-exo-yellow"
+                            ></span>
+                          {/if}
+                        </span>
+                        {turboquantSaving ? "…" : "Off"}
+                      </button>
+                    </div>
+                    {#if turboquantEnabled}
+                      <div
+                        class="mt-2 space-y-2 pl-1 in:fade={{ duration: 150 }}"
+                      >
+                        <!-- Bits per channel -->
+                        <div class="flex items-center gap-2">
+                          <span class="text-[10px] text-white/50 font-mono w-20"
+                            >Bits:</span
+                          >
+                          <select
+                            value={turboquantBits}
+                            onchange={(e) =>
+                              applyTurboQuantBits(
+                                Number((e.target as HTMLSelectElement).value),
+                              )}
+                            disabled={turboquantSaving}
+                            class="flex-1 bg-exo-dark-gray text-white/90 text-xs font-mono border border-exo-medium-gray/50 rounded px-2 py-1 focus:border-exo-yellow/60 focus:outline-none disabled:opacity-50"
+                          >
+                            {#each TURBOQUANT_BIT_OPTIONS as opt}
+                              <option value={opt}>{opt}-bit</option>
+                            {/each}
+                          </select>
+                        </div>
+                        <!-- Skip last layer -->
+                        <button
+                          type="button"
+                          onclick={toggleTurboQuantSkipLast}
+                          disabled={turboquantSaving}
+                          class="flex items-center gap-2 text-[10px] text-white/50 hover:text-white/70 font-mono transition-colors cursor-pointer disabled:opacity-50"
+                        >
+                          <span
+                            class="w-3 h-3 rounded-sm border flex items-center justify-center transition-all {turboquantSkipLast
+                              ? 'bg-exo-yellow border-exo-yellow'
+                              : 'border-exo-medium-gray'}"
+                          >
+                            {#if turboquantSkipLast}
+                              <svg
+                                class="w-2 h-2 text-exo-dark-gray"
+                                fill="none"
+                                viewBox="0 0 24 24"
+                                stroke="currentColor"
+                                stroke-width="4"
+                              >
+                                <path
+                                  stroke-linecap="round"
+                                  stroke-linejoin="round"
+                                  d="M5 13l4 4L19 7"
+                                />
+                              </svg>
+                            {/if}
+                          </span>
+                          Skip last layer (full precision)
+                        </button>
+                      </div>
+                    {/if}
+                    <div
+                      class="text-[10px] text-white/40 font-mono mt-1.5 leading-snug"
+                    >
+                      Quantizes the KV cache to cut its memory footprint (longer
+                      contexts / bigger batches). Mirrors oMLX's
+                      <code class="text-exo-yellow/80">turboquant_kv_*</code>.
+                      Half-step bits (2.5/3.5) round down until the native
+                      kernel lands. Composes with the tiered cache below. Ship
+                      default: Off. Env:
+                      <code class="text-exo-yellow/80">EXO_TURBOQUANT_KV</code>,
+                      <code class="text-exo-yellow/80"
+                        >EXO_TURBOQUANT_KV_BITS</code
+                      >,
+                      <code class="text-exo-yellow/80"
+                        >EXO_TURBOQUANT_SKIP_LAST</code
+                      >.
+                    </div>
+                  </div>
+
+                  <!-- Tiered KV cache: Hot RAM + Cold SSD + persistence (#01) -->
+                  <div>
+                    <div class="text-xs text-white/50 font-mono mb-2">
+                      Tiered KV Cache:
+                    </div>
+                    <div class="flex gap-2">
+                      <button
+                        onclick={toggleTieredCache}
+                        disabled={tieredCacheSaving}
+                        class="flex items-center gap-2 py-1.5 px-3 text-xs font-mono border rounded transition-all duration-200 cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed {tieredCacheEnabled
+                          ? 'bg-transparent text-exo-yellow border-exo-yellow'
+                          : 'bg-transparent text-white/70 border-exo-medium-gray/50 hover:border-exo-yellow/50'}"
+                      >
+                        <span
+                          class="w-3 h-3 rounded-full border-2 flex items-center justify-center {tieredCacheEnabled
+                            ? 'border-exo-yellow'
+                            : 'border-exo-medium-gray'}"
+                        >
+                          {#if tieredCacheEnabled}
+                            <span class="w-1.5 h-1.5 rounded-full bg-exo-yellow"
+                            ></span>
+                          {/if}
+                        </span>
+                        {tieredCacheSaving ? "…" : "On"}
+                      </button>
+                      <button
+                        onclick={toggleTieredCache}
+                        disabled={tieredCacheSaving}
+                        class="flex items-center gap-2 py-1.5 px-3 text-xs font-mono border rounded transition-all duration-200 cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed {!tieredCacheEnabled
+                          ? 'bg-transparent text-exo-yellow border-exo-yellow'
+                          : 'bg-transparent text-white/70 border-exo-medium-gray/50 hover:border-exo-yellow/50'}"
+                      >
+                        <span
+                          class="w-3 h-3 rounded-full border-2 flex items-center justify-center {!tieredCacheEnabled
+                            ? 'border-exo-yellow'
+                            : 'border-exo-medium-gray'}"
+                        >
+                          {#if !tieredCacheEnabled}
+                            <span class="w-1.5 h-1.5 rounded-full bg-exo-yellow"
+                            ></span>
+                          {/if}
+                        </span>
+                        {tieredCacheSaving ? "…" : "Off"}
+                      </button>
+                    </div>
+                    {#if tieredCacheEnabled}
+                      <div
+                        class="mt-2 space-y-2 pl-1 in:fade={{ duration: 150 }}"
+                      >
+                        <!-- SSD cache directory -->
+                        <div class="flex items-center gap-2">
+                          <span class="text-[10px] text-white/50 font-mono w-20"
+                            >SSD dir:</span
+                          >
+                          <input
+                            type="text"
+                            value={tieredSsdCacheDir}
+                            oninput={(e) =>
+                              (tieredSsdCacheDir = (
+                                e.target as HTMLInputElement
+                              ).value)}
+                            onblur={applyTieredCacheSettings}
+                            placeholder="(default: ~/.exo/kv_ssd_cache)"
+                            class="flex-1 bg-exo-dark-gray text-white/90 text-xs font-mono border border-exo-medium-gray/50 rounded px-2 py-1 focus:border-exo-yellow/60 focus:outline-none"
+                          />
+                        </div>
+                        <!-- SSD cache max size -->
+                        <div class="flex items-center gap-2">
+                          <span class="text-[10px] text-white/50 font-mono w-20"
+                            >SSD cap:</span
+                          >
+                          <input
+                            type="text"
+                            value={tieredSsdCacheMaxSize}
+                            oninput={(e) =>
+                              (tieredSsdCacheMaxSize = (
+                                e.target as HTMLInputElement
+                              ).value)}
+                            onblur={applyTieredCacheSettings}
+                            placeholder="auto / 8GB / 512MB"
+                            class="flex-1 bg-exo-dark-gray text-white/90 text-xs font-mono border border-exo-medium-gray/50 rounded px-2 py-1 focus:border-exo-yellow/60 focus:outline-none"
+                          />
+                        </div>
+                        <!-- Hot (RAM) cache max size -->
+                        <div class="flex items-center gap-2">
+                          <span class="text-[10px] text-white/50 font-mono w-20"
+                            >RAM cap:</span
+                          >
+                          <input
+                            type="text"
+                            value={tieredHotCacheMaxSize}
+                            oninput={(e) =>
+                              (tieredHotCacheMaxSize = (
+                                e.target as HTMLInputElement
+                              ).value)}
+                            onblur={applyTieredCacheSettings}
+                            placeholder="0 = reclaim threshold / 8GB"
+                            class="flex-1 bg-exo-dark-gray text-white/90 text-xs font-mono border border-exo-medium-gray/50 rounded px-2 py-1 focus:border-exo-yellow/60 focus:outline-none"
+                          />
+                        </div>
+                      </div>
+                    {/if}
+                    <div
+                      class="text-[10px] text-white/40 font-mono mt-1.5 leading-snug"
+                    >
+                      Spills evicted KV blocks to SSD and restores them on a
+                      future prefix hit — even after a restart — so long
+                      agentic/coding sessions reuse gigabytes of prior KV
+                      instead of recomputing. Mirrors oMLX's tiered cache (Hot
+                      RAM + Cold SSD + persistence). Composes with TurboQuant
+                      above (quantized blocks spill smaller). Ship default: Off.
+                      Env:
+                      <code class="text-exo-yellow/80">EXO_TIERED_KV_CACHE</code
+                      >,
+                      <code class="text-exo-yellow/80">EXO_SSD_CACHE_DIR</code>,
+                      <code class="text-exo-yellow/80"
+                        >EXO_SSD_CACHE_MAX_SIZE</code
+                      >.
+                    </div>
+
+                    <!-- Runtime cache observability (mirrors oMLX) -->
+                    {#if tieredCacheEnabled}
+                      <div
+                        class="mt-2.5 p-3 border border-exo-medium-gray/40 rounded bg-exo-dark-gray/60"
+                      >
+                        <div
+                          class="text-[10px] text-white/50 font-mono uppercase tracking-wider mb-2"
+                        >
+                          Runtime Cache Observability
+                        </div>
+                        {#if tieredCacheStatusLoading && !tieredCacheStatus}
+                          <div class="text-[10px] text-white/40 font-mono">
+                            Loading…
+                          </div>
+                        {:else if tieredCacheStatus}
+                          <!-- SSD usage gauge -->
+                          <div class="flex flex-wrap items-center gap-2 mb-2">
+                            <span class="text-[10px] text-white/50 font-mono"
+                              >SSD</span
+                            >
+                            <div
+                              class="flex-1 min-w-[60px] h-1.5 bg-exo-medium-gray/50 rounded-full overflow-hidden"
+                            >
+                              <div
+                                class="h-full bg-exo-yellow/70 rounded-full transition-all duration-500"
+                                style="width: {ssdCacheUsagePercent}%"
+                              ></div>
+                            </div>
+                            <span
+                              class="text-[10px] text-white/60 font-mono whitespace-nowrap tabular-nums"
+                            >
+                              {formatBytes(tieredCacheStatus.ssdCacheSizeBytes)}
+                              / {formatBytes(
+                                tieredCacheStatus.ssdCacheMaxSizeBytes,
+                              )} · {tieredCacheStatus.ssdCacheFiles.toLocaleString()}
+                              files
+                            </span>
+                            <!-- Clear SSD cache button + confirm -->
+                            {#if !showClearSsdCacheConfirm}
+                              <button
+                                type="button"
+                                onclick={() =>
+                                  (showClearSsdCacheConfirm = true)}
+                                disabled={clearingSsdCache ||
+                                  tieredCacheStatus.ssdCacheFiles === 0}
+                                title="Clear SSD cache"
+                                class="p-1 text-white/40 hover:text-red-400 hover:bg-white/10 rounded transition-all disabled:opacity-30 disabled:cursor-not-allowed cursor-pointer"
+                              >
+                                <svg
+                                  class="w-3.5 h-3.5"
+                                  fill="none"
+                                  viewBox="0 0 24 24"
+                                  stroke="currentColor"
+                                  stroke-width="2"
+                                >
+                                  <path
+                                    stroke-linecap="round"
+                                    stroke-linejoin="round"
+                                    d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"
+                                  />
+                                </svg>
+                              </button>
+                            {:else}
+                              <div class="flex items-center gap-1.5">
+                                <span class="text-[10px] text-red-400 font-mono"
+                                  >Clear all SSD cache files?</span
+                                >
+                                <button
+                                  type="button"
+                                  onclick={confirmClearSsdCache}
+                                  disabled={clearingSsdCache}
+                                  class="px-2 py-0.5 text-[10px] font-mono text-white bg-red-500/80 hover:bg-red-500 rounded transition-all disabled:opacity-50 cursor-pointer"
+                                >
+                                  {clearingSsdCache ? "…" : "Yes"}
+                                </button>
+                                <button
+                                  type="button"
+                                  onclick={() =>
+                                    (showClearSsdCacheConfirm = false)}
+                                  class="px-2 py-0.5 text-[10px] font-mono text-white/60 hover:bg-white/10 rounded transition-all cursor-pointer"
+                                >
+                                  Cancel
+                                </button>
+                              </div>
+                            {/if}
+                          </div>
+                          <!-- Path info rows -->
+                          <div class="space-y-1 text-[10px] font-mono">
+                            <div class="flex gap-2">
+                              <span class="text-white/40 w-28 shrink-0"
+                                >Active base:</span
+                              >
+                              <code class="text-white/60 break-all"
+                                >{tieredCacheStatus.basePath || "-"}</code
+                              >
+                            </div>
+                            <div class="flex gap-2">
+                              <span class="text-white/40 w-28 shrink-0"
+                                >SSD cache dir:</span
+                              >
+                              <code class="text-white/60 break-all"
+                                >{tieredCacheStatus.ssdCacheDir || "-"}</code
+                              >
+                            </div>
+                            <div class="flex gap-2">
+                              <span class="text-white/40 w-28 shrink-0"
+                                >SSD disk cap:</span
+                              >
+                              <code class="text-white/60 break-all"
+                                >{formatBytes(
+                                  tieredCacheStatus.ssdDiskCapacityBytes,
+                                )}</code
+                              >
+                            </div>
+                          </div>
+                        {:else}
+                          <div class="text-[10px] text-white/40 font-mono">
+                            No status.
+                          </div>
+                        {/if}
+                      </div>
+                    {/if}
                   </div>
                 </div>
               {/if}
@@ -6525,16 +7171,22 @@
                             <div
                               class="mt-1 flex items-center gap-1.5 text-[11px] font-mono text-white/55"
                             >
-                              <span title="Input tokens">↓ {formatTokenCount(
-                                tokenUsage?.promptTokens ?? 0,
-                              )}</span>
+                              <span title="Input tokens"
+                                >↓ {formatTokenCount(
+                                  tokenUsage?.promptTokens ?? 0,
+                                )}</span
+                              >
                               <span class="text-white/20">·</span>
-                              <span title="Output tokens">↑ {formatTokenCount(
-                                tokenUsage?.completionTokens ?? 0,
-                              )}</span>
+                              <span title="Output tokens"
+                                >↑ {formatTokenCount(
+                                  tokenUsage?.completionTokens ?? 0,
+                                )}</span
+                              >
                               <span class="text-white/20">·</span>
-                              <span title="Completed requests">{tokenUsage?.requestCount ?? 0}
-                                req</span>
+                              <span title="Completed requests"
+                                >{tokenUsage?.requestCount ?? 0}
+                                req</span
+                              >
                             </div>
                           {/if}
                           {#if debugEnabled && instanceConnections.length > 0}

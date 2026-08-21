@@ -3437,6 +3437,99 @@ class AppStore {
   }
 
   /**
+   * Runtime-toggle TurboQuant KV-cache compression (#07). Mirrors oMLX's
+   * ``turboquant_kv_enabled`` / ``turboquant_kv_bits`` / ``turboquant_skip_last``.
+   * Takes effect on the next model load. Refetches feature flags so the UI
+   * reflects the new enabled state immediately.
+   */
+  async setTurboQuant(
+    enabled: boolean,
+    bits: number,
+    skipLast: boolean,
+  ): Promise<{ enabled: boolean; bits: number; skipLast: boolean }> {
+    const response = await fetch("/v1/turboquant", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ enabled, bits, skip_last: skipLast }),
+    });
+    if (!response.ok) {
+      throw new Error(
+        `Failed to set TurboQuant: ${response.status} ${await response.text()}`,
+      );
+    }
+    const result = (await response.json()) as {
+      enabled: boolean;
+      bits: number;
+      skipLast: boolean;
+    };
+    await this.fetchFeatureFlags();
+    return result;
+  }
+
+  /**
+   * Runtime-toggle the tiered (Hot RAM / Cold SSD) KV cache (#01). Mirrors
+   * oMLX's ``CacheSettings``. ``ssdCacheMaxSize`` / ``hotCacheMaxSize`` accept
+   * a size string ("auto"/"8GB") or a byte count. Refetches feature flags so
+   * the UI reflects the new enabled state immediately.
+   */
+  async setTieredCache(
+    enabled: boolean,
+    hotCacheOnly: boolean,
+    ssdCacheDir: string | null,
+    ssdCacheMaxSize: string | number,
+    hotCacheMaxSize: string | number,
+  ): Promise<Record<string, unknown>> {
+    const response = await fetch("/v1/tiered-cache", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        enabled,
+        hot_cache_only: hotCacheOnly,
+        ssd_cache_dir: ssdCacheDir,
+        ssd_cache_max_size: ssdCacheMaxSize,
+        hot_cache_max_size: hotCacheMaxSize,
+      }),
+    });
+    if (!response.ok) {
+      throw new Error(
+        `Failed to set tiered cache: ${response.status} ${await response.text()}`,
+      );
+    }
+    const result = (await response.json()) as Record<string, unknown>;
+    await this.fetchFeatureFlags();
+    return result;
+  }
+
+  /**
+   * Fetch the live tiered-cache status (hot/cold block counts + sizes) for the
+   * dashboard observability block.
+   */
+  async fetchTieredCacheStatus(): Promise<Record<string, unknown>> {
+    const response = await fetch("/v1/tiered-cache");
+    if (!response.ok) {
+      throw new Error(
+        `Failed to fetch tiered-cache status: ${response.status} ${await response.text()}`,
+      );
+    }
+    return (await response.json()) as Record<string, unknown>;
+  }
+
+  /**
+   * Delete every file in the SSD cache dir (mirrors oMLX's clear route).
+   * Returns the count of files removed.
+   */
+  async clearTieredCache(): Promise<number> {
+    const response = await fetch("/v1/tiered-cache", { method: "DELETE" });
+    if (!response.ok) {
+      throw new Error(
+        `Failed to clear SSD cache: ${response.status} ${await response.text()}`,
+      );
+    }
+    const result = (await response.json()) as { removed: number };
+    return result.removed;
+  }
+
+  /**
    * Delete a downloaded model from a specific node
    */
   async deleteDownload(nodeId: string, modelId: string): Promise<void> {
@@ -3551,6 +3644,27 @@ export const deleteInstanceLink = (linkId: string) =>
   appStore.deleteInstanceLink(linkId);
 export const setMemoryGuard = (enabled: boolean) =>
   appStore.setMemoryGuard(enabled);
+export const setTurboQuant = (
+  enabled: boolean,
+  bits: number,
+  skipLast: boolean,
+) => appStore.setTurboQuant(enabled, bits, skipLast);
+export const setTieredCache = (
+  enabled: boolean,
+  hotCacheOnly: boolean,
+  ssdCacheDir: string | null,
+  ssdCacheMaxSize: string | number,
+  hotCacheMaxSize: string | number,
+) =>
+  appStore.setTieredCache(
+    enabled,
+    hotCacheOnly,
+    ssdCacheDir,
+    ssdCacheMaxSize,
+    hotCacheMaxSize,
+  );
+export const fetchTieredCacheStatus = () => appStore.fetchTieredCacheStatus();
+export const clearTieredCache = () => appStore.clearTieredCache();
 export const downloads = () => appStore.downloads;
 export const nodeDisk = () => appStore.nodeDisk;
 export const placementPreviews = () => appStore.placementPreviews;

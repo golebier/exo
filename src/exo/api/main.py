@@ -92,6 +92,7 @@ from exo.api.types import (
     PlacementPreviewResponse,
     StartDownloadParams,
     StartDownloadResponse,
+    TieredCacheSetting,
     ToolCall,
     TraceCategoryStats,
     TraceEventResponse,
@@ -100,6 +101,7 @@ from exo.api.types import (
     TraceRankStats,
     TraceResponse,
     TraceStatsResponse,
+    TurboQuantSetting,
     normalize_image_size,
 )
 from exo.api.types.claude_api import (
@@ -208,7 +210,7 @@ from exo.utils.channels import Receiver, Sender, channel
 from exo.utils.disk_event_log import DiskEventLog
 from exo.utils.power_sampler import PowerSampler
 from exo.utils.task_group import TaskGroup
-from exo.worker.engines.mlx import memory_guard
+from exo.worker.engines.mlx import memory_guard, turboquant
 
 _API_EVENT_LOG_DIR = EXO_EVENT_LOG_DIR / "api"
 ONBOARDING_COMPLETE_FILE = EXO_CACHE_HOME / "onboarding_complete"
@@ -358,6 +360,10 @@ class API:
         self.app.delete("/v1/instance-links/{link_id}")(self.delete_instance_link)
         self.app.get("/v1/feature-flags")(self.get_feature_flags)
         self.app.put("/v1/memory-guard")(self.set_memory_guard)
+        self.app.put("/v1/turboquant")(self.set_turboquant)
+        self.app.put("/v1/tiered-cache")(self.set_tiered_cache)
+        self.app.get("/v1/tiered-cache")(self.get_tiered_cache)
+        self.app.delete("/v1/tiered-cache")(self.clear_tiered_cache)
         self.app.get("/v1/version")(self.get_version)
         self.app.get("/models")(self.get_models)
         self.app.get("/v1/models")(self.get_models)
@@ -701,6 +707,8 @@ class API:
         return {
             "disaggregation": ENABLE_DISAGGREGATION,
             "prefillMemoryGuard": memory_guard.is_guard_enabled(),
+            "turboquantKv": turboquant.is_turboquant_enabled(),
+            "tieredKvCache": turboquant.is_tiered_cache_enabled(),
         }
 
     async def set_memory_guard(self, body: MemoryGuardSetting) -> dict[str, bool]:
@@ -713,6 +721,63 @@ class API:
         """
         memory_guard.set_guard_enabled(body.enabled)
         return {"prefillMemoryGuard": memory_guard.is_guard_enabled()}
+
+    async def set_turboquant(self, body: TurboQuantSetting) -> dict[str, object]:
+        """Runtime toggle for TurboQuant KV-cache compression (#07).
+
+        Mirrors oMLX's ``ModelSettings.turboquant_kv_*``. Takes effect on the
+        next ``make_kv_cache`` call (next model load, or a clean prefill after
+        the prefix cache is invalidated); a model already loaded with a
+        different cache dtype is not retroactively requantized.
+        """
+        turboquant.set_turboquant_enabled(body.enabled)
+        turboquant.set_turboquant_bits(body.bits)
+        turboquant.set_turboquant_skip_last(body.skip_last)
+        settings = turboquant.turboquant_settings()
+        return {str(k): v for k, v in settings.items()}
+
+    async def set_tiered_cache(self, body: TieredCacheSetting) -> dict[str, object]:
+        """Runtime toggle for the tiered (Hot RAM / Cold SSD) KV cache (#01).
+
+        Mirrors oMLX's ``CacheSettings``. The SSD spill/restore plumbing is
+        staged behind this flag; the dir/size knobs are live so the dashboard
+        reflects the configured state and the heavy paged-SSD work can land
+        without further UI churn.
+        """
+        turboquant.set_tiered_cache_enabled(body.enabled)
+        turboquant.set_hot_cache_only(body.hot_cache_only)
+        turboquant.set_ssd_cache_dir(body.ssd_cache_dir)
+        turboquant.set_ssd_cache_max_size(body.ssd_cache_max_size)
+        turboquant.set_hot_cache_max_size(body.hot_cache_max_size)
+        settings = turboquant.tiered_cache_settings()
+        return {str(k): v for k, v in settings.items()}
+
+    async def get_tiered_cache(self) -> dict[str, object]:
+        """Live tiered-cache status for the dashboard observability block."""
+        status = turboquant.tiered_cache_status()
+        return {
+            "enabled": status.enabled,
+            "hotCacheOnly": status.hot_cache_only,
+            "ssdCacheDir": status.ssd_cache_dir,
+            "ssdCacheMaxSizeBytes": status.ssd_cache_max_size_bytes,
+            "hotCacheMaxSizeBytes": status.hot_cache_max_size_bytes,
+            "hotCacheEntries": status.hot_cache_entries,
+            "hotCacheSizeBytes": status.hot_cache_size_bytes,
+            "ssdCacheFiles": status.ssd_cache_files,
+            "ssdCacheSizeBytes": status.ssd_cache_size_bytes,
+            "ssdDiskCapacityBytes": status.ssd_disk_capacity_bytes,
+            "basePath": status.base_path,
+            "responseStateDir": status.response_state_dir,
+        }
+
+    async def clear_tiered_cache(self) -> dict[str, int]:
+        """Delete every file in the SSD cache dir (mirrors oMLX's clear route).
+
+        Returns the count of files removed. Safe to call whether or not the
+        tier is enabled; a disabled tier simply has nothing to clear.
+        """
+        removed = turboquant.clear_ssd_cache()
+        return {"removed": removed}
 
     async def get_version(self) -> dict[str, str]:
         """App build version for the dashboard top-left badge (task #11)."""
