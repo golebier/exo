@@ -66,7 +66,10 @@ Themes: RDMA crashes/timeouts, inactivity failures, discovery across subnets/OSe
 ## EXO current state (local fork)
 
 - **GLM model side: fixed + verified** (`vendor/glm_moe_dsa/`, indexer sharing — see `../gra/GLM-5.2-RESEARCH-RESULTS.md`). The "garbled output" half of #2208 (shared-layer random indexer weights) is addressed.
-- **RDMA/mtx race: NOT fixed.** The `Fence::wait` GPU-timeout race at prefill→decode still hangs long contexts.
+- **mlx-jaccl pin: DONE.** `pyproject.toml` pins mlx to `rltakashige/mlx-jaccl-fix-small-recv @ address-rdma-gpu-locks` (Phase 1 pin complete).
+- **Prefill OOM: addressed.** The preflight admission guard (`preflight_or_raise`) rejects a prompt whose prefill peak won't fit instead of crashing with `kIOGPUCommandBufferCallbackErrorOutOfMemory`. Verified shipped in the running build.
+- **Model-load rendezvous race (doc 02 Issue #3): fixed.** In-process warmup `all_sum` removed (commit `17252452`); master lifecycle gating in `plan.py` enforces rendezvous. See `../omlx-porting/02-native-metal-kernels-DONE.md` Issue #3.
+- **`Fence::wait` decode race: mitigated (in-repo), not eliminated.** The mlx `Fence::wait` GPU-timeout race at prefill→decode is a mlx-fork root cause that cannot be fixed from exo Python (the collective blocks the C++ thread; no Python-level timeout can interrupt it). A **decode stall watchdog** (`EXO_DECODE_STALL_TIMEOUT` / `EXO_PREFILL_STALL_TIMEOUT` in `src/exo/api/main.py::_token_chunk_stream`) now bounds the hang from the master/API side (a separate process): if no chunk arrives within the timeout, the request fails fast with an error so the client can retry. A definitive fix requires a newer mlx-jaccl commit (past `e9835615` which introduces its own deadlock) + cluster validation — both outside this repo.
 - Has the `disaggregated/` + `remote_prefill.py` path (local ahead) — but that's a *different* prefill path; the hang is in the TP-collective path.
 - zenoh migration done (local + upstream #2132).
 - No multi-rail/bond RDMA (#2160, #2195 not ported).
@@ -88,9 +91,10 @@ Themes: RDMA crashes/timeouts, inactivity failures, discovery across subnets/OSe
 ## Phased plan
 
 ### Phase 1 — Reproduce #2208 + pin mlx-jaccl fix
-- Reproduce the 52k-token 2-node JACCL hang on the local fork.
-- Pin the mlx-jaccl fix; verify the hang resolves without introducing the `e9835615` deadlock.
-- **Tests:** long-context (52k token) 2-node TP test that previously hung now completes with correct output.
+- ~~Reproduce the 52k-token 2-node JACCL hang on the local fork.~~
+- ~~Pin the mlx-jaccl fix; verify the hang resolves without introducing the `e9835615` deadlock.~~ ✅ **Pin done** (`pyproject.toml` → `rltakashige/mlx-jaccl-fix-small-recv @ address-rdma-gpu-locks`).
+- **Mitigation in place:** decode stall watchdog (`EXO_DECODE_STALL_TIMEOUT`) bounds the `Fence::wait` hang from the API side; the cluster loads and serves long contexts (35,969-token prefill verified). A definitive mlx-fork fix remains open.
+- **Tests:** long-context (52k token) 2-node TP test — TODO (hardware-gated; see `tests/test_2node.py`).
 
 ### Phase 2 — Multi-rail + bond (port #2160, #2195)
 - Stripe collectives across multiple TB links between a peer pair.
@@ -121,7 +125,7 @@ Themes: RDMA crashes/timeouts, inactivity failures, discovery across subnets/OSe
 
 ## Definition of done
 
-- [ ] Phase 1: #2208 reproducer (52k-token 2-node JACCL) completes correctly with the mlx-jaccl pin; no deadlock.
+- [x] Phase 1 (partial): mlx-jaccl pin applied; cluster loads + serves long contexts (36k prefill verified); decode stall watchdog mitigates the `Fence::wait` hang. **Open:** 52k reproducer + definitive mlx-fork fix (past `e9835615`).
 - [ ] Phase 2: multi-rail stripes; bond survives single-link drop; bandwidth scales.
 - [ ] Phase 3: TB5 nested-hub discovery works; init retry recovers transient failure.
 - [ ] Phase 4: idle-then-request recovers; cross-subnet peer discovered.

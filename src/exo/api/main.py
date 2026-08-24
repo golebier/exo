@@ -12,7 +12,7 @@ from typing import Annotated, Any, Literal, cast
 from uuid import uuid4
 
 import anyio
-from anyio import BrokenResourceError, ClosedResourceError
+from anyio import BrokenResourceError, ClosedResourceError, EndOfStream
 from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
@@ -134,9 +134,11 @@ from exo.shared.constants import (
     ENABLE_DISAGGREGATION,
     EXO_APP_VERSION,
     EXO_CACHE_HOME,
+    EXO_DECODE_STALL_TIMEOUT,
     EXO_EVENT_LOG_DIR,
     EXO_IMAGE_CACHE_DIR,
     EXO_MAX_CHUNK_SIZE,
+    EXO_PREFILL_STALL_TIMEOUT,
     EXO_TRACING_CACHE_DIR,
 )
 from exo.shared.election import ElectionMessage
@@ -857,10 +859,56 @@ class API:
             ]()
 
             with recv as token_chunks:
-                async for chunk in token_chunks:
+                decode_started = False
+                while True:
+                    # Stall watchdog: bound the wait for the next chunk so a
+                    # hung mlx ``Fence::wait`` collective (which blocks the
+                    # runner's C++ thread and stops it emitting chunks) cannot
+                    # hang the API client forever.  The master/API is a
+                    # separate process and can observe the absence of chunks.
+                    # See EXO_DECODE_STALL_TIMEOUT / EXO_PREFILL_STALL_TIMEOUT.
+                    stall_timeout = (
+                        EXO_DECODE_STALL_TIMEOUT
+                        if decode_started
+                        else EXO_PREFILL_STALL_TIMEOUT
+                    )
+                    chunk: (
+                        TokenChunk | ErrorChunk | ToolCallChunk | PrefillProgressChunk
+                    ) | None = None
+                    if stall_timeout > 0:
+                        with anyio.move_on_after(stall_timeout) as cancel_scope:
+                            try:
+                                chunk = await token_chunks.receive()
+                            except EndOfStream:
+                                break
+                        if cancel_scope.cancelled_caught:
+                            phase = "decode" if decode_started else "prefill"
+                            logger.error(
+                                f"{command_id} {phase} stall: no chunk within "
+                                f"{stall_timeout}s — likely a hung mlx "
+                                f"Fence::wait collective on a TP peer. "
+                                f"Failing the request."
+                            )
+                            yield ErrorChunk(
+                                model=cast(ModelId, str(command_id)),
+                                error_message=(
+                                    f"{phase} stalled: no tokens for "
+                                    f"{stall_timeout}s (hung distributed "
+                                    f"collective). Please retry."
+                                ),
+                            )
+                            break
+                    else:
+                        try:
+                            chunk = await token_chunks.receive()
+                        except EndOfStream:
+                            break
+
+                    assert chunk is not None
                     yield chunk
                     if isinstance(chunk, PrefillProgressChunk):
                         continue
+                    decode_started = True
                     if chunk.finish_reason is not None:
                         break
 

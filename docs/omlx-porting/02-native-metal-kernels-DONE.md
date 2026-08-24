@@ -1,8 +1,8 @@
 # 02 — Native Metal Custom Kernels: Implementation & Post-Deploy Issues (DONE log)
 
 **Status:** Native kernel build/packaging implemented and verified; two runtime
-regressions found during cluster deployment and fixed; a third (pre-existing)
-JACCL rendezvous race identified and pending a fix. This doc is the
+regressions found during cluster deployment and fixed; the third (pre-existing)
+JACCL rendezvous race is **fixed** (see Issue #3 below). This doc is the
 post-mortem / implementation record. See
 [`02-native-metal-kernels.md`](./02-native-metal-kernels.md) for the original
 design rationale and [`mlx_kernels/README.md`](../../mlx_kernels/README.md) for
@@ -261,10 +261,13 @@ belongs there.
 
 ## 3. Issue #3 — JACCL `all_sum` rendezvous race (pre-existing, exposed by timing)
 
-> ⚠️ **Not yet fixed.** This is the current blocker. It is **not** caused by
-> the native-kernel work — it's in `utils_mlx.py` (commit `311fda60`, present
-> in the `v1.0.72-GLM-5.2` tag that "worked"). Our lazy-import fix changed
-> runner import timing enough to expose it.
+> ✅ **Fixed.** The in-process warmup `all_sum` was **removed** entirely
+> (commit `17252452`) and model-load rendezvous is now enforced by the
+> master's lifecycle gating in `plan.py` (rank 0 is not sent `LoadModel`
+> until rank 1 reaches `RunnerConnected`). The RDMA data path itself is
+> validated by `_probe_rdma_interface` in a subprocess (both ranks
+> participate simultaneously). Verified on the live 2-node M3 Ultra cluster:
+> a 35,969-token prefill completed successfully and the cluster is serving.
 
 ### Symptom (second deploy, build r4 with the lazy fix)
 
@@ -325,46 +328,61 @@ import graph) had rank 1 arriving at the collective at/before rank 0. Our
 native-kernel work shifted the runner's import sequence enough that rank 0 now
 wins the race.
 
-### Proposed fix (NOT yet implemented)
+### Fix (implemented)
 
-Make the warmup **rendezvous-safe** by retrying until both ranks demonstrably
-participated (the sum must equal `world_size`). `mx.distributed` exposes no
-plain `barrier()`; a value-checking retry is the portable guard:
+The retry-loop approach proposed below was **rejected** after analysis: the
+1ms degenerate return is deterministic for the coordinator (JACCL caches the
+group state and returns instantly without re-exchanging), so a value-checking
+retry loop cannot help rank 1 — only rank 0's behavior changes. There is no
+portable in-process fix because the race is in the coordinator's unilateral
+completion.
+
+Instead, the fix has two parts:
+
+1. **Removed the in-process warmup `all_sum`** from `utils_mlx.py`
+   (commit `17252452`). The RDMA data path is validated exclusively by
+   `_probe_rdma_interface`, which runs a full `all_sum` in a **subprocess**
+   with both ranks participating simultaneously — sidestepping the in-process
+   coordinator race entirely.
+2. **Master-side lifecycle gating** in `plan.py`: rank 0 is not sent
+   `LoadModel` until rank 1 has reached `RunnerConnected`. This guarantees
+   both ranks are past distributed init and the group is established before
+   any model-load collective runs. If the in-process group is broken, model
+   loading's first real collective (which both ranks enter in lockstep) will
+   surface it — and the master's `_probe_rdma_interface` already caught any
+   RDMA data-path failure.
+
+The `utils_mlx.py` code now carries an explicit comment documenting why no
+in-process warmup runs and what guarantees correctness.
+
+> **Note (rejected alternative).** The original proposal was a value-checking
+> retry loop: repeat `all_sum(1.0)` until `result == world_size`. This was
+> rejected because the coordinator's degenerate 1ms return is cached and
+> deterministic — it repeats on every retry without re-exchanging. A real
+> fix would require a coordinator-side ack round via the TCP/zenoh
+> side-channel, but the master-lifecycle gating above already provides that
+> rendezvous guarantee out-of-band. Kept here for the record:
 
 ```python
-# Proposed: src/exo/worker/engines/mlx/utils_mlx.py
-if isinstance(bound_instance.instance, MlxJacclInstance):
-    world_size = len(jaccl_devices)
-    logger.info(f"Rank {rank} warming up JACCL data path")
-    # A plain all_sum can return degenerately on rank 0 (the coordinator)
-    # before rank 1 joins the group — retry until both ranks demonstrably
-    # participated (sum == world_size) so neither hangs.
-    deadline = time.monotonic() + 60.0
-    while True:
-        result = mx.eval(mx.distributed.all_sum(mx.array(1.0), group=group))
-        if int(result.item()) == world_size:
-            break
-        if time.monotonic() > deadline:
-            raise TimeoutError(
-                f"rank {rank}: JACCL warmup all_sum did not reach "
-                f"{world_size} participants in 60s (got {int(result.item())})"
-            )
-        time.sleep(0.5)
-    logger.info(f"Rank {rank} JACCL warmup complete")
+# REJECTED: retry loop does not work (degenerate return is cached).
+# world_size = len(jaccl_devices)
+# deadline = time.monotonic() + 60.0
+# while True:
+#     result = mx.eval(mx.distributed.all_sum(mx.array(1.0), group=group))
+#     if int(result.item()) == world_size:
+#         break
+#     if time.monotonic() > deadline:
+#         raise TimeoutError(...)
+#     time.sleep(0.5)
 ```
 
-**Caveat:** this assumes the degenerate 1ms return repeats the collective on
-each retry. If jaccl caches the group state and returns instantly every time
-without re-exchanging, the retry won't help and a real barrier/rendezvous
-primitive (or a coordinator-side ack round via the existing TCP side-channel)
-is needed. Must be validated empirically on the cluster before committing.
+### Verification (live cluster, `GLM-5.2-oQ4`, M3 Ultra ×2, build `1.0.72-cache-efficiency-dev2`)
 
-### Open question (needs a 2-node test)
-
-Is the 1ms degenerate return deterministic, or does it depend on rank-arrival
-order? If the latter, the retry loop above suffices. If the former, the fix
-must force a rendezvous (e.g. both ranks `all_sum` a nonce and the coordinator
-confirms via the zenoh/TCP command path before either proceeds to model load).
+Both nodes running commit `42762e44` (which includes the `17252452` fix).
+Model load succeeds; a 35,969-token prefill completed (11:44→11:47) followed
+by successful decode. No `Fence::wait`/`IOSurface`/rendezvous-hang evidence
+in recent logs. The runner process is idle-healthy (parked on
+`_PySemaphore_Wait`, not wedged in a collective).
 
 ---
 

@@ -111,3 +111,20 @@ EXO_APP_VERSION = os.getenv("EXO_APP_VERSION") or "dev"
 EXO_MAX_CONCURRENT_REQUESTS = int(os.getenv("EXO_MAX_CONCURRENT_REQUESTS", "8"))
 
 EXO_MAX_INSTANCE_RETRIES = 5
+
+# Decode stall watchdog (seconds).  During multi-node TP decode the runner's
+# per-token collective (``agree_on_cancellations`` → ``all_gather``) can block
+# indefinitely in mlx ``Fence::wait`` if a peer's Metal command buffer times
+# out.  Because the collective blocks the C++ thread, neither rank can emit a
+# chunk and the API client hangs forever.  This bounds the hang from the
+# master/API side (a separate process) by failing the request if no chunk
+# arrives within this window after decode has started.  Set to 0 to disable.
+# 120s tolerates a slow first decode step (prefill→decode barrier + first
+# sample) while still bounding a true stall.
+EXO_DECODE_STALL_TIMEOUT = float(os.getenv("EXO_DECODE_STALL_TIMEOUT", "120"))
+
+# Prefill stall watchdog (seconds).  Bounds the wait for the *next* chunk
+# before decode begins (``PrefillProgressChunk`` heartbeat during prefill, or
+# the first ``TokenChunk`` at decode start).  Generous because a 45–52k-token
+# prefill may take minutes, but progress chunks should still arrive regularly.
+EXO_PREFILL_STALL_TIMEOUT = float(os.getenv("EXO_PREFILL_STALL_TIMEOUT", "180"))
