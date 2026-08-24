@@ -5609,6 +5609,61 @@
                               req</span
                             >
                           </div>
+                          {#if tokenUsage && tokenUsage.promptTokens > 0}
+                            {@const cacheEfficiency =
+                              (tokenUsage.cachedTokens ?? 0) /
+                              tokenUsage.promptTokens *
+                              100}
+                            <div
+                              class="mt-1.5 grid grid-cols-3 gap-1.5"
+                              title="Prefix-cache accounting for this instance (mirrors oMLX's cache-efficiency stat cards)"
+                            >
+                              <div
+                                class="rounded-md bg-white/5 px-1.5 py-1 text-center"
+                              >
+                                <div
+                                  class="text-[9px] font-semibold uppercase tracking-wider text-white/40"
+                                >
+                                  Prefill
+                                </div>
+                                <div
+                                  class="text-[11px] font-mono text-white/70"
+                                >
+                                  {formatTokenCount(tokenUsage.promptTokens)}
+                                </div>
+                              </div>
+                              <div
+                                class="rounded-md bg-white/5 px-1.5 py-1 text-center"
+                              >
+                                <div
+                                  class="text-[9px] font-semibold uppercase tracking-wider text-white/40"
+                                >
+                                  Cached
+                                </div>
+                                <div
+                                  class="text-[11px] font-mono text-white/70"
+                                >
+                                  {formatTokenCount(
+                                    tokenUsage.cachedTokens ?? 0,
+                                  )}
+                                </div>
+                              </div>
+                              <div
+                                class="rounded-md bg-white/5 px-1.5 py-1 text-center"
+                              >
+                                <div
+                                  class="text-[9px] font-semibold uppercase tracking-wider text-white/40"
+                                >
+                                  Efficiency
+                                </div>
+                                <div
+                                  class="text-[11px] font-mono text-white/70"
+                                >
+                                  {cacheEfficiency.toFixed(1)}%
+                                </div>
+                              </div>
+                            </div>
+                          {/if}
                         {/if}
                         {#if debugEnabled && instanceConnections.length > 0}
                           <div class="mt-2 space-y-1">
@@ -7188,6 +7243,61 @@
                                 req</span
                               >
                             </div>
+                            {#if tokenUsage && tokenUsage.promptTokens > 0}
+                              {@const cacheEfficiency =
+                                (tokenUsage.cachedTokens ?? 0) /
+                                tokenUsage.promptTokens *
+                                100}
+                              <div
+                                class="mt-1.5 grid grid-cols-3 gap-1.5"
+                                title="Prefix-cache accounting for this instance (mirrors oMLX's cache-efficiency stat cards)"
+                              >
+                                <div
+                                  class="rounded-md bg-white/5 px-1.5 py-1 text-center"
+                                >
+                                  <div
+                                    class="text-[9px] font-semibold uppercase tracking-wider text-white/40"
+                                  >
+                                    Prefill
+                                  </div>
+                                  <div
+                                    class="text-[11px] font-mono text-white/70"
+                                  >
+                                    {formatTokenCount(tokenUsage.promptTokens)}
+                                  </div>
+                                </div>
+                                <div
+                                  class="rounded-md bg-white/5 px-1.5 py-1 text-center"
+                                >
+                                  <div
+                                    class="text-[9px] font-semibold uppercase tracking-wider text-white/40"
+                                  >
+                                    Cached
+                                  </div>
+                                  <div
+                                    class="text-[11px] font-mono text-white/70"
+                                  >
+                                    {formatTokenCount(
+                                      tokenUsage.cachedTokens ?? 0,
+                                    )}
+                                  </div>
+                                </div>
+                                <div
+                                  class="rounded-md bg-white/5 px-1.5 py-1 text-center"
+                                >
+                                  <div
+                                    class="text-[9px] font-semibold uppercase tracking-wider text-white/40"
+                                  >
+                                    Efficiency
+                                  </div>
+                                  <div
+                                    class="text-[11px] font-mono text-white/70"
+                                  >
+                                    {cacheEfficiency.toFixed(1)}%
+                                  </div>
+                                </div>
+                              </div>
+                            {/if}
                           {/if}
                           {#if debugEnabled && instanceConnections.length > 0}
                             <div class="mt-2 space-y-1">

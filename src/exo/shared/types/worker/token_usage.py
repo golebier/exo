@@ -17,3 +17,7 @@ class InstanceTokenUsage(FrozenModel):
     completion_tokens: int
     total_tokens: int
     request_count: int
+    # Share of ``prompt_tokens`` served from the KV prefix cache rather than
+    # recomputed. Defaults to 0 so persisted state from before this field
+    # existed still deserializes.
+    cached_tokens: int = 0

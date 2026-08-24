@@ -82,6 +82,9 @@ class InstanceTokensUpdated(BaseEvent):
     instance_id: InstanceId
     prompt_tokens: int
     completion_tokens: int
+    # Prompt tokens served from the KV prefix cache for this request. Defaults
+    # to 0 so persisted events from before this field existed still replay.
+    cached_tokens: int = 0
 
 
 class RunnerStatusUpdated(BaseEvent):

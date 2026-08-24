@@ -429,7 +429,7 @@
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
-				MARKETING_VERSION = 1.0.72-memory-headroom-dev4;
+				MARKETING_VERSION = 1.0.72-cache-efficiency-dev1;
 				PRODUCT_BUNDLE_IDENTIFIER = exolabs.EXO;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				EXO_BUILD_COMMIT = local;
@@ -466,7 +466,7 @@
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
-				MARKETING_VERSION = 1.0.72-memory-headroom-dev4;
+				MARKETING_VERSION = 1.0.72-cache-efficiency-dev1;
 				PRODUCT_BUNDLE_IDENTIFIER = exolabs.EXO;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				EXO_BUILD_COMMIT = local;

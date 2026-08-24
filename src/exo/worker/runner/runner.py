@@ -423,5 +423,6 @@ class Runner:
                     instance_id=self.instance.instance_id,
                     prompt_tokens=usage.prompt_tokens,
                     completion_tokens=usage.completion_tokens,
+                    cached_tokens=usage.prompt_tokens_details.cached_tokens,
                 )
             )

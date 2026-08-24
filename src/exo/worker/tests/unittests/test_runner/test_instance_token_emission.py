@@ -64,12 +64,12 @@ class _EventCollector:
     def join(self) -> None: ...
 
 
-def _usage(prompt: int, completion: int) -> Usage:
+def _usage(prompt: int, completion: int, cached: int = 0) -> Usage:
     return Usage(
         prompt_tokens=prompt,
         completion_tokens=completion,
         total_tokens=prompt + completion,
-        prompt_tokens_details=PromptTokensDetails(cached_tokens=0),
+        prompt_tokens_details=PromptTokensDetails(cached_tokens=cached),
         completion_tokens_details=CompletionTokensDetails(reasoning_tokens=0),
     )
 
@@ -119,6 +119,26 @@ def test_final_token_chunk_emits_usage() -> None:
     assert emitted[0].instance_id == INSTANCE_1_ID
     assert emitted[0].prompt_tokens == 12
     assert emitted[0].completion_tokens == 5
+    assert emitted[0].cached_tokens == 0
+
+
+def test_final_token_chunk_emits_cached_tokens() -> None:
+    """Cached prompt tokens flow from the chunk usage into the event."""
+    runner, collector = _make_runner()
+    chunk = TokenChunk(
+        model=MODEL_A_ID,
+        text="hello",
+        token_id=0,
+        usage=_usage(prompt=120, completion=5, cached=100),
+        finish_reason="stop",
+    )
+
+    runner.send_chunk(chunk, COMMAND_ID)
+
+    emitted = _instance_tokens_events(collector.events)
+    assert len(emitted) == 1
+    assert emitted[0].prompt_tokens == 120
+    assert emitted[0].cached_tokens == 100
 
 
 def test_intermediate_token_chunk_without_finish_reason_does_not_emit() -> None:
@@ -165,6 +185,7 @@ def test_tool_call_chunk_emits_usage() -> None:
     assert len(emitted) == 1
     assert emitted[0].prompt_tokens == 8
     assert emitted[0].completion_tokens == 3
+    assert emitted[0].cached_tokens == 0
 
 
 def test_tool_call_chunk_without_usage_does_not_emit() -> None:

@@ -300,6 +300,7 @@ export interface InstanceTokenUsage {
   completionTokens: number;
   totalTokens: number;
   requestCount: number;
+  cachedTokens: number;
 }
 
 export interface Message {

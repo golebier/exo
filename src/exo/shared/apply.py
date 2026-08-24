@@ -271,6 +271,7 @@ def apply_instance_tokens_updated(event: InstanceTokensUpdated, state: State) ->
             completion_tokens=event.completion_tokens,
             total_tokens=delta_total,
             request_count=1,
+            cached_tokens=event.cached_tokens,
         )
     else:
         new_usage = current.model_copy(
@@ -280,6 +281,7 @@ def apply_instance_tokens_updated(event: InstanceTokensUpdated, state: State) ->
                 + event.completion_tokens,
                 "total_tokens": current.total_tokens + delta_total,
                 "request_count": current.request_count + 1,
+                "cached_tokens": current.cached_tokens + event.cached_tokens,
             }
         )
     new_usage_mapping: Mapping[InstanceId, InstanceTokenUsage] = {

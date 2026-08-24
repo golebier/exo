@@ -13,12 +13,13 @@ from exo.shared.types.worker.token_usage import InstanceTokenUsage
 
 
 def _delta(
-    instance_id: InstanceId, prompt: int, completion: int
+    instance_id: InstanceId, prompt: int, completion: int, cached: int = 0
 ) -> InstanceTokensUpdated:
     return InstanceTokensUpdated(
         instance_id=instance_id,
         prompt_tokens=prompt,
         completion_tokens=completion,
+        cached_tokens=cached,
     )
 
 
@@ -32,6 +33,7 @@ def test_accumulate_single_instance() -> None:
     assert usage.completion_tokens == 4
     assert usage.total_tokens == 14
     assert usage.request_count == 1
+    assert usage.cached_tokens == 0
 
     state = apply_instance_tokens_updated(_delta(instance_id, 5, 2), state)
     usage = state.instance_token_usage[instance_id]
@@ -99,6 +101,44 @@ def test_replay_reproduces_cumulative_counts() -> None:
     assert usage.request_count == 3
 
 
+def test_accumulate_cached_tokens() -> None:
+    """Cached tokens accumulate and derive a cache-efficiency ratio."""
+    state = State()
+    instance_id = InstanceId("inst-cache")
+
+    state = apply_instance_tokens_updated(
+        _delta(instance_id, prompt=100, completion=4, cached=80), state
+    )
+    state = apply_instance_tokens_updated(
+        _delta(instance_id, prompt=50, completion=2, cached=45), state
+    )
+
+    usage = state.instance_token_usage[instance_id]
+    assert usage.prompt_tokens == 150
+    assert usage.cached_tokens == 125
+    assert usage.request_count == 2
+    assert usage.cached_tokens / usage.prompt_tokens == 125 / 150
+
+
+def test_old_events_without_cached_tokens_replay_as_zero() -> None:
+    """Persisted events from before ``cached_tokens`` existed must still replay."""
+    instance_id = InstanceId("inst-legacy")
+    legacy_event_json = (
+        '{"InstanceTokensUpdated": {'
+        f'"instanceId": "{instance_id}",'
+        '"promptTokens": 10,'
+        '"completionTokens": 4'
+        "}}"
+    )
+    event = InstanceTokensUpdated.model_validate_json(legacy_event_json)
+
+    state = apply_instance_tokens_updated(event, State())
+    usage = state.instance_token_usage[instance_id]
+    assert usage.prompt_tokens == 10
+    assert usage.completion_tokens == 4
+    assert usage.cached_tokens == 0
+
+
 def test_state_serialization_roundtrip_preserves_usage() -> None:
     instance_id = InstanceId("inst-rt")
     state = State()
@@ -112,4 +152,5 @@ def test_state_serialization_roundtrip_preserves_usage() -> None:
         completion_tokens=5,
         total_tokens=17,
         request_count=1,
+        cached_tokens=0,
     )
