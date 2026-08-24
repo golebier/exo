@@ -6,6 +6,8 @@ import time
 from collections.abc import AsyncGenerator
 from typing import Any
 
+from fastapi import HTTPException
+
 from exo.api.types import (
     ChatCompletionChoice,
     ChatCompletionMessage,
@@ -234,8 +236,8 @@ async def generate_chat_stream(
                 error_response = ErrorResponse(
                     error=ErrorInfo(
                         message=chunk.error_message or "Internal server error",
-                        type="InternalServerError",
-                        code=500,
+                        type=chunk.error_type or "InternalServerError",
+                        code=chunk.error_code or 500,
                     )
                 )
                 yield f"data: {error_response.model_dump_json(exclude_none=True)}\n\n"
@@ -300,14 +302,36 @@ async def collect_chat_response(
 ) -> AsyncGenerator[str]:
     # This is an AsyncGenerator[str] rather than returning a ChatCompletionReponse because
     # FastAPI handles the cancellation better but wouldn't auto-serialize for some reason
-    """Collect all token chunks and return a single ChatCompletionResponse."""
+    """Collect all token chunks and return a single ChatCompletionResponse as JSON."""
+    response = await build_chat_completion_response(command_id, chunk_stream)
+    yield response.model_dump_json(exclude_none=True)
+    return
+
+
+async def build_chat_completion_response(
+    command_id: CommandId,
+    chunk_stream: AsyncGenerator[
+        ErrorChunk | ToolCallChunk | TokenChunk | PrefillProgressChunk, None
+    ],
+) -> ChatCompletionResponse:
+    """Collect all token chunks and return a single ``ChatCompletionResponse``.
+
+    Unlike :func:`collect_chat_response` (which yields JSON for a
+    ``StreamingResponse``), this returns the response object directly so the
+    route can return it and let FastAPI serialize it — and, crucially, so an
+    ``ErrorChunk`` surfaces as an ``HTTPException`` **before** any response
+    headers are committed. A ``StreamingResponse`` sends ``http.response.start``
+    (status 200) before iterating its body, so an error raised inside the body
+    generator cannot change the status code; the non-streaming route must
+    detect the error up-front and raise :class:`HTTPException` with the chunk's
+    ``error_code`` (e.g. 400 for a prefill-memory rejection) instead.
+    """
     text_parts: list[str] = []
     thinking_parts: list[str] = []
     tool_calls: list[ToolCall] = []
     logprobs_content: list[LogprobsContentItem] = []
     model: str | None = None
     finish_reason: FinishReason | None = None
-    error_message: str | None = None
     last_usage: Usage | None = None
 
     async for chunk in chunk_stream:
@@ -316,8 +340,14 @@ async def collect_chat_response(
                 continue
 
             case ErrorChunk():
-                error_message = chunk.error_message or "Internal server error"
-                break
+                # Raise before any response is committed so the route returns the
+                # chunk's HTTP status (400 for a client-recoverable prefill-memory
+                # rejection, 500 for an unmapped internal fault) instead of a
+                # generic 200-with-broken-body.
+                raise HTTPException(
+                    status_code=chunk.error_code or 500,
+                    detail=chunk.error_message or "Internal server error",
+                )
 
             case TokenChunk():
                 if model is None:
@@ -352,14 +382,11 @@ async def collect_chat_response(
                 )
                 finish_reason = chunk.finish_reason
 
-    if error_message is not None:
-        raise ValueError(error_message)
-
     combined_text = "".join(text_parts)
     combined_thinking = "".join(thinking_parts) if thinking_parts else None
     assert model is not None
 
-    yield ChatCompletionResponse(
+    return ChatCompletionResponse(
         id=command_id,
         created=int(time.time()),
         model=model,
@@ -379,5 +406,4 @@ async def collect_chat_response(
             )
         ],
         usage=last_usage,
-    ).model_dump_json(exclude_none=True)
-    return
+    )

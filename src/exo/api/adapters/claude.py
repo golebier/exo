@@ -5,6 +5,8 @@ import re
 from collections.abc import AsyncGenerator
 from typing import Any
 
+from fastapi import HTTPException
+
 from exo.api.adapters.chat_completions import fetch_image_url
 from exo.api.types import FinishReason, Usage
 from exo.api.types.claude_api import (
@@ -12,6 +14,8 @@ from exo.api.types.claude_api import (
     ClaudeContentBlockDeltaEvent,
     ClaudeContentBlockStartEvent,
     ClaudeContentBlockStopEvent,
+    ClaudeErrorBody,
+    ClaudeErrorEvent,
     ClaudeImageBlock,
     ClaudeInputJsonDelta,
     ClaudeMessageDelta,
@@ -46,6 +50,22 @@ from exo.shared.types.text_generation import (
     InputMessageContent,
     TextGenerationTaskParams,
 )
+
+
+def _claude_error_type_for(error_code: int) -> str:
+    """Map an HTTP status to Anthropic's error ``type`` category.
+
+    Anthropic's API uses a small set of error types (``invalid_request_error``,
+    ``api_error``, ``overloaded_error``, …). A 4xx prefill-memory rejection is
+    a client-recoverable ``invalid_request_error``; anything else is an
+    ``api_error``. The streaming ``event: error`` and the non-stream error body
+    both use this so Claude Code surfaces the right retry semantics.
+    """
+    if 400 <= error_code < 500:
+        return "invalid_request_error"
+    if error_code == 529:
+        return "overloaded_error"
+    return "api_error"
 
 
 def finish_reason_to_claude_stop_reason(
@@ -268,21 +288,46 @@ async def collect_claude_response(
 ) -> AsyncGenerator[str]:
     # This is an AsyncGenerator[str] rather than returning a ChatCompletionReponse because
     # FastAPI handles the cancellation better but wouldn't auto-serialize for some reason
-    """Collect all token chunks and return a single ClaudeMessagesResponse."""
+    """Collect all token chunks and return a single ClaudeMessagesResponse as JSON."""
+    response = await build_claude_response(command_id, model, chunk_stream)
+    yield response.model_dump_json()
+    return
+
+
+async def build_claude_response(
+    command_id: CommandId,
+    model: str,
+    chunk_stream: AsyncGenerator[
+        ErrorChunk | ToolCallChunk | TokenChunk | PrefillProgressChunk, None
+    ],
+) -> ClaudeMessagesResponse:
+    """Collect all token chunks and return a single ``ClaudeMessagesResponse``.
+
+    Returns the response object directly (see
+    ``build_chat_completion_response`` for why the non-streaming route must not
+    use a ``StreamingResponse``): an ``ErrorChunk`` raises
+    :class:`HTTPException` with the chunk's ``error_code`` before any response
+    headers are committed, so a prefill-memory rejection maps to 400 instead of
+    a truncated 200-with-broken-body.
+    """
     text_parts: list[str] = []
     thinking_parts: list[str] = []
     tool_use_blocks: list[ClaudeToolUseBlock] = []
     stop_reason: ClaudeStopReason | None = None
     last_usage: Usage | None = None
-    error_message: str | None = None
 
     async for chunk in chunk_stream:
         if isinstance(chunk, PrefillProgressChunk):
             continue
 
         if isinstance(chunk, ErrorChunk):
-            error_message = chunk.error_message or "Internal server error"
-            break
+            # Raise before any response is committed so the route returns the
+            # chunk's HTTP status (400 for a client-recoverable prefill-memory
+            # rejection) instead of a generic 200-with-broken-body.
+            raise HTTPException(
+                status_code=chunk.error_code or 500,
+                detail=chunk.error_message or "Internal server error",
+            )
 
         last_usage = chunk.usage or last_usage
 
@@ -306,9 +351,6 @@ async def collect_claude_response(
         if chunk.finish_reason is not None:
             stop_reason = finish_reason_to_claude_stop_reason(chunk.finish_reason)
 
-    if error_message is not None:
-        raise ValueError(error_message)
-
     combined_text = "".join(text_parts)
     combined_thinking = "".join(thinking_parts)
 
@@ -328,7 +370,7 @@ async def collect_claude_response(
     input_tokens = last_usage.prompt_tokens if last_usage else 0
     output_tokens = last_usage.completion_tokens if last_usage else 0
 
-    yield ClaudeMessagesResponse(
+    return ClaudeMessagesResponse(
         id=f"msg_{command_id}",
         model=model,
         content=content,
@@ -337,8 +379,7 @@ async def collect_claude_response(
             input_tokens=input_tokens,
             output_tokens=output_tokens,
         ),
-    ).model_dump_json()
-    return
+    )
 
 
 async def generate_claude_stream(
@@ -376,8 +417,22 @@ async def generate_claude_stream(
             continue
 
         if isinstance(chunk, ErrorChunk):
-            # Close text block and bail
-            break
+            # Emit an Anthropic ``event: error`` and terminate the stream. The
+            # HTTP status is already 200 (the SSE response has started), so the
+            # client learns the failure category from the error event's ``type``
+            # (e.g. ``invalid_request_error`` for a 4xx prefill-memory
+            # rejection) — the same way Anthropic's own API surfaces streaming
+            # errors. Previously this ``break``ed and emitted an empty message,
+            # hiding the error from Claude Code entirely.
+            error_code = chunk.error_code or 500
+            error_event = ClaudeErrorEvent(
+                error=ClaudeErrorBody(
+                    type=_claude_error_type_for(error_code),
+                    message=chunk.error_message or "Internal server error",
+                )
+            )
+            yield f"event: error\ndata: {error_event.model_dump_json()}\n\n"
+            return
 
         last_usage = chunk.usage or last_usage
 

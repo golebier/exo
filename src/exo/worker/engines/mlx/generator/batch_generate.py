@@ -182,7 +182,13 @@ class ExoBatchGenerator:
                 )
                 prompt_tokens = remaining_tokens
         else:
-            cache = make_kv_cache(self.model)
+            # #1990: mlx-lm's BatchGenerator does multi-sequence batched
+            # trim/extend on a single node, where QuantizedKVCache's state can
+            # desync across the batched sequences. Skip KV quantization in
+            # single-node batched mode (``group is None``); distributed mode
+            # (each rank holds one sequence shard) is unaffected.
+            single_node = self.group is None
+            cache = make_kv_cache(self.model, force_plain=single_node)
 
         # Preflight admission: reject a prompt whose prefill peak won't fit even
         # after the headroom eviction above (oMLX raise_if_prefill_exceeds). A

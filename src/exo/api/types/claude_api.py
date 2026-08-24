@@ -231,6 +231,26 @@ class ClaudeMessageStopEvent(BaseModel, frozen=True):
     type: Literal["message_stop"] = "message_stop"
 
 
+class ClaudeErrorBody(BaseModel, frozen=True):
+    """The ``error`` object inside an Anthropic streaming/non-stream error.
+
+    Mirrors Anthropic's ``{"type": <api_error_type>, "message": ...}`` shape.
+    ``api_error_type`` is the Anthropic error category (e.g.
+    ``invalid_request_error``) derived from the runner ``ErrorChunk``'s HTTP
+    status, not the OpenAI-style ``type`` string carried on the chunk.
+    """
+
+    type: str
+    message: str
+
+
+class ClaudeErrorEvent(BaseModel, frozen=True):
+    """Anthropic ``event: error`` streaming event."""
+
+    type: Literal["error"] = "error"
+    error: ClaudeErrorBody
+
+
 ClaudeStreamEvent = (
     ClaudeMessageStartEvent
     | ClaudeContentBlockStartEvent
@@ -238,4 +258,5 @@ ClaudeStreamEvent = (
     | ClaudeContentBlockStopEvent
     | ClaudeMessageDeltaEvent
     | ClaudeMessageStopEvent
+    | ClaudeErrorEvent
 )

@@ -31,7 +31,7 @@ Legend: ✅ shipped · ⚠️ partial / has blocker · ❌ not started · 🆕 n
 
 | # | Feature | Status | Notes |
 |---|---------|--------|-------|
-| 01 | Tiered KV cache (RAM+SSD+persist) | ⚠️ | Settings/flag layer + dashboard shipped; paged-block manager + SSD spill + restart-recovery pending |
+| 01 | Tiered KV cache (RAM+SSD+persist) | ✅ | Settings/flag layer + dashboard + SSD cold tier (spill/restore + restart recovery + signature guard) shipped; paged-block manager + prefix-SSD restore pending |
 | 02 | Native Metal kernels (GLM-5.2) | ✅ | Vendored + packaged + lazy-import fixed; JACCL rendezvous race **fixed** (master lifecycle gating + warmup removal); prefill OOM guarded; decode `Fence::wait` mitigated by stall watchdog |
 | 03 | Multi-Token Prediction (MTP) | ❌ | Design only; reconcile with exo #03 |
 | 04 | SpecPrefill (sparse prefill) | ❌ | Design only |
@@ -51,11 +51,11 @@ Legend: ✅ shipped · ⚠️ partial / has blocker · ❌ not started · 🆕 n
 | 04 | Arbitrary TP splits | ❌ | Unblocks 3-node + quantized TP |
 | 05 | Bandwidth/latency-aware placement | ❌ | Good-first-issue scope; immediate TPS win |
 | 06 | GLM-5.2 long-context + RDMA/TB reliability | ❌ | The flagship-config pain cluster |
-| 07 | TurboQuant KV-cache | ⚠️ | Settings + integer fallback shipped; native kernel + hardening pending |
+| 07 | TurboQuant KV-cache | ✅ | Settings + integer fallback + dashboard shipped; **#1990/#2261 correctness hardening landed**; native kernel + PDD handoff pending |
 | 08 | Model support breadth (catalog + GGUF + embeddings) | ❌ | Overlaps oMLX #07 |
 | 09 | P2P / Thunderbolt model distribution | ❌ | One-node-downloads-others-pull |
 | 10 | Observability (Prometheus /metrics) | ❌ | No metrics endpoint today |
-| 11 | Memory headroom before prefill + near-limit placement | ✅ | Phases 1–3 full; cluster validation + UI wiring pending |
+| 11 | Memory headroom before prefill + near-limit placement | ✅ | Phases 1–3 full; reclaim ceiling + toggle + version badge; **HTTP 400 mapping for `PrefillMemoryExceededError` landed** (OpenAI + Claude); UI max-context + MLA-precise KV + cluster validation pending |
 | 12 | GPU offload for prompt processing | ❌ | Overlaps #01 + #02 |
 
 ### 🆕 New candidates from oMLX v0.6.x (not in present tasks)
@@ -208,7 +208,7 @@ as the long-prompt-TTFT special case for mixed clusters.
 
 Verified against the working tree on 2025-08-24, not just the design docs.
 
-### ✅ omlx 01 — Tiered KV cache (settings layer)
+### ✅ omlx 01 — Tiered KV cache (settings + SSD cold tier)
 **Shipped:**
 - `src/exo/worker/engines/mlx/turboquant.py` — runtime settings layer
   (`is_tiered_cache_enabled`, `hot_cache_only`, `ssd_cache_dir`,
@@ -220,14 +220,25 @@ Verified against the working tree on 2025-08-24, not just the design docs.
 - Dashboard: On/Off toggle + SSD dir/cap/RAM-cap inputs + live observability
   gauge (used/total, file count, clear button).
 
-**Missing (Phases 1–3):**
-- `KVCacheBlock`, `FreeKVCacheBlockQueue` (O(1) LRU), chain hashing, COW.
-- `PagedSSDBlockMetadata`, `PagedSSDCacheIndex`, safetensors spill/restore.
-- Startup scan + cache-signature validation on model swap.
+**Missing (Phase 1 paged-block manager + prefix-SSD restore):**
+- `KVCacheBlock`, `FreeKVCacheBlockQueue` (O(1) LRU), chain hashing, COW — the
+  paged-block manager (Phase 1). The SSD adjunct captures the persistence
+  value without it; it remains a future optimization.
+- Prefix SSD restore (restore the longest common prefix, not just exact match).
 - Phase 4 = boundary snapshot offload (omlx #08).
 
-**Evidence:** no `PagedSSD` / `FreeKVCacheBlockQueue` / `KVCacheBlock`
-symbols exist in `src/exo/worker/engines/mlx/` yet.
+**Now shipped (Phases 2–3, SSD cold tier):**
+- `src/exo/worker/engines/mlx/ssd_cache.py` — `SSDKVCacheStore`: spill/restore
+  via mlx-lm's `save_prompt_cache`/`load_prompt_cache` (byte-exact for
+  KVCache/QuantizedKVCache/RotatingKVCache/ArraysCache/CacheList), SSD-
+  eligibility for exotic classes, cache-signature guard (model/quant swap),
+  restart-recovery scan, LRU size cap.
+- `src/exo/worker/engines/mlx/cache.py` — `KVPrefixCache.set_ssd_store` /
+  `set_model_id`; spill on `_evict_until_under`; exact-match SSD restore in
+  `get_kv_cache`; `clear()` wipes SSD.
+- `src/exo/worker/engines/mlx/builder.py` — wires the store from the resolved
+  tiered-cache settings + model id.
+- 14 tests in `test_ssd_cache.py`. See `missing-column-work-DONE.md`.
 
 ### ⚠️ omlx 02 — Native Metal kernels (built + blocked)
 **Shipped:**
@@ -272,9 +283,11 @@ symbols exist in `src/exo/worker/engines/mlx/` yet.
 - 40 tests in `test_turboquant.py`.
 
 **Missing:**
-- Phase 1 correctness hardening (#1990, #2261) — skip KV-quant in
-  single-node BatchGenerator; clean prefill after chained prefix-cache
-  extensions.
+- ✅ **Phase 1 correctness hardening (#1990, #2261)** — **LANDED.**
+  `make_kv_cache(force_plain=)` skips KV quant in single-node BatchGenerator
+  mode (#1990); `KVPrefixCache` tracks chained extensions and forces a clean
+  prefill when a partial hit would extend a chained+quantized entry (#2261).
+  8 tests in `test_turboquant_hardening.py`. See `missing-column-work-DONE.md`.
 - Phase 3 native fast-path kernel (oMLX `turboquant_attention.py`); today
   half-step depths (2.5/3.5) round down to integer `QuantizedKVCache`.
 - Phase 4 PDD cache handoff for quantized KV in disaggregated prefill.
@@ -300,11 +313,15 @@ symbols exist in `src/exo/worker/engines/mlx/` yet.
 - 69 tests (42 prefill-headroom + 12 memory-guard + 15 placement-memory).
 
 **Missing:**
+- ✅ **HTTP 400 mapping for `PrefillMemoryExceededError`** — **LANDED** across
+  OpenAI chat (stream/non-stream/bench) + Claude `/v1/messages`
+  (stream/non-stream); Claude streaming gained a proper `event: error`.
+  9 tests in `test_error_mapping.py` + `test_chat_completions_stream.py`.
+  See `missing-column-work-DONE.md`.
 - ⚠️ Dashboard max-context-length control (#2241) — backend lever exists,
   UI wiring separate.
 - ⚠️ MLA-precise KV estimation (currently over-counts MLA; safe but may
   false-reject placement).
-- ⚠️ HTTP 400 mapping for `PrefillMemoryExceededError` (currently 500).
 - ⚠️ Cluster validation of the reclaim ceiling with
   `EXO_MEMORY_GUARD_TIER=aggressive`.
 
@@ -366,7 +383,11 @@ flagship config right now.
 ### Single pick for "gain the most"
 **Finish the tiered-SSD KV plumbing** — settings layer done (low risk),
 directly serves the primary agentic workload, and it's the feature oMLX was
-built around.
+built around. **Update (2025-08-24): the SSD cold tier (Phases 2–3) landed** —
+evicted entries spill to disk and a future exact-match prefix lookup that
+misses RAM restores from SSD instead of recomputing, even after a restart. The
+paged-block manager (Phase 1) and prefix-SSD restore remain; see
+[`missing-column-work-DONE.md`](missing-column-work-DONE.md).
 
 ---
 
@@ -492,6 +513,7 @@ curl -s https://api.github.com/repos/jundot/omlx/releases
 
 ## Cross-references
 
+- **Missing-column work DONE log (omlx 01 SSD tier · exo 07 hardening · exo 11 HTTP 400):** [`missing-column-work-DONE.md`](missing-column-work-DONE.md)
 - oMLX porting master index: [`omlx-porting/README.md`](omlx-porting/README.md)
 - Upstream porting master index: [`exo-upstream-porting/README.md`](exo-upstream-porting/README.md)
 - Tiered KV cache DONE log: [`omlx-porting/01-tiered-kv-cache-ssd-DONE.md`](omlx-porting/01-tiered-kv-cache-ssd-DONE.md)

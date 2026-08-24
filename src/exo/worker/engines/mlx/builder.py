@@ -2,6 +2,7 @@ import contextlib
 import os
 from collections.abc import Generator
 from dataclasses import dataclass
+from pathlib import Path
 
 import mlx.core as mx
 from mlx_lm.tokenizer_utils import TokenizerWrapper
@@ -13,6 +14,7 @@ from exo.shared.types.worker.instances import BoundInstance
 from exo.shared.types.worker.runner_response import ModelLoadingResponse
 from exo.utils.channels import MpReceiver, MpSender
 from exo.worker.engines.base import Builder, Engine
+from exo.worker.engines.mlx import turboquant
 from exo.worker.runner.bootstrap import logger
 from exo.worker.runner.llm_inference.batch_generator import (
     BatchGenerator,
@@ -21,6 +23,7 @@ from exo.worker.runner.llm_inference.batch_generator import (
 from exo.worker.runner.llm_inference.tool_parsers import make_mlx_parser
 
 from .cache import KVPrefixCache
+from .ssd_cache import SSDKVCacheStore
 from .types import Model
 from .utils_mlx import (
     initialize_mlx,
@@ -81,6 +84,20 @@ class MlxBuilder(Builder):
             )
 
         kv_prefix_cache = KVPrefixCache(self.group)
+        # Wire the cold (SSD) tier for the tiered KV cache (oMLX doc 01,
+        # Phases 2–3). The store is constructed from the resolved tiered-cache
+        # settings; it no-ops (``is_active() == False``) unless the operator
+        # enabled the tier, so a default install keeps today's RAM-only
+        # behaviour. ``set_model_id`` records the model for the cache
+        # signature guard so a stale SSD block from a different model is
+        # refused on restore.
+        kv_prefix_cache.set_model_id(self.model_id)
+        kv_prefix_cache.set_ssd_store(
+            SSDKVCacheStore(
+                ssd_dir=Path(turboquant.ssd_cache_dir()),
+                max_size_bytes=turboquant.ssd_cache_max_size_bytes(),
+            )
+        )
 
         device_rank = 0 if self.group is None else self.group.rank()
         if os.environ.get("EXO_NO_BATCH"):

@@ -21,11 +21,13 @@ from mlx_lm.models.deepseek_v4 import (
 )
 from mlx_lm.tokenizer_utils import TokenizerWrapper
 
+from exo.shared.models.model_cards import ModelId
 from exo.shared.types.memory import Memory
 from exo.worker.engines.mlx import memory_guard, turboquant
 from exo.worker.engines.mlx.constants import CACHE_GROUP_SIZE, KV_CACHE_BITS
 from exo.worker.engines.mlx.exceptions import PrefillMemoryExceededError
 from exo.worker.engines.mlx.prefill_transient_tracker import PrefillTransientTracker
+from exo.worker.engines.mlx.ssd_cache import SSDKVCacheStore
 from exo.worker.engines.mlx.types import KVCacheType, Model
 from exo.worker.runner.bootstrap import logger
 
@@ -291,6 +293,17 @@ def has_non_kv_caches(cache: KVCacheType) -> bool:
     return any(is_non_trimmable_cache_entry(c) for c in cache)
 
 
+def _cache_is_quantized(cache: KVCacheType) -> bool:
+    """Whether any layer of ``cache`` is a ``QuantizedKVCache``.
+
+    Used by the #2261 chained-extension guard: only quantized caches are at
+    risk of stale state after a chained extension, so the clean-prefill guard
+    is gated on this. A plain ``KVCache`` / ``RotatingKVCache`` (or a hybrid
+    cache whose KV branches are all full precision) is always safe to chain.
+    """
+    return any(isinstance(c, QuantizedKVCache) for c in cache)
+
+
 class KVPrefixCache:
     def __init__(self, group: mx.distributed.Group | None):
         self.prompts: list[mx.array] = []  # mx array of tokens (ints)
@@ -298,9 +311,27 @@ class KVPrefixCache:
         self._snapshots: list[list[CacheSnapshot] | None] = []
         self._media_regions: list[list["MediaRegion"]] = []
         self._last_used: list[int] = []  # monotonic counter of last access per entry
+        # #2261: per-entry flag marking entries produced by extending a previous
+        # partial hit (a "chained" extension). When KV quantization is active,
+        # a chained quantized entry is not trusted as the base for a *further*
+        # partial extension — the accumulated quantization error / state can
+        # desync — so ``get_kv_cache`` forces a clean prefill instead of reusing
+        # it. Plain (non-quantized) caches are always safe to chain.
+        self._chained: list[bool] = []
         self.prefill_tps: list[float] = []
         self._access_counter: int = 0
         self._group = group
+        # Cold (SSD) tier for evicted/restarted entries (oMLX doc 01, Phases
+        # 2–3). Lazily created via :meth:`set_ssd_store` once the engine knows
+        # the model id + resolved SSD settings; ``None`` ⇒ RAM-only behaviour
+        # (today's default — the tier is opt-in behind
+        # ``EXO_TIERED_KV_CACHE``). When present, evicted RAM entries spill to
+        # SSD and an exact-match prefix lookup that misses RAM is restored
+        # from SSD instead of being recomputed.
+        self._ssd_store: SSDKVCacheStore | None = None
+        # Model id for the SSD cache signature (guards against model swaps on
+        # restore). Set via :meth:`set_model_id` by the engine builder.
+        self.model_id: ModelId | None = None
         # Per-model EWMA of prefill chunk transient bytes/token (Phase 2).
         # Refines the preflight admission estimate after the first prefill
         # and feeds the per-chunk abort guard. One tracker per loaded model,
@@ -313,16 +344,51 @@ class KVPrefixCache:
         # the chunk's model() + eval). Set by ``guard_prefill_chunk_or_raise``.
         self._prefill_chunk_baseline_bytes: int = 0
 
+    def set_ssd_store(self, store: SSDKVCacheStore | None) -> None:
+        """Wire the cold (SSD) tier (oMLX doc 01, Phases 2–3).
+
+        Called by the engine builder once the model id + resolved SSD settings
+        are known. Passing ``None`` disables the tier (RAM-only). The store is
+        responsible for its own restart-recovery scan (run at its construction),
+        so wiring it here also triggers recovery on the first model load. No-op
+        semantics when the tiered-cache master switch is off — the store itself
+        reports ``is_active() == False`` and every spill/restore is a no-op.
+        """
+        self._ssd_store = store
+        if store is not None and store.is_active():
+            logger.info(
+                "SSD KV cold tier active: dir=%s, max_size=%d bytes, recovered=%d entries",
+                store.ssd_dir,
+                store.max_size_bytes,
+                store.status().get("ssd_entries", 0),
+            )
+
+    def set_model_id(self, model_id: ModelId | None) -> None:
+        """Record the loaded model id for the SSD cache signature.
+
+        Must be called on model load (and reload) so the SSD tier's signature
+        guard refuses to restore a block saved under a different model.
+        """
+        self.model_id = model_id
+
     def clear(self):
-        """Clear all cached prompts and caches."""
+        """Clear all cached prompts and caches.
+
+        Also clears the SSD cold tier (if wired) so a model swap / explicit
+        reset wipes both tiers together — a stale SSD block from a previous
+        model must not survive a ``clear()``.
+        """
         self.prompts.clear()
         self.caches.clear()
         self._snapshots.clear()
         self._media_regions.clear()
         self._last_used.clear()
         self.prefill_tps.clear()
+        self._chained.clear()
         self.prefill_transient_tracker.reset()
         self._prefill_chunk_baseline_bytes = 0
+        if self._ssd_store is not None and self._ssd_store.is_active():
+            self._ssd_store.clear()
 
     def add_kv_cache(
         self,
@@ -341,6 +407,7 @@ class KVPrefixCache:
         self.prefill_tps.append(prefill_tps)
         self._access_counter += 1
         self._last_used.append(self._access_counter)
+        self._chained.append(False)  # fresh entry, not a chained extension
         logger.info(f"KV cache added: {len(prompt_tokens)} tokens")
 
     def update_kv_cache(
@@ -368,6 +435,11 @@ class KVPrefixCache:
         self.prefill_tps[index] = prefill_tps
         self._access_counter += 1
         self._last_used[index] = self._access_counter
+        # #2261: this entry was extended from a previous partial hit — mark it
+        # chained so a future partial hit that would extend it *again* forces a
+        # clean prefill when KV quantization is active (stale-quantized-state
+        # guard). See ``_should_force_clean_prefill``.
+        self._chained[index] = True
         logger.info(f"KV cache updated (index {index}): {len(prompt_tokens)} tokens")
 
     def _get_snapshot(
@@ -433,6 +505,56 @@ class KVPrefixCache:
                 best_index, best_length = i, length
 
         if best_index is None:
+            # No RAM hit: check the SSD cold tier for an exact-match restore
+            # (oMLX doc 01, Phase 2/3 — the restart / eviction-recovery path
+            # that skips the full re-prefill). Exact-match only: a *prefix*
+            # SSD restore is a later refinement; the RAM tier still serves
+            # partial hits. Best-effort: a restore miss/ineligibility falls
+            # through to a fresh cache (today's behaviour).
+            if self._ssd_store is not None:
+                restored, restored_tokens = self._ssd_store.restore(
+                    prompt_tokens, model_id=self.model_id
+                )
+                if restored is not None:
+                    logger.info(
+                        f"SSD KV cache restored: {restored_tokens}/{max_length} "
+                        f"tokens — skipping re-prefill"
+                    )
+                    # Add it back to the RAM tier so subsequent requests hit
+                    # RAM (the SSD entry is re-spilled on a future eviction).
+                    self._access_counter += 1
+                    self.prompts.append(prompt_tokens)
+                    self.caches.append(restored)
+                    self._snapshots.append(None)
+                    self._media_regions.append(query_regions)
+                    self.prefill_tps.append(0.0)
+                    self._last_used.append(self._access_counter)
+                    self._chained.append(False)  # restored, not a chained ext
+                    remaining = prompt_tokens[restored_tokens:]
+                    return restored, remaining, None, restored_tokens >= max_length
+            return make_kv_cache(model), prompt_tokens, None, False
+
+        # #2261: force a clean prefill after chained prefix-cache extensions
+        # when KV quantization is active. A partial (non-exact) hit that would
+        # *extend* an entry which was itself produced by an extension (chained)
+        # reuses quantized KV state that has accumulated across two extensions;
+        # the quantization boundaries can desync and corrupt output. Refuse to
+        # reuse it — return a fresh cache so the whole prompt is recomputed.
+        # Exact hits reuse the entry as-is (no extension). Non-quantized caches
+        # are always safe to chain, so the guard only applies when quantization
+        # is on.
+        self._ensure_chained_parallel()
+        if (
+            not is_exact
+            and best_length < max_length
+            and self._chained[best_index]
+            and _cache_is_quantized(self.caches[best_index])
+        ):
+            logger.info(
+                f"#2261: forcing clean prefill — partial hit on a chained "
+                f"quantized entry ({best_length}/{max_length} tokens); "
+                f"recomputing to avoid stale quantized KV state."
+            )
             return make_kv_cache(model), prompt_tokens, None, False
 
         # For exact match: trim to max_length-1 so remaining has the last token
@@ -772,6 +894,19 @@ class KVPrefixCache:
             return 0
         return int(bound)
 
+    def _ensure_chained_parallel(self) -> None:
+        """Keep ``_chained`` length-parallel to ``caches``.
+
+        Some test helpers and legacy paths append to ``caches``/``prompts``
+        directly (bypassing ``add_kv_cache``); pad ``_chained`` with ``False``
+        so the parallel-list invariant holds and the eviction/#2261 paths can't
+        index out of bounds. Fresh entries are treated as non-chained.
+        """
+        while len(self._chained) < len(self.caches):
+            self._chained.append(False)
+        # Trim if something removed caches without going through the helpers.
+        del self._chained[len(self.caches) :]
+
     def _evict_until_under(self, threshold: float) -> int:
         """Evict LRU entries until pressure is below ``threshold``.
 
@@ -808,6 +943,7 @@ class KVPrefixCache:
         if len(self.caches) == 0:
             return 0
 
+        self._ensure_chained_parallel()
         evicted_count = 0
         # Evict LRU entries until below threshold (or the retry cap, whichever
         # comes first — see the docstring on the cap's purpose).
@@ -818,12 +954,23 @@ class KVPrefixCache:
         ):
             lru_index = self._last_used.index(min(self._last_used))
             evicted_tokens = len(self.prompts[lru_index])
+            # Spill the LRU entry to the SSD cold tier *before* dropping it
+            # (oMLX doc 01, Phase 2). Best-effort + eligible-only: a non-SSD-
+            # eligible entry (exotic cache class) or a disabled tier is simply
+            # dropped, exactly as before the SSD tier existed.
+            if self._ssd_store is not None:
+                self._ssd_store.spill(
+                    self.prompts[lru_index],
+                    self.caches[lru_index],
+                    model_id=self.model_id,
+                )
             self.prompts.pop(lru_index)
             self.caches.pop(lru_index)
             self._snapshots.pop(lru_index)
             self._media_regions.pop(lru_index)
             self._last_used.pop(lru_index)
             self.prefill_tps.pop(lru_index)
+            self._chained.pop(lru_index)
 
             evicted_count += 1
             logger.info(
@@ -1253,7 +1400,11 @@ def _format_bytes(n: int) -> str:
 
 
 def make_kv_cache(
-    model: Model, max_kv_size: int | None = None, keep: int = 0
+    model: Model,
+    max_kv_size: int | None = None,
+    keep: int = 0,
+    *,
+    force_plain: bool = False,
 ) -> KVCacheType:
     """Construct the per-layer KV cache list.
 
@@ -1267,6 +1418,15 @@ def make_kv_cache(
     ``ArraysCache``+``KVCache`` models) defer to their own constructor, so the
     TurboQuant bits apply only to the plain-KV branches. This is the same
     seam oMLX's ``type_handlers.py`` keys on.
+
+    ``force_plain`` skips quantization and builds plain ``KVCache`` layers
+    regardless of TurboQuant / ``KV_CACHE_BITS``. This is the #1990
+    correctness fix: mlx-lm's ``BatchGenerator`` does multi-sequence batched
+    trim/extend on a single node, where ``QuantizedKVCache``'s state can
+    desync across the batched sequences — so single-node batched mode must not
+    quantize. (Distributed mode is unaffected: each rank holds one sequence
+    shard.) Hybrid-cache models (``make_cache``) are also unaffected because
+    they own their construction.
     """
     assert hasattr(model, "layers")
 
@@ -1278,6 +1438,22 @@ def make_kv_cache(
     tq_bits = turboquant.effective_kv_bits()
     effective_bits = tq_bits if tq_bits is not None else KV_CACHE_BITS
     skip_last = turboquant.is_turboquant_enabled() and turboquant.turboquant_skip_last()
+
+    if force_plain:
+        # #1990: single-node BatchGenerator mode — quantized KV is unsafe under
+        # multi-sequence batched trim/extend. Build plain KVCache regardless of
+        # the configured bits.
+        if max_kv_size is None:
+            logger.info(
+                "Using plain KV cache (force_plain; #1990 single-node batched mode)"
+            )
+            return [KVCache() for _ in model.layers]
+        logger.info(
+            "Using rotating KV cache (force_plain; #1990) with %s with %s",
+            f"{max_kv_size=}",
+            f"{keep=}",
+        )
+        return [RotatingKVCache(max_size=max_kv_size, keep=keep) for _ in model.layers]
 
     if max_kv_size is None:
         if effective_bits is None:

@@ -164,6 +164,89 @@ class TestErrorStreamShape:
         for value in events[0]["error"].values():
             assert value is not None
 
+    async def test_error_chunk_defaults_to_500_internal(self):
+        """An ErrorChunk with no mapped cause keeps the historic 500 status."""
+        chunks: list[PrefillProgressChunk | ErrorChunk | ToolCallChunk | TokenChunk] = [
+            ErrorChunk(model=_TEST_MODEL, error_message="boom"),
+        ]
+        lines: list[str] = []
+        async for event in generate_chat_stream(
+            CommandId("test-cmd-err-default"), _stream(chunks)
+        ):
+            lines.append(event)
+
+        events = _parse_data_events(lines)
+        assert events[0]["error"]["code"] == 500
+        assert events[0]["error"]["type"] == "InternalServerError"
+
+    async def test_error_chunk_maps_prefill_memory_exceeded_to_400(self):
+        """A prefill-memory rejection surfaces as a 400 client error in stream."""
+        chunks: list[PrefillProgressChunk | ErrorChunk | ToolCallChunk | TokenChunk] = [
+            ErrorChunk(
+                model=_TEST_MODEL,
+                error_message="Prefill would require ~10 GiB peak ...",
+                error_code=400,
+                error_type="PrefillMemoryExceeded",
+            ),
+        ]
+        lines: list[str] = []
+        async for event in generate_chat_stream(
+            CommandId("test-cmd-err-400"), _stream(chunks)
+        ):
+            lines.append(event)
+
+        events = _parse_data_events(lines)
+        assert events[0]["error"]["code"] == 400
+        assert events[0]["error"]["type"] == "PrefillMemoryExceeded"
+        assert events[0]["error"]["message"].startswith("Prefill would require")
+
+
+class TestNonStreamingErrorMapping:
+    async def test_non_stream_error_raises_http_exception_with_code(self):
+        """A non-stream ErrorChunk raises HTTPException with the chunk's code.
+
+        The route returns the response object directly (not a StreamingResponse)
+        so an error raises before any response headers are committed; this test
+        asserts the build helper raises HTTPException(400) for a prefill-memory
+        rejection rather than the old ValueError/200.
+        """
+        from fastapi import HTTPException
+
+        from exo.api.adapters.chat_completions import build_chat_completion_response
+
+        chunks: list[PrefillProgressChunk | ErrorChunk | ToolCallChunk | TokenChunk] = [
+            ErrorChunk(
+                model=_TEST_MODEL,
+                error_message="Prefill would require ~10 GiB peak ...",
+                error_code=400,
+                error_type="PrefillMemoryExceeded",
+            ),
+        ]
+        try:
+            await build_chat_completion_response(
+                CommandId("test-cmd-nonstream-err"), _stream(chunks)
+            )
+            raise AssertionError("expected HTTPException(400)")
+        except HTTPException as exc:
+            assert exc.status_code == 400
+            assert "Prefill would require" in str(exc.detail)
+
+    async def test_non_stream_unmapped_error_defaults_to_500(self):
+        from fastapi import HTTPException
+
+        from exo.api.adapters.chat_completions import build_chat_completion_response
+
+        chunks: list[PrefillProgressChunk | ErrorChunk | ToolCallChunk | TokenChunk] = [
+            ErrorChunk(model=_TEST_MODEL, error_message="boom"),
+        ]
+        try:
+            await build_chat_completion_response(
+                CommandId("test-cmd-nonstream-500"), _stream(chunks)
+            )
+            raise AssertionError("expected HTTPException(500)")
+        except HTTPException as exc:
+            assert exc.status_code == 500
+
 
 class TestNonStreamingResponseShape:
     async def test_collected_response_message_has_no_disallowed_nulls(self):

@@ -24,13 +24,13 @@ from hypercorn.utils import LifespanTimeoutError, ShutdownError
 from loguru import logger
 
 from exo.api.adapters.chat_completions import (
+    build_chat_completion_response,
     chat_request_to_text_generation,
-    collect_chat_response,
     generate_chat_stream,
 )
 from exo.api.adapters.claude import (
+    build_claude_response,
     claude_request_to_text_generation,
-    collect_claude_response,
     generate_claude_stream,
 )
 from exo.api.adapters.ollama import (
@@ -946,7 +946,7 @@ class API:
 
                 if chunk.finish_reason == "error":
                     raise HTTPException(
-                        status_code=500,
+                        status_code=chunk.error_code or 500,
                         detail=chunk.error_message or "Internal server error",
                     )
 
@@ -1075,12 +1075,16 @@ class API:
                 },
             )
         else:
-            return StreamingResponse(
-                collect_chat_response(
-                    command.command_id,
-                    self._token_chunk_stream(command.command_id),
-                ),
-                media_type="application/json",
+            # Return the response object directly (not a StreamingResponse) so
+            # an ``ErrorChunk`` raises ``HTTPException`` with the chunk's
+            # ``error_code`` before any response headers are committed — a
+            # ``StreamingResponse`` sends status 200 before iterating its body,
+            # so an error raised inside the body generator cannot change the
+            # status. This maps prefill-memory rejections to 400 (see
+            # ``PrefillMemoryExceededError``) instead of a truncated 200.
+            return await build_chat_completion_response(
+                command.command_id,
+                self._token_chunk_stream(command.command_id),
             )
 
     async def bench_chat_completions(
@@ -1694,13 +1698,15 @@ class API:
                 },
             )
         else:
-            return StreamingResponse(
-                collect_claude_response(
-                    command.command_id,
-                    payload.model,
-                    self._token_chunk_stream(command.command_id),
-                ),
-                media_type="application/json",
+            # Return the response object directly (not a StreamingResponse) so
+            # an ``ErrorChunk`` raises ``HTTPException`` with the chunk's
+            # ``error_code`` before any response headers are committed (a
+            # ``StreamingResponse`` sends status 200 before iterating its body).
+            # Maps prefill-memory rejections to 400 instead of a truncated 200.
+            return await build_claude_response(
+                command.command_id,
+                payload.model,
+                self._token_chunk_stream(command.command_id),
             )
 
     async def openai_responses(

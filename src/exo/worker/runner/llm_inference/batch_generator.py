@@ -30,6 +30,10 @@ from exo.worker.engines.base import Engine
 from exo.worker.engines.mlx.cache import KVPrefixCache
 from exo.worker.engines.mlx.disaggregated.adapter import write_cache_to_wire
 from exo.worker.engines.mlx.disaggregated.serve import run_prefill_for_request
+from exo.worker.engines.mlx.exceptions import (
+    http_error_status_for,
+    http_error_type_for,
+)
 from exo.worker.engines.mlx.generator.batch_generate import ExoBatchGenerator
 from exo.worker.engines.mlx.generator.generate import (
     PrefillCancelled,
@@ -243,6 +247,11 @@ class SequentialGenerator(Engine):
                         model=self.model_id,
                         finish_reason="error",
                         error_message=str(e),
+                        # Map client-recoverable errors (e.g. a too-large prompt
+                        # rejected by the prefill guard) to the right HTTP status
+                        # so the API returns 400 instead of a blanket 500.
+                        error_code=http_error_status_for(e),
+                        error_type=http_error_type_for(e),
                     ),
                 )
             )
@@ -502,6 +511,11 @@ class BatchGenerator(Engine):
                         model=self.model_id,
                         finish_reason="error",
                         error_message=str(e),
+                        # Map client-recoverable errors (e.g. a too-large prompt
+                        # rejected by the prefill guard) to the right HTTP status
+                        # so the API returns 400 instead of a blanket 500.
+                        error_code=http_error_status_for(e),
+                        error_type=http_error_type_for(e),
                     ),
                 )
             )

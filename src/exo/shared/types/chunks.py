@@ -35,6 +35,16 @@ class ErrorChunk(BaseChunk):
     error_message: str
     finish_reason: Literal["error"] = "error"
 
+    # HTTP status code + OpenAI-style ``type`` for this error. Populated by the
+    # runner's ``_send_error`` from the exception class (see
+    # ``exo.worker.engines.mlx.exceptions.http_error_status_for``) so the API
+    # layer maps client-recoverable errors (e.g. a too-large prompt rejected by
+    # the prefill guard → 400) instead of returning a blanket 500. Defaults to
+    # 500/``InternalServerError`` so an ErrorChunk built without a mapped cause
+    # keeps the historic behaviour.
+    error_code: int = 500
+    error_type: str = "InternalServerError"
+
     # NOTE: this is a bad place to put this, creates semantic overlap/confusion;
     #       at some point someone put this somewhere else, thanks :)
     diagnostics: list[KnownRunnerDiagnostic] = []
