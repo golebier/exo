@@ -10,6 +10,7 @@ from mlx_lm.sample_utils import make_sampler
 
 from exo.shared.types.common import ModelId
 from exo.shared.types.text_generation import InputMessage, TextGenerationTaskParams
+from exo.worker.engines.mlx import memory_guard
 from exo.worker.engines.mlx.cache import (
     KVPrefixCache,
     cache_length,
@@ -104,6 +105,119 @@ class TestKVPrefix:
         cache = KVPrefixCache(None)
         cache.clear()
         assert len(cache.prompts) == 0
+
+
+class TestEvictionPressureModel:
+    """Reclaim-based eviction: a resident model must not be treated as pressure.
+
+    Regression for the prefix cache being evicted on every prefill on a large
+    Apple-Silicon box whose model weights are wired via ``iogpu.wired_limit_mb``:
+    ``psutil.virtual_memory().percent`` counts those wired pages as "used" and
+    reports >75% with the model alone loaded, so the legacy percentage
+    threshold evicted the whole cache before each lookup and
+    ``prefix_hit_length`` (the value reported as ``cached_tokens`` in the
+    cache-efficiency UI) was always 0. Eviction must instead compare the
+    process's real footprint (``current_usage_bytes``) against the reclaim-
+    based byte ceilings.
+    """
+
+    def _seed_cache(self) -> KVPrefixCache:
+        cache = KVPrefixCache(None)
+        cache.prompts.append(mx.array([1, 2, 3]))
+        cache.caches.append([KVCache()])
+        cache._snapshots.append(None)
+        cache._media_regions.append([])
+        cache._last_used.append(1)
+        cache.prefill_tps.append(0.0)
+        return cache
+
+    def test_does_not_evict_when_real_footprint_below_ceiling(self):
+        """A legitimately-resident model below the byte ceiling is not pressure."""
+        cache = self._seed_cache()
+        with (
+            patch.object(
+                memory_guard, "eviction_soft_bytes", return_value=200 * 1024**3
+            ),
+            patch.object(
+                memory_guard, "eviction_hard_bytes", return_value=220 * 1024**3
+            ),
+            patch.object(
+                memory_guard, "current_usage_bytes", return_value=60 * 1024**3
+            ),
+            # The legacy percentage reports >75% (model wired) — must be ignored.
+            patch(
+                "exo.worker.engines.mlx.cache.get_memory_used_percentage",
+                return_value=0.95,
+            ),
+        ):
+            cache.evict_for_prefill_headroom()
+        assert len(cache.prompts) == 1, (
+            "cache must survive when real footprint is below ceiling"
+        )
+
+    def test_evicts_when_real_footprint_exceeds_soft_ceiling(self):
+        """Before-prefill evicts down to the soft watermark under genuine pressure."""
+        cache = self._seed_cache()
+        with (
+            patch.object(
+                memory_guard, "eviction_soft_bytes", return_value=100 * 1024**3
+            ),
+            patch.object(
+                memory_guard, "eviction_hard_bytes", return_value=120 * 1024**3
+            ),
+            patch.object(
+                memory_guard, "current_usage_bytes", return_value=150 * 1024**3
+            ),
+            patch(
+                "exo.worker.engines.mlx.cache.get_memory_used_percentage",
+                return_value=0.10,
+            ),
+        ):
+            cache.evict_for_prefill_headroom()
+        assert len(cache.prompts) == 0, (
+            "cache must be evicted when footprint exceeds soft ceiling"
+        )
+
+    def test_post_add_uses_hard_ceiling(self):
+        """_evict_if_needed targets the hard ceiling.
+
+        A footprint above soft but below hard does not evict (post-add, not
+        before-prefill).
+        """
+        cache = self._seed_cache()
+        with (
+            patch.object(
+                memory_guard, "eviction_soft_bytes", return_value=100 * 1024**3
+            ),
+            patch.object(
+                memory_guard, "eviction_hard_bytes", return_value=200 * 1024**3
+            ),
+            patch.object(
+                memory_guard, "current_usage_bytes", return_value=150 * 1024**3
+            ),
+            patch(
+                "exo.worker.engines.mlx.cache.get_memory_used_percentage",
+                return_value=0.95,
+            ),
+        ):
+            cache._evict_if_needed()
+        assert len(cache.prompts) == 1, "post-add must not evict below the hard ceiling"
+
+    def test_falls_back_to_percentage_when_ceilings_unresolvable(self):
+        """When the reclaim model can't compute ceilings, legacy percentage is used."""
+        cache = self._seed_cache()
+        with (
+            patch.object(memory_guard, "eviction_soft_bytes", return_value=0),
+            patch.object(memory_guard, "eviction_hard_bytes", return_value=0),
+            patch(
+                "exo.worker.engines.mlx.cache.get_memory_used_percentage",
+                return_value=0.95,
+            ),
+        ):
+            cache.evict_for_prefill_headroom()
+        assert len(cache.prompts) == 0, (
+            "legacy percentage path still evicts above threshold"
+        )
 
 
 def _load_gpt_oss() -> tuple[Model, object]:
@@ -568,10 +682,18 @@ class TestKVPrefixCacheWithModel:
         kv_prefix_cache._last_used[2] = 100.0
         # Entry 0 (_last_used=0.0) is LRU, entry 1 (_last_used=1.0) is next
 
-        # Simulate memory pressure: return usage above _MEMORY_THRESHOLD (0.9)
-        with patch(
-            "exo.worker.engines.mlx.cache.get_memory_used_percentage",
-            return_value=0.95,
+        # Simulate memory pressure: real footprint above the hard ceiling so
+        # the post-add eviction (which targets the hard ceiling) evicts LRU
+        # entries. The legacy percentage is patched too to confirm the byte
+        # path is what's actually consulted.
+        with (
+            patch.object(memory_guard, "eviction_hard_bytes", return_value=1_000),
+            patch.object(memory_guard, "eviction_soft_bytes", return_value=1_000),
+            patch.object(memory_guard, "current_usage_bytes", return_value=10_000_000),
+            patch(
+                "exo.worker.engines.mlx.cache.get_memory_used_percentage",
+                return_value=0.95,
+            ),
         ):
             # Trigger eviction by adding a new entry
             task = TextGenerationTaskParams(
@@ -642,20 +764,27 @@ class TestKVPrefixCacheWithModel:
 
         assert len(kv_prefix_cache.prompts) == 3
 
-        # Simulate pressure above the prefill threshold but below the cache
-        # threshold: the post-add path would NOT evict here, but the
-        # before-prefill path must (it targets the tighter watermark).
-        # Readings: stay at 0.75 (between prefill 0.60 and memory 0.80 for a
-        # 16GB box). Each eviction re-measures; keep it high enough that LRU0
-        # and LRU1 are evicted, then drop below the prefill threshold so LRU2
-        # survives and prefill proceeds.
-        readings = iter([0.75, 0.75, 0.55])
+        # Simulate pressure above the prefill (soft) ceiling but such that
+        # the post-add (hard) path would not evict: the before-prefill path
+        # must (it targets the tighter soft watermark). Drive eviction via
+        # the reclaim-based footprint: two readings above the soft ceiling
+        # (evict LRU0, LRU1), then one below so LRU2 survives and prefill
+        # proceeds. The legacy percentage is patched low to confirm it is NOT
+        # the consulted metric.
+        readings = iter([10_000_000, 10_000_000, 0])
 
-        def fake_pressure(_self: KVPrefixCache) -> float:
+        def fake_usage() -> int:
             return next(readings)
 
         with (
-            patch.object(KVPrefixCache, "get_memory_used_percentage", fake_pressure),
+            patch.object(memory_guard, "eviction_soft_bytes", return_value=1_000),
+            patch.object(
+                memory_guard, "eviction_hard_bytes", return_value=10_000_000_000
+            ),
+            patch.object(memory_guard, "current_usage_bytes", fake_usage),
+            patch.object(
+                KVPrefixCache, "get_memory_used_percentage", return_value=0.10
+            ),
             patch.object(cache_mod, "gc.collect"),
             patch.object(cache_mod, "mx.clear_cache"),
         ):

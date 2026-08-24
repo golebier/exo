@@ -459,6 +459,40 @@ def hard_limit_bytes() -> int:
     return ceiling_breakdown().hard_limit
 
 
+def eviction_hard_bytes() -> int:
+    """Hard byte ceiling for cache eviction, independent of the admission toggle.
+
+    Unlike :func:`hard_limit_bytes` (which returns 0 when the preflight guard
+    is disabled), this always resolves the reclaim-based ceiling from the
+    underlying components so the *eviction* path uses the correct metric on a
+    large Apple-Silicon box regardless of whether admission rejection is on.
+    Eviction and admission are separate concerns: an operator may run with
+    the guard off (no preflight rejection) yet still want the prefix cache
+    evicted against the real OOM ceiling rather than ``psutil``'s wired-page
+    percentage — which otherwise evicts the whole cache on every prefill
+    when the model is wired via ``iogpu.wired_limit_mb``.
+    """
+    resolved = _normalize_tier(_MEMORY_GUARD_TIER)
+    static_ceiling = _static_ceiling_bytes(resolved)
+    dynamic_ceiling = _dynamic_ceiling_bytes(resolved)
+    metal_cap = get_effective_metal_cap_bytes()
+    candidates = [c for c in (static_ceiling, dynamic_ceiling, metal_cap) if c > 0]
+    return min(candidates) if candidates else 0
+
+
+def eviction_soft_bytes() -> int:
+    """Soft byte watermark for before-prefill eviction, independent of the toggle.
+
+    Companion to :func:`eviction_hard_bytes` for the prefill-headroom path.
+    See :func:`soft_limit_bytes` for the watermark semantics; this variant is
+    always resolvable so eviction works with the guard off.
+    """
+    hard = eviction_hard_bytes()
+    if hard <= 0:
+        return 0
+    return int(hard * _SOFT_THRESHOLD_BY_TIER[_MEMORY_GUARD_TIER])
+
+
 def soft_limit_bytes() -> int:
     """Soft watermark — the cache is evicted below this before prefill.
 

@@ -785,6 +785,25 @@ class KVPrefixCache:
         stuck pressure reading (e.g. a third-party process holding memory)
         can't evict the entire cache in one go — the preflight estimator
         then decides whether to admit or reject.
+
+        Pressure model: eviction compares the process's real footprint
+        (``memory_guard.current_usage_bytes`` = max(phys_footprint, MLX
+        active)) against the guard's byte ceilings — ``eviction_soft_bytes``
+        for the before-prefill path, ``eviction_hard_bytes`` for the post-add
+        path — scaled by ``threshold``'s relative position between the soft
+        and hard watermarks. This is the fix for the prefix cache being
+        evicted on *every* prefill on a large Apple-Silicon box whose model
+        weights are wired via ``iogpu.wired_limit_mb``:
+        ``psutil.virtual_memory().percent`` counts those wired pages as
+        "used" and reports >75% with the model alone loaded, so the legacy
+        percentage threshold evicted the whole cache before each lookup and
+        ``prefix_hit_length`` was always 0. ``current_usage_bytes`` only
+        counts what *this process* holds, so a legitimately-resident model
+        no longer looks like pressure. The byte ceilings are resolved
+        independently of the preflight-admission toggle (see
+        ``memory_guard.eviction_*_bytes``) so eviction is correct whether or
+        not admission rejection is on; the legacy ``get_memory_used_percentage``
+        is only the fallback when the reclaim model can't be computed.
         """
         if len(self.caches) == 0:
             return 0
@@ -795,7 +814,7 @@ class KVPrefixCache:
         while (
             len(self.caches) > 0
             and evicted_count < _MAX_PREFILL_EVICTION_RETRIES
-            and self.get_memory_used_percentage() > threshold
+            and self._memory_pressure_exceeds(threshold)
         ):
             lru_index = self._last_used.index(min(self._last_used))
             evicted_tokens = len(self.prompts[lru_index])
@@ -817,6 +836,52 @@ class KVPrefixCache:
             mx.clear_cache()
 
         return evicted_count
+
+    def _memory_pressure_exceeds(self, threshold: float) -> bool:
+        """Whether memory pressure warrants further eviction.
+
+        ``threshold`` is the legacy fractional watermark (0-1) passed by
+        ``_evict_if_needed`` (``_MEMORY_THRESHOLD``) and
+        ``evict_for_prefill_headroom`` (``_PREFILL_MEMORY_THRESHOLD``). See
+        ``_evict_until_under`` for why the reclaim-based byte model replaces
+        the naive ``psutil`` percentage on loaded large-memory boxes.
+        """
+        soft = memory_guard.eviction_soft_bytes()
+        hard = memory_guard.eviction_hard_bytes()
+        # No byte ceilings resolvable → legacy percentage path so behaviour is
+        # unchanged on platforms where the reclaim model can't be computed.
+        if soft <= 0 or hard <= 0:
+            return self.get_memory_used_percentage() > threshold
+
+        # Map the fractional threshold onto a byte ceiling. The prefill path
+        # targets the soft watermark (threshold < _MEMORY_THRESHOLD); the
+        # post-add path targets the hard limit. Interpolate linearly between
+        # soft and hard by where ``threshold`` sits between
+        # ``_PREFILL_MEMORY_THRESHOLD`` and ``_MEMORY_THRESHOLD``.
+        lo = _PREFILL_MEMORY_THRESHOLD
+        hi = _MEMORY_THRESHOLD
+        t = min(1.0, max(0.0, (threshold - lo) / (hi - lo))) if hi > lo else 0.0
+        ceiling_bytes = int(soft + t * (hard - soft))
+        if ceiling_bytes <= 0:
+            return self.get_memory_used_percentage() > threshold
+
+        local_usage = memory_guard.current_usage_bytes()
+        if self._group is None:
+            return local_usage > ceiling_bytes
+
+        # Cluster-max usage vs cluster-max ceiling (conservative, mirroring the
+        # legacy all-gather-of-percentages path): evict if *any* rank is over.
+        all_usage = mx.distributed.all_gather(
+            mx.array([local_usage], dtype=mx.uint64),
+            group=self._group,
+        )
+        all_ceilings = mx.distributed.all_gather(
+            mx.array([ceiling_bytes], dtype=mx.uint64),
+            group=self._group,
+        )
+        max_usage = int(mx.max(all_usage).item())
+        min_ceiling = int(mx.min(all_ceilings).item())
+        return max_usage > min_ceiling
 
     def get_memory_used_percentage(self) -> float:
         local_pressure: float = get_memory_used_percentage()

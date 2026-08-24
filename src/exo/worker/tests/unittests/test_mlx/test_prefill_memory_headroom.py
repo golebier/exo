@@ -21,6 +21,7 @@ import mlx.core as mx
 import pytest
 
 from exo.worker.engines.mlx import cache as cache_mod
+from exo.worker.engines.mlx import memory_guard
 from exo.worker.engines.mlx.cache import (
     _DEFAULT_PREFILL_STEP_SIZE,
     KVPrefixCache,
@@ -237,25 +238,31 @@ class TestEvictForPrefillHeadroom:
 
     def test_evicts_until_below_prefill_threshold(self):
         c = self._populated_cache()
-        # Drive pressure down across evictions: 0.95 -> 0.80 -> 0.62 (below
-        # the default prefill threshold of ~0.60 only on the 3rd reading).
-        # We use a prefill threshold of 0.70 here (memory threshold 0.80) so
-        # the sequence crosses it deterministically.
-        readings = iter([0.95, 0.80, 0.62, 0.55])
+        # Drive the reclaim-based footprint down across evictions: high, high,
+        # then below the soft ceiling so eviction stops. The before-prefill
+        # path targets the soft watermark. The legacy percentage is patched
+        # low to confirm it is NOT the consulted metric.
+        readings = iter([10_000_000, 10_000_000, 0, 0])
 
-        def fake_pressure(_self: KVPrefixCache) -> float:
+        def fake_usage() -> int:
             return next(readings)
 
         with (
-            patch.object(KVPrefixCache, "get_memory_used_percentage", fake_pressure),
-            patch.object(cache_mod, "_PREFILL_MEMORY_THRESHOLD", 0.70),
+            patch.object(memory_guard, "eviction_soft_bytes", return_value=1_000),
+            patch.object(
+                memory_guard, "eviction_hard_bytes", return_value=10_000_000_000
+            ),
+            patch.object(memory_guard, "current_usage_bytes", fake_usage),
+            patch.object(
+                KVPrefixCache, "get_memory_used_percentage", lambda self: 0.10
+            ),
             patch("exo.worker.engines.mlx.cache.gc.collect"),
             patch("exo.worker.engines.mlx.cache.mx.clear_cache"),
         ):
             evicted = c.evict_for_prefill_headroom()
 
-        # Readings: 0.95 (>0.70, evict LRU0), 0.80 (>0.70, evict LRU1),
-        # 0.62 (<=0.70, stop). Two evicted, one remains.
+        # Readings: high (>soft, evict LRU0), high (>soft, evict LRU1),
+        # 0 (<=soft, stop). Two evicted, one remains.
         assert evicted == 2
         assert len(c.prompts) == 1
         # The survivor is the most-recently-used (index 2, _last_used=2.0).
@@ -264,6 +271,13 @@ class TestEvictForPrefillHeadroom:
     def test_no_eviction_when_already_below_threshold(self):
         c = self._populated_cache()
         with (
+            patch.object(
+                memory_guard, "eviction_soft_bytes", return_value=10_000_000_000
+            ),
+            patch.object(
+                memory_guard, "eviction_hard_bytes", return_value=10_000_000_000
+            ),
+            patch.object(memory_guard, "current_usage_bytes", return_value=0),
             patch.object(
                 KVPrefixCache, "get_memory_used_percentage", lambda self: 0.40
             ),
@@ -277,6 +291,11 @@ class TestEvictForPrefillHeadroom:
     def test_no_eviction_when_cache_empty(self):
         c = KVPrefixCache(group=None)
         with (
+            patch.object(memory_guard, "eviction_soft_bytes", return_value=1_000),
+            patch.object(
+                memory_guard, "eviction_hard_bytes", return_value=10_000_000_000
+            ),
+            patch.object(memory_guard, "current_usage_bytes", return_value=10_000_000),
             patch.object(
                 KVPrefixCache, "get_memory_used_percentage", lambda self: 0.95
             ),
@@ -287,14 +306,20 @@ class TestEvictForPrefillHeadroom:
         assert evicted == 0
 
     def test_prefill_threshold_tighter_than_cache_threshold(self):
-        # evict_for_prefill_headroom targets a *lower* watermark than
-        # _evict_if_needed, so it evicts at least as aggressively. Concretely:
-        # at 0.75 pressure with thresholds memory=0.80 / prefill=0.70, the
-        # post-add path would not evict but the before-prefill path must.
+        # evict_for_prefill_headroom targets a *lower* watermark (soft) than
+        # _evict_if_needed (hard), so it evicts at least as aggressively.
+        # Concretely: a footprint above the soft ceiling but below the hard
+        # ceiling means the post-add path would not evict but the before-
+        # prefill path must.
         c = self._populated_cache()
         with (
+            patch.object(memory_guard, "eviction_soft_bytes", return_value=1_000),
             patch.object(
-                KVPrefixCache, "get_memory_used_percentage", lambda self: 0.75
+                memory_guard, "eviction_hard_bytes", return_value=10_000_000_000
+            ),
+            patch.object(memory_guard, "current_usage_bytes", return_value=5_000_000),
+            patch.object(
+                KVPrefixCache, "get_memory_used_percentage", lambda self: 0.10
             ),
             patch.object(cache_mod, "_MEMORY_THRESHOLD", 0.80),
             patch.object(cache_mod, "_PREFILL_MEMORY_THRESHOLD", 0.70),
@@ -322,8 +347,15 @@ class TestEvictForPrefillHeadroom:
         assert len(c.prompts) == 20
         cap = cache_mod._MAX_PREFILL_EVICTION_RETRIES
         with (
+            patch.object(memory_guard, "eviction_soft_bytes", return_value=1_000),
             patch.object(
-                KVPrefixCache, "get_memory_used_percentage", lambda self: 0.99
+                memory_guard, "eviction_hard_bytes", return_value=10_000_000_000
+            ),
+            patch.object(
+                memory_guard, "current_usage_bytes", return_value=10_000_000_000
+            ),
+            patch.object(
+                KVPrefixCache, "get_memory_used_percentage", lambda self: 0.10
             ),
             patch.object(cache_mod, "_PREFILL_MEMORY_THRESHOLD", 0.50),
             patch("exo.worker.engines.mlx.cache.gc.collect"),
