@@ -4,8 +4,9 @@ from typing import cast
 from unittest.mock import patch
 
 import mlx.core as mx
+import numpy as np
 import pytest
-from mlx_lm.models.cache import KVCache
+from mlx_lm.models.cache import KVCache, QuantizedKVCache
 from mlx_lm.sample_utils import make_sampler
 
 from exo.shared.types.common import ModelId
@@ -13,6 +14,7 @@ from exo.shared.types.text_generation import InputMessage, TextGenerationTaskPar
 from exo.worker.engines.mlx import memory_guard
 from exo.worker.engines.mlx.cache import (
     KVPrefixCache,
+    _copy_kv_cache,
     cache_length,
     encode_prompt,
     get_prefix_length,
@@ -107,7 +109,107 @@ class TestKVPrefix:
         assert len(cache.prompts) == 0
 
 
-class TestEvictionPressureModel:
+class TestShallowCopyIndependence:
+    """Regression: the prefix-cache copy must not share mutable state with the
+    live decode cache. The root cause of the TP decode-stall watchdog was a
+    multi-GB ``deepcopy`` on the post-prefill critical path; the fix shares
+    MLX array data (immutable; ``extend``/``trim`` rebind) via a shallow
+    per-layer copy. These tests pin the independence invariant."""
+
+    @staticmethod
+    def _filled_quant_cache(tokens: int = 4) -> list[QuantizedKVCache]:
+        cache = [QuantizedKVCache(group_size=64, bits=4) for _ in range(2)]
+        k = mx.array(np.random.randn(1, 8, tokens, 64).astype(np.float16))
+        v = mx.array(np.random.randn(1, 8, tokens, 64).astype(np.float16))
+        for c in cache:
+            c.keys = k
+            c.values = v
+            c.offset = tokens
+        return cache
+
+    def test_shallow_copy_is_independent_of_decode_extend(self):
+        """Extending the live cache (decode) must not mutate the stored copy."""
+        live = self._filled_quant_cache(tokens=4)
+        stored = _copy_kv_cache(live)
+        assert cache_length(stored) == 4
+        # Simulate decode: extend the live cache (rebinds keys/values/offset).
+        for layer in live:
+            layer.keys = mx.concatenate(
+                [layer.keys, mx.array(np.random.randn(1, 8, 2, 64).astype(np.float16))],
+                axis=2,
+            )
+            layer.values = mx.concatenate(
+                [
+                    layer.values,
+                    mx.array(np.random.randn(1, 8, 2, 64).astype(np.float16)),
+                ],
+                axis=2,
+            )
+            layer.offset = 6
+        # The stored copy keeps the original prompt KV.
+        assert cache_length(stored) == 4
+        assert stored[0].keys.shape[2] == 4
+        assert live[0].keys.shape[2] == 6
+
+    def test_shallow_copy_is_independent_of_trim(self):
+        """Trimming the stored copy (a future prefix-hit trim) must not affect
+        the live cache."""
+        from exo.worker.engines.mlx.cache import trim_cache
+
+        live = self._filled_quant_cache(tokens=6)
+        stored = _copy_kv_cache(live)
+        trim_cache(stored, 2, None)
+        assert cache_length(stored) == 4
+        assert cache_length(live) == 6  # live unaffected
+
+    def test_add_kv_cache_stores_independent_copy(self):
+        """``add_kv_cache`` must snapshot the prefill state, not alias it."""
+        cache = KVPrefixCache(None)
+        prompt = mx.array([1, 2, 3, 4])
+        live = self._filled_quant_cache(tokens=4)
+        cache.add_kv_cache(prompt, live)
+        # Mutate the live cache (decode) after add — the stored entry is frozen.
+        for layer in live:
+            layer.keys = mx.concatenate(
+                [layer.keys, mx.array(np.random.randn(1, 8, 1, 64).astype(np.float16))],
+                axis=2,
+            )
+            layer.offset = 5
+        assert cache_length(cache.caches[0]) == 4  # stored, not 5
+
+    def test_get_kv_cache_returns_independent_copy(self):
+        """``get_kv_cache`` must return a copy the caller can trim/extend
+        without corrupting the stored entry."""
+        cache = KVPrefixCache(None)
+        prompt = mx.array([1, 2, 3, 4, 5, 6])
+        cache.add_kv_cache(prompt, self._filled_quant_cache(tokens=6))
+
+        class _FakeModel:
+            layers: list[object] = []
+
+        got, _remaining, _idx, _exact = cache.get_kv_cache(_FakeModel(), prompt)
+        # Extend the returned cache (decode) — the stored entry is frozen.
+        for layer in got:
+            layer.keys = mx.concatenate(
+                [layer.keys, mx.array(np.random.randn(1, 8, 1, 64).astype(np.float16))],
+                axis=2,
+            )
+            layer.offset = 7
+        assert cache_length(cache.caches[0]) == 6  # stored, not 7
+
+    def test_ssm_cache_falls_back_to_deepcopy(self):
+        """Caches with SSM/exotic layers (ArraysCache) must use deepcopy (their
+        state is in-place-mutated and can't be safely shared)."""
+        from mlx_lm.models.cache import ArraysCache
+
+        a = ArraysCache(size=1)
+        a.cache = [mx.array(np.random.randn(2, 4, 8).astype(np.float32))]
+        stored = _copy_kv_cache([a])
+        # Mutate the live cache in place (ArraysCache.extend writes the list).
+        a.cache[0] = mx.array(np.random.randn(2, 4, 8).astype(np.float32))
+        # The deepcopy'd stored entry is unaffected.
+        assert stored[0].cache[0] is not a.cache[0]
+
     """Reclaim-based eviction: a resident model must not be treated as pressure.
 
     Regression for the prefix cache being evicted on every prefill on a large

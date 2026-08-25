@@ -1,3 +1,4 @@
+import copy
 import gc
 import os
 from copy import deepcopy
@@ -293,6 +294,31 @@ def has_non_kv_caches(cache: KVCacheType) -> bool:
     return any(is_non_trimmable_cache_entry(c) for c in cache)
 
 
+def _copy_kv_cache(cache: KVCacheType) -> KVCacheType:
+    """Copy a KV cache for prefix-cache storage, sharing MLX array data.
+
+    For standard append-only KV caches (``KVCache``/``QuantizedKVCache``) a
+    shallow per-layer copy is O(1) in KV size: MLX arrays are immutable and
+    ``extend``/``trim`` rebind them (never mutate in place), so sharing array
+    data between the stored entry and the live decode cache is safe — decode
+    creates new arrays via ``mx.concatenate`` and the stored entry keeps the
+    original prompt-KV arrays.  This avoids a multi-GB ``deepcopy`` on the
+    post-prefill critical path (between the prefill collective and the decode
+    ``mx_barrier``) that stalls the tensor-parallel decode collective under
+    memory pressure — the root cause of the ``decode stalled: no tokens for
+    120.0s`` watchdog firing on a 2-node TP cluster after a ~50k-token prefill.
+
+    For caches with in-place-mutated containers (``ArraysCache``/SSM,
+    ``RotatingKVCache``, non-trimmable ``CacheList``, ``DeepseekV4Cache``) —
+    detected by :func:`has_non_kv_caches` — fall back to ``deepcopy``:
+    correctness over speed (these are exotic/SSM caches, typically far smaller
+    than the KV tiers, and their state can't be safely shared).
+    """
+    if not has_non_kv_caches(cache):
+        return [copy.copy(layer) for layer in cache]
+    return deepcopy(cache)
+
+
 def _cache_is_quantized(cache: KVCacheType) -> bool:
     """Whether any layer of ``cache`` is a ``QuantizedKVCache``.
 
@@ -401,7 +427,7 @@ class KVPrefixCache:
         """Add a new cache entry. Evicts LRU entries if memory is high."""
         self._evict_if_needed()
         self.prompts.append(prompt_tokens)
-        self.caches.append(deepcopy(cache))
+        self.caches.append(_copy_kv_cache(cache))
         self._snapshots.append(ssm_snapshots)
         self._media_regions.append(media_regions or [])
         self.prefill_tps.append(prefill_tps)
@@ -429,7 +455,7 @@ class KVPrefixCache:
             merged.extend(snapshots)
 
         self.prompts[index] = prompt_tokens
-        self.caches[index] = deepcopy(cache)
+        self.caches[index] = _copy_kv_cache(cache)
         self._snapshots[index] = merged or None
         self._media_regions[index] = media_regions or []
         self.prefill_tps[index] = prefill_tps
@@ -613,7 +639,7 @@ class KVPrefixCache:
         if restore_snap is None and has_ssm:
             return make_kv_cache(model), prompt_tokens, None, False
 
-        prompt_cache = deepcopy(self.caches[best_index])
+        prompt_cache = _copy_kv_cache(self.caches[best_index])
         tokens_to_trim = cached_length - restore_pos
         if tokens_to_trim > 0:
             trim_cache(prompt_cache, tokens_to_trim, restore_snap)
