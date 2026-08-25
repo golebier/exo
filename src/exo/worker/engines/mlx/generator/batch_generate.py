@@ -1,4 +1,5 @@
 import contextlib
+import gc
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -505,6 +506,16 @@ class ExoBatchGenerator:
         _step_elapsed = time.perf_counter() - _step_tic
         _overhead = _step_elapsed - _next_elapsed
         self._step_count += 1
+        # Periodically reclaim Metal buffers accumulated by decode-step
+        # intermediates (attention activations, logits).  Under the memory
+        # pressure of a large-context decode (e.g. 49k tokens on a ~200 GB
+        # model in 256 GB RAM) these can fill the buffer pool and stall the
+        # TP all-reduce collective — the ``decode stalled: no tokens for
+        # 120s`` watchdog.  gc.collect() releases the Python references so
+        # mx.clear_cache() can actually reclaim the Metal buffers.
+        if self._step_count % 32 == 0:
+            gc.collect()
+            mx.clear_cache()
         if self._step_count % 64 == 0 and responses:
             logger.debug(
                 f"step overhead: {_overhead * 1000:.2f}ms (next={_next_elapsed * 1000:.2f}ms total={_step_elapsed * 1000:.2f}ms)"

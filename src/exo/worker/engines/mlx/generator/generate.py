@@ -1,5 +1,6 @@
 import contextlib
 import functools
+import gc
 import math
 import time
 import uuid
@@ -464,6 +465,13 @@ def flush_prefill_for_decode(
     # surface mlx-lm exposes (keys/values/offset); matches the pipeline path.
     with contextlib.suppress(Exception):
         mx.eval([c.state for c in cache])  # type: ignore[reportUnknownMemberType]
+    # Release Python references to prefill intermediate activations (attention
+    # scores, hidden states from the 49k-token forward pass) so the Metal
+    # buffers they hold can be reclaimed.  Without gc.collect() these Python
+    # objects keep the buffers alive and mx.clear_cache() can't free them —
+    # the decode step then can't allocate and the TP collective stalls.
+    # Mirrors the eviction path's gc.collect() + mx.clear_cache() sequence.
+    gc.collect()
     mx.clear_cache()
     mx_barrier(group)
 
