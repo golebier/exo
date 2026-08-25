@@ -38,6 +38,7 @@ from exo.worker.engines.mlx.generator.generate import (
     bind_chunk_guard,
     eos_ids_from_tokenizer,
     extract_top_logprobs,
+    flush_prefill_for_decode,
     patch_embed_tokens,
     prefill,
 )
@@ -300,6 +301,14 @@ class ExoBatchGenerator:
                 media_regions,
                 prefill_tps=_prefill_tps,
             )
+
+        # Flush prefill transients + reclaim the Metal buffer pool + sync ranks
+        # before the first decode step.  Without this, a long prefill's
+        # intermediate arrays fill the buffer pool and the first decode step
+        # stalls on allocation under memory pressure, hanging the TP
+        # all-reduce collective (the ``decode stalled: no tokens for 120s``
+        # watchdog).  See flush_prefill_for_decode.
+        flush_prefill_for_decode(cache, self.group)
 
         last_tokens = prompt_tokens[-2:]
 

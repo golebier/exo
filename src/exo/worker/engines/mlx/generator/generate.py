@@ -438,6 +438,36 @@ def prefill(
     return tokens_per_sec, num_tokens, snapshots[:-1] if snapshots else []
 
 
+def flush_prefill_for_decode(
+    cache: KVCacheType,
+    group: mx.distributed.Group | None,
+) -> None:
+    """Flush prefill transients + reclaim the Metal buffer pool before decode.
+
+    A long prefill (e.g. 50k tokens) fills MLX's Metal buffer pool with
+    intermediate arrays (attention scores, activations) that are no longer
+    needed once the KV cache is populated.  Without reclaiming them, the first
+    decode step can't allocate the (small) decode-activation buffers and stalls
+    — and because each decode step runs a tensor-parallel all-reduce, stalling
+    one rank hangs the collective (``Fence::wait``), tripping the
+    ``decode stalled: no tokens for 120s`` watchdog.
+
+    This mirrors the pipeline-parallel prefill path's ``mx.eval([c.state ...])``
+    (which forces evaluation of the lazy cache-trim graph) and the eviction
+    path's ``gc.collect()`` + ``mx.clear_cache()`` (which reclaims freed
+    buffers), then adds an ``mx_barrier`` so both ranks enter decode together.
+    Called after prefill + prefix-cache save, before the first decode step.
+    """
+    # Force-evaluate the cache state so pending lazy ops (the post-prefill
+    # ``c.trim(2)`` and the last prefill chunk's KV writes) complete and their
+    # intermediate arrays become reclaimable.  ``.state`` is the evalable
+    # surface mlx-lm exposes (keys/values/offset); matches the pipeline path.
+    with contextlib.suppress(Exception):
+        mx.eval([c.state for c in cache])  # type: ignore[reportUnknownMemberType]
+    mx.clear_cache()
+    mx_barrier(group)
+
+
 def warmup_inference(
     model: Model,
     tokenizer: TokenizerWrapper,
@@ -780,7 +810,10 @@ def mlx_generate(
     generation_start_time = time.perf_counter()
     usage: Usage | None = None
     logger.info("Starting decode")
-    mx_barrier(group)
+    # Flush prefill transients + reclaim the Metal buffer pool before decode
+    # (see flush_prefill_for_decode).  The batch path calls this too; the
+    # non-batch path needs the same reclaim after a long prefill.
+    flush_prefill_for_decode(caches, group)
 
     for completion_tokens, out in enumerate(
         stream_generate(
