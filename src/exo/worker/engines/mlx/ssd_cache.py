@@ -40,7 +40,7 @@ import json
 import logging
 import os
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
@@ -90,6 +90,23 @@ _META_SAVED_AT = "exo_saved_at_epoch"
 # 2-level hash-prefix dir to keep any single directory's entry count bounded
 # (mirrors oMLX's hash-prefix layout and keeps ``rglob`` scans cheap).
 _ENTRY_SUFFIX = ".safetensors"
+# Sidecar holding the entry's prompt token ids (int32 ``.npy``), written
+# alongside the safetensors file so the in-RAM index can do longest-common-
+# prefix matching for prefix-SSD restore without touching the (large) KV
+# file. The token array is small relative to the KV (50k tokens ≈ 200 KB vs
+# a multi-GB KV file) and scales with entry size, so the SSD size cap bounds
+# the total index memory.
+_TOKENS_SUFFIX = ".tokens.npy"
+
+# Cache classes whose state ``trim(n)`` cannot safely roll back. A prefix
+# restore of such an entry would need a snapshot (which SSD restore doesn't
+# have), so partial prefix restore is only offered for entries with none of
+# these. Exact match (no trim) is still offered for every SSD-eligible entry.
+# Mirrors ``cache.is_non_trimmable_cache_entry`` but checked by class name to
+# keep this module decoupled from ``cache.py`` (no circular import).
+_NON_TRIMMABLE_BY_NAME: frozenset[str] = frozenset(
+    {"ArraysCache", "RotatingKVCache", "DeepseekV4Cache"}
+)
 
 
 def _entry_is_ssd_eligible(cache: "KVCacheType") -> bool:
@@ -107,6 +124,47 @@ def _entry_is_ssd_eligible(cache: "KVCacheType") -> bool:
         and hasattr(type(layer), "from_state")
         for layer in cache
     )
+
+
+def _has_non_trimmable_layers(cache: "KVCacheType") -> bool:
+    """Whether ``cache`` has any layer a prefix restore can't trim back.
+
+    A partial prefix restore trims the restored cache down to the common
+    prefix length; layers whose state ``trim(n)`` can't roll back
+    (``ArraysCache``/``RotatingKVCache``/``DeepseekV4Cache``/non-trimmable
+    ``CacheList``) need a snapshot for that, which SSD restore doesn't carry.
+    So a partial prefix restore is only offered when this returns False.
+    Exact-match restore (no trim) is offered for every SSD-eligible entry.
+    """
+    for layer in cache:
+        name = type(layer).__name__
+        if name in _NON_TRIMMABLE_BY_NAME:
+            return True
+        if name == "CacheList":
+            try:
+                if not bool(layer.is_trimmable()):  # type: ignore[reportUnknownMemberType]
+                    return True
+            except Exception:  # pragma: no cover - defensive
+                return True
+    return False
+
+
+def _common_prefix_len(a: np.ndarray, b: np.ndarray) -> int:
+    """Length of the longest common prefix of two int token arrays.
+
+    Vectorised: ``argmax`` of the first mismatch gives its index (0 when the
+    very first token differs); if no token differs in the overlap, the whole
+    overlap is the prefix. O(min(len(a), len(b))) per entry, but the compare
+    is a single vectorised numpy op so it's fast for 50k-token prompts.
+    """
+    n = min(int(len(a)), int(len(b)))
+    if n == 0:
+        return 0
+    # Element-wise inequality; cast because ndarray comparison stubs are Any.
+    diff = cast("np.ndarray", a[:n] != b[:n])
+    if not bool(diff.any()):
+        return n
+    return int(np.argmax(diff))
 
 
 def _cache_signature(cache: "KVCacheType", model_id: "ModelId | None") -> str:
@@ -157,15 +215,24 @@ def _hash_prefix_dirs(digest: str) -> Path:
     return Path(digest[0]) / digest[1:3]
 
 
+def _tokens_sidecar(entry_path: Path) -> Path:
+    """Path of the ``.tokens.npy`` sidecar for a given entry safetensors file."""
+    return entry_path.with_suffix(_TOKENS_SUFFIX)
+
+
 @dataclass(frozen=True)
 class SSDEntryIndex:
     """In-RAM index record for one SSD-cached entry.
 
-    The full prompt tokens are NOT held in RAM — only their hash (the lookup
-    key) and the metadata needed to (a) validate the signature, (b) find the
-    file, and (c) LRU-evict the SSD tier when it exceeds its size cap. The
-    prompt length is stored so a prefix lookup can cheaply reject SSD entries
-    shorter than the query before touching disk.
+    The full prompt **token ids** are held in RAM (as a compact int32 array) so
+    the longest-common-prefix lookup for prefix-SSD restore can run without
+    touching the (large) KV file — the token array is ~200 KB for a 50k-token
+    prompt vs a multi-GB KV file, and it scales with entry size so the SSD size
+    cap bounds total index memory. Also stored: the hash (cheap exact-membership
+    key), the signature (model/quant-swap guard), the file paths, and the LRU
+    access epoch. ``prompt_tokens`` is ``None`` only when an entry was recovered
+    from disk but its sidecar was missing/unreadable (degrades that entry to
+    exact-match-only).
     """
 
     prompt_hash: str
@@ -175,6 +242,7 @@ class SSDEntryIndex:
     file_path: Path
     file_size_bytes: int
     last_access_epoch: int
+    prompt_tokens: np.ndarray | None = None
 
 
 @dataclass
@@ -251,6 +319,22 @@ class SSDKVCacheStore:
             logger.warning("SSD KV spill failed for %s: %s", digest[:12], exc)
             return False
         size = path.stat().st_size
+        # Write the prompt-tokens sidecar so the in-RAM index can do longest-
+        # common-prefix matching for prefix-SSD restore. Best-effort: a write
+        # failure leaves the entry exact-match-only (``prompt_tokens=None``).
+        tokens_path = _tokens_sidecar(path)
+        tokens_arr: np.ndarray | None = None
+        try:
+            tokens_arr = np.asarray(np.array(prompt_tokens), dtype=np.int32)
+            np.save(tokens_path, tokens_arr)
+            with _suppress_os():
+                os.chmod(tokens_path, 0o600)
+        except OSError as exc:  # pragma: no cover - defensive
+            logger.warning(
+                "SSD KV tokens sidecar write failed for %s: %s", digest[:12], exc
+            )
+            tokens_arr = None
+        size += tokens_path.stat().st_size if tokens_arr is not None else 0
         self._access_counter += 1
         self._index[digest] = SSDEntryIndex(
             prompt_hash=digest,
@@ -260,6 +344,7 @@ class SSDKVCacheStore:
             file_path=path,
             file_size_bytes=size,
             last_access_epoch=self._access_counter,
+            prompt_tokens=tokens_arr,
         )
         self._enforce_size_cap()
         logger.info(
@@ -323,15 +408,7 @@ class SSDKVCacheStore:
             self._remove(digest)
             return None, 0
         self._access_counter += 1
-        record = SSDEntryIndex(
-            prompt_hash=record.prompt_hash,
-            token_count=record.token_count,
-            signature=record.signature,
-            model_id=record.model_id,
-            file_path=record.file_path,
-            file_size_bytes=record.file_size_bytes,
-            last_access_epoch=self._access_counter,
-        )
+        record = replace(record, last_access_epoch=self._access_counter)
         self._index[digest] = record
         # Re-new the file's mtime so an LRU-atime-based recovery scan keeps it.
         with _suppress_os():
@@ -352,6 +429,117 @@ class SSDKVCacheStore:
             return False
         digest = _prompt_hash(prompt_tokens)
         return digest in self._index
+
+    # ─── prefix restore (SSD → RAM on partial prefix hit) ─────────────────────
+    def restore_prefix(
+        self, prompt_tokens: mx.array, *, model_id: "ModelId | None"
+    ) -> "tuple[KVCacheType | None, int]":
+        """Restore the longest common prefix held on SSD (oMLX doc 01 finish).
+
+        The dominant agentic workload is re-sending the same long system
+        prompt plus a few new turns. After a restart/LRU eviction the RAM tier
+        is empty, so without this the whole prompt is re-prefilled. This finds
+        the SSD entry whose prompt shares the longest common prefix with the
+        query, loads + signature-validates its cache, and returns it along with
+        the matched prefix length so the caller trims it to the prefix and only
+        prefills the suffix.
+
+        Returns ``(cache, prefix_len)`` with the cache at the entry's **full**
+        offset (the caller trims) and ``prefix_len`` the common prefix length;
+        ``(None, 0)`` when the tier is inactive, no entry has a common prefix,
+        or the only partial match is on a non-trimmable entry (which can't be
+        trimmed back to the prefix without a snapshot). Exact matches
+        (``prefix_len == entry length``) are offered for every SSD-eligible
+        entry regardless of trimmability (no trim needed).
+        """
+        if not self.is_active() or not self._index:
+            return None, 0
+        try:
+            query = np.asarray(np.array(prompt_tokens), dtype=np.int32)
+        except Exception:  # pragma: no cover - defensive
+            return None, 0
+        if int(query.size) == 0:
+            return None, 0
+
+        # Find the SSD entry with the longest common prefix (RAM-only compare
+        # over the indexed token arrays — no disk I/O).
+        best_digest: str | None = None
+        best_len = 0
+        for digest, record in self._index.items():
+            entry_tokens = record.prompt_tokens
+            if entry_tokens is None or int(entry_tokens.size) == 0:
+                # Sidecar missing (legacy/recovery gap) → only exact match via
+                # the hash is possible for this entry; skip prefix scan.
+                continue
+            common = _common_prefix_len(query, entry_tokens)
+            if common > best_len:
+                best_len = common
+                best_digest = digest
+
+        # Fall back to exact hash match when no indexed tokens produced a hit
+        # (e.g. all sidecars missing) — preserves the Phase-2 exact-restore
+        # behaviour for entries recovered without their sidecar.
+        if best_digest is None:
+            exact_digest = _prompt_hash(prompt_tokens)
+            if exact_digest and exact_digest in self._index:
+                best_digest = exact_digest
+                best_len = self._index[exact_digest].token_count
+
+        if best_digest is None or best_len <= 0:
+            return None, 0
+        record = self._index[best_digest]
+
+        try:
+            loaded, meta = load_prompt_cache(
+                str(record.file_path), return_metadata=True
+            )
+        except Exception as exc:  # pragma: no cover - corrupt file
+            logger.warning(
+                "SSD KV prefix restore failed for %s: %s — removing stale file",
+                best_digest[:12],
+                exc,
+            )
+            self._remove(best_digest)
+            return None, 0
+        cache = cast("KVCacheType", cast(object, loaded))
+        stored_sig = _meta_get(meta, _META_SIGNATURE)
+        if stored_sig and stored_sig != _cache_signature(cache, model_id):
+            logger.info(
+                "SSD KV signature mismatch for %s — refusing prefix restore "
+                "(model/quant swap); removing stale block",
+                best_digest[:12],
+            )
+            self._remove(best_digest)
+            return None, 0
+
+        # A partial prefix restore trims the cache back to the prefix; entries
+        # with non-trimmable layers can't be trimmed without a snapshot, so a
+        # partial match on one is refused (exact match is fine — no trim).
+        if best_len < record.token_count and _has_non_trimmable_layers(cache):
+            logger.info(
+                "SSD KV prefix restore: best match %d/%d tokens but entry has "
+                "non-trimmable layers — refusing partial restore (no snapshot).",
+                best_len,
+                record.token_count,
+            )
+            return None, 0
+
+        self._access_counter += 1
+        record = replace(record, last_access_epoch=self._access_counter)
+        self._index[best_digest] = record
+        with _suppress_os():
+            os.utime(record.file_path, None)
+        logger.info(
+            "SSD KV prefix restore: %d/%d tokens ← %s (SSD tier %d/%d bytes, "
+            "%d entries)",
+            best_len,
+            record.token_count,
+            record.file_path,
+            self._total_size(),
+            self.max_size_bytes,
+            len(self._index),
+        )
+        return cache, best_len
 
     # ─── restart recovery ────────────────────────────────────────────────────
     def _recover_from_disk(self) -> None:
@@ -393,6 +581,26 @@ class SSDKVCacheStore:
             except OSError:
                 _unlink_quiet(path)
                 continue
+            # Load the prompt-tokens sidecar so prefix-SSD restore works for
+            # recovered entries too. Missing/unreadable sidecar → exact-match
+            # only (``prompt_tokens=None``).
+            tokens_path = _tokens_sidecar(path)
+            tokens_arr: np.ndarray | None = None
+            if tokens_path.is_file():
+                try:
+                    tokens_arr = np.asarray(
+                        np.load(tokens_path, allow_pickle=False),
+                        dtype=np.int32,
+                    )
+                except OSError as exc:  # pragma: no cover - defensive
+                    logger.warning(
+                        "SSD KV recovery: unreadable tokens sidecar %s: %s",
+                        tokens_path,
+                        exc,
+                    )
+                    _unlink_quiet(tokens_path)
+            if tokens_arr is not None:
+                size += tokens_path.stat().st_size
             self._access_counter += 1
             self._index[digest] = SSDEntryIndex(
                 prompt_hash=digest,
@@ -402,6 +610,7 @@ class SSDKVCacheStore:
                 file_path=path,
                 file_size_bytes=size,
                 last_access_epoch=self._access_counter,
+                prompt_tokens=tokens_arr,
             )
             found += 1
         if found:
@@ -442,6 +651,7 @@ class SSDKVCacheStore:
         if record is None:
             return
         _unlink_quiet(record.file_path)
+        _unlink_quiet(_tokens_sidecar(record.file_path))
 
     def _ensure_dir(self) -> None:
         try:
@@ -469,6 +679,9 @@ class SSDKVCacheStore:
         # mid-spill before indexing).
         if self.ssd_dir.exists():
             for path in self.ssd_dir.rglob(f"*{_ENTRY_SUFFIX}"):
+                if path.is_file():
+                    _unlink_quiet(path)
+            for path in self.ssd_dir.rglob(f"*{_TOKENS_SUFFIX}"):
                 if path.is_file():
                     _unlink_quiet(path)
         return removed

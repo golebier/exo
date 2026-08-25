@@ -8,12 +8,13 @@ restore skipping re-prefill). The tier is default-off, so every test enables it
 explicitly via the ``turboquant`` runtime override.
 """
 
+from dataclasses import replace
 from pathlib import Path
 
 import mlx.core as mx
 import numpy as np
 import pytest
-from mlx_lm.models.cache import KVCache, QuantizedKVCache
+from mlx_lm.models.cache import ArraysCache, KVCache, QuantizedKVCache
 
 from exo.shared.types.common import ModelId
 from exo.worker.engines.mlx import turboquant
@@ -195,9 +196,10 @@ class TestLRUSizeCap:
     def test_evicts_lru_when_over_cap(self, ssd_dir: Path):
         one_size = self._one_entry_size(ssd_dir)
         # Cap holds one entry but not two → the second spill evicts the LRU.
-        # All entries use the same token count so their on-disk sizes match.
+        # All entries use the same token count so their on-disk sizes match
+        # (the tokens sidecar scales with prompt length).
         store = SSDKVCacheStore(ssd_dir=ssd_dir, max_size_bytes=one_size + 1)
-        p1, p2 = _tokens(4), _tokens(40)  # distinct prompts, same-size cache
+        p1, p2 = _tokens(4), mx.array([10, 11, 12, 13])  # distinct, same length
         store.spill(p1, _filled_kv_cache(tokens=4), model_id=_TEST_MODEL)
         store.spill(p2, _filled_kv_cache(tokens=4), model_id=_TEST_MODEL)
         assert store.has(p2) is True
@@ -207,13 +209,15 @@ class TestLRUSizeCap:
         one_size = self._one_entry_size(ssd_dir)
         # Cap holds two entries but not three (all entries same on-disk size).
         store = SSDKVCacheStore(ssd_dir=ssd_dir, max_size_bytes=one_size * 2 + 1)
-        p1, p2 = _tokens(4), _tokens(40)
+        p1, p2 = _tokens(4), mx.array([10, 11, 12, 13])
         store.spill(p1, _filled_kv_cache(tokens=4), model_id=_TEST_MODEL)
         store.spill(p2, _filled_kv_cache(tokens=4), model_id=_TEST_MODEL)
         # Restore p1 (the older one) so it becomes most-recently-used.
         assert store.restore(p1, model_id=_TEST_MODEL)[0] is not None
         # A third spill exceeds the cap; p2 (now LRU) is evicted, p1 survives.
-        store.spill(_tokens(80), _filled_kv_cache(tokens=4), model_id=_TEST_MODEL)
+        store.spill(
+            mx.array([20, 21, 22, 23]), _filled_kv_cache(tokens=4), model_id=_TEST_MODEL
+        )
         assert store.has(p1) is True
         assert store.has(p2) is False
 
@@ -279,6 +283,145 @@ class TestKVPrefixCacheIntegration:
         assert exact is False
         # A fresh cache was returned (re-prefill required), not the stale block.
         assert cache_length(got) == 0
+
+
+class TestPrefixRestore:
+    """Longest-common-prefix SSD restore (oMLX doc 01 finish)."""
+
+    @staticmethod
+    def _filled_arrays_cache(tokens: int = 4) -> list[ArraysCache]:
+        # ArraysCache is SSD-eligible but NOT trimmable — used to exercise the
+        # partial-restore refusal path.
+        cache = [ArraysCache(size=1) for _ in range(2)]
+        for c in cache:
+            c.cache = [mx.array(np.random.randn(2, tokens, 8).astype(np.float32))]
+        return cache
+
+    def test_finds_longest_common_prefix_entry_is_prefix_of_query(self, ssd_dir: Path):
+        """Entry prompt is a strict prefix of the query (the agentic case)."""
+        store = SSDKVCacheStore(ssd_dir=ssd_dir, max_size_bytes=0)
+        entry_prompt = _tokens(8)  # [0..7]
+        store.spill(entry_prompt, _filled_kv_cache(tokens=8), model_id=_TEST_MODEL)
+        # Query = entry + 2 new tokens. Exact restore misses (hash differs).
+        query = mx.array(list(range(10)))
+        assert store.restore(query, model_id=_TEST_MODEL)[0] is None
+        restored, prefix_len = store.restore_prefix(query, model_id=_TEST_MODEL)
+        assert restored is not None
+        assert prefix_len == 8  # the whole entry is the prefix
+        assert cache_length(restored) == 8  # no trim needed
+
+    def test_trims_when_entry_diverges_mid_query(self, ssd_dir: Path):
+        """Entry shares only a prefix with the query and must be trimmed."""
+        store = SSDKVCacheStore(ssd_dir=ssd_dir, max_size_bytes=0)
+        store.spill(_tokens(8), _filled_kv_cache(tokens=8), model_id=_TEST_MODEL)
+        # Query diverges at token 4: [0,1,2,3,99,...]
+        query = mx.array([0, 1, 2, 3, 99, 100, 101, 102])
+        restored, prefix_len = store.restore_prefix(query, model_id=_TEST_MODEL)
+        assert restored is not None
+        assert prefix_len == 4
+        # The loaded cache is still at the entry's full offset (8); the caller
+        # trims it down to the 4-token prefix.
+        assert cache_length(restored) == 8
+
+    def test_picks_longest_among_multiple_entries(self, ssd_dir: Path):
+        store = SSDKVCacheStore(ssd_dir=ssd_dir, max_size_bytes=0)
+        # Entry A shares 3 tokens; entry B shares 6 tokens with the query.
+        store.spill(
+            mx.array([0, 1, 2, 50]), _filled_kv_cache(tokens=4), model_id=_TEST_MODEL
+        )
+        store.spill(
+            mx.array([0, 1, 2, 3, 4, 5, 60]),
+            _filled_kv_cache(tokens=7),
+            model_id=_TEST_MODEL,
+        )
+        query = mx.array([0, 1, 2, 3, 4, 5, 99])
+        restored, prefix_len = store.restore_prefix(query, model_id=_TEST_MODEL)
+        assert restored is not None
+        assert prefix_len == 6  # entry B's longer prefix wins
+
+    def test_no_common_prefix_returns_none(self, ssd_dir: Path):
+        store = SSDKVCacheStore(ssd_dir=ssd_dir, max_size_bytes=0)
+        store.spill(_tokens(4), _filled_kv_cache(tokens=4), model_id=_TEST_MODEL)
+        # Wholly disjoint prompt.
+        restored, prefix_len = store.restore_prefix(
+            mx.array([100, 101, 102, 103]), model_id=_TEST_MODEL
+        )
+        assert restored is None
+        assert prefix_len == 0
+
+    def test_refuses_partial_restore_for_non_trimmable_entry(self, ssd_dir: Path):
+        """ArraysCache can't be trimmed back to a partial prefix → refuse."""
+        store = SSDKVCacheStore(ssd_dir=ssd_dir, max_size_bytes=0)
+        store.spill(
+            _tokens(8), self._filled_arrays_cache(tokens=8), model_id=_TEST_MODEL
+        )
+        # Partial prefix (4 of 8) on a non-trimmable entry → refused.
+        query = mx.array([0, 1, 2, 3, 99, 100, 101, 102])
+        restored, prefix_len = store.restore_prefix(query, model_id=_TEST_MODEL)
+        assert restored is None
+        assert prefix_len == 0
+
+    def test_exact_match_restored_for_non_trimmable_entry(self, ssd_dir: Path):
+        """Exact match needs no trim → offered even for non-trimmable entries."""
+        store = SSDKVCacheStore(ssd_dir=ssd_dir, max_size_bytes=0)
+        prompt = _tokens(8)
+        store.spill(prompt, self._filled_arrays_cache(tokens=8), model_id=_TEST_MODEL)
+        restored, prefix_len = store.restore_prefix(prompt, model_id=_TEST_MODEL)
+        assert restored is not None
+        assert prefix_len == 8
+
+    def test_falls_back_to_exact_when_sidecar_missing(self, ssd_dir: Path):
+        """A recovered entry whose sidecar was lost still serves exact restore."""
+        store = SSDKVCacheStore(ssd_dir=ssd_dir, max_size_bytes=0)
+        prompt = _tokens(8)
+        store.spill(prompt, _filled_kv_cache(tokens=8), model_id=_TEST_MODEL)
+        # Simulate a lost/unreadable sidecar by clearing the indexed tokens.
+        digest = next(iter(store._index))
+        store._index[digest] = replace(store._index[digest], prompt_tokens=None)
+        # Prefix scan finds nothing, but the exact-hash fallback restores.
+        restored, prefix_len = store.restore_prefix(prompt, model_id=_TEST_MODEL)
+        assert restored is not None
+        assert prefix_len == 8
+
+    def test_prefix_restore_works_after_restart_recovery(self, ssd_dir: Path):
+        """The recovery scan loads the tokens sidecar so prefix restore works."""
+        store1 = SSDKVCacheStore(ssd_dir=ssd_dir, max_size_bytes=0)
+        store1.spill(_tokens(8), _filled_kv_cache(tokens=8), model_id=_TEST_MODEL)
+        # Simulate a restart: brand-new store over the same dir.
+        store2 = SSDKVCacheStore(ssd_dir=ssd_dir, max_size_bytes=0)
+        query = mx.array(list(range(10)))  # entry is a prefix of the query
+        restored, prefix_len = store2.restore_prefix(query, model_id=_TEST_MODEL)
+        assert restored is not None
+        assert prefix_len == 8
+
+
+class TestPrefixRestoreIntegration:
+    """End-to-end prefix restore through ``KVPrefixCache.get_kv_cache``."""
+
+    def test_prefix_restore_prefills_only_suffix(self, ssd_dir: Path, monkeypatch):
+        cache = KVPrefixCache(group=None)
+        cache.set_model_id(_TEST_MODEL)
+        store = SSDKVCacheStore(ssd_dir=ssd_dir, max_size_bytes=0)
+        cache.set_ssd_store(store)
+
+        # Spill an 8-token entry, then evict it from RAM to SSD.
+        entry_prompt = _tokens(8)
+        cache.add_kv_cache(entry_prompt, _filled_quant_cache(tokens=8))
+        monkeypatch.setattr(cache, "_memory_pressure_exceeds", lambda _t: True)
+        cache._evict_until_under(1.0)
+        assert len(cache.caches) == 0
+        assert store.has(entry_prompt)
+
+        # Query = entry + 2 new tokens. RAM miss → exact SSD miss → prefix hit.
+        query = mx.array(list(range(10)))
+        got, remaining, idx, exact = cache.get_kv_cache(_FakeModel(), query)
+        assert idx is None
+        assert exact is False  # not an exact match of the query
+        assert cache_length(got) == 8  # restored to the 8-token prefix
+        assert list(np.asarray(np.array(remaining))) == [8, 9]
+        # The prefix-restored entry is now in RAM (truncated prompt).
+        assert len(cache.caches) == 1
+        assert len(cache.prompts[0]) == 8
 
 
 class _FakeModel:

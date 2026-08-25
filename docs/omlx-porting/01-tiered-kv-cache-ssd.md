@@ -6,6 +6,16 @@
 **oMLX source:** `omlx/cache/{paged_cache.py, paged_ssd_cache.py, prefix_cache.py, boundary_snapshot_store.py, type_handlers.py, type_registry.py, hybrid_cache.py, factory.py, stats.py, interface.py, recovery.py, observability.py}`
 **EXO target:** `src/exo/worker/engines/mlx/cache.py` (extend `KVPrefixCache`)
 
+> **Status (partial — shipped):** Phases 2–3 (SSD spill/restore + restart
+> recovery) and the **prefix-SSD restore** refinement are implemented in
+> `src/exo/worker/engines/mlx/ssd_cache.py` + `cache.py`, behind
+> `EXO_TIERED_KV_CACHE=1` (default-off). The SSD store now restores the
+> **longest common prefix** across SSD entries (not just exact match), so the
+> dominant agentic re-send-context workload skips re-prefilling the shared
+> prefix after a restart/LRU eviction. Phase 1's paged-block RAM manager
+> (O(1) LRU + chain-hash) remains future work — the persistence value
+> doesn't require it, and the existing list-of-entries hot path is untouched.
+
 ---
 
 ## Why this is #1
@@ -204,9 +214,16 @@ Phase 3 independently.
 ## Definition of done
 
 - [ ] Phase 1: paged RAM manager passes existing `test_kv_prefix_cache.py` + new
-      block/COW/LRU tests; `basedpyright` + `ruff` clean.
-- [ ] Phase 2: spill + restore works; `test_spill_restore_roundtrip.py` green.
-- [ ] Phase 3: restart-recovery test (`test_restart_prefix_hit.py`) green.
+      block/COW/LRU tests; `basedpyright` + `ruff` clean. *(Not yet done — the
+      persistence value ships without it; see status note above.)*
+- [x] Phase 2: spill + restore works; round-trip tests green
+      (`test_ssd_cache.py::TestSpillRestoreRoundTrip`).
+- [x] **Prefix-SSD restore** (Phase 2 refinement): longest-common-prefix
+      restore across SSD entries — `test_ssd_cache.py::TestPrefixRestore` +
+      `TestPrefixRestoreIntegration` green.
+- [x] Phase 3: restart-recovery test green
+      (`test_ssd_cache.py::TestRestartRecovery` +
+      `test_prefix_restore_works_after_restart_recovery`).
 - [ ] Benchmark: TTFT on a 8k-token repeat prompt after restart drops from
       "full recompute" to "SSD restore" — measure and record tok/s.
 - [ ] Dashboard surface (optional): hot/cold block counts + hit rate in the

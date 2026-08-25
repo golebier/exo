@@ -135,3 +135,36 @@ further UI churn will be needed when they land.
 Shipped and live on the cluster. The settings layer + dashboard controls are
 the user-facing deliverable; the paged-SSD plumbing (Phases 1–3) is the next
 implementation milestone and can proceed independently behind these flags.
+
+---
+
+## 6. Follow-up: SSD spill/restore + prefix-SSD restore (shipped)
+
+A subsequent change implemented the actual SSD cold tier on top of the
+settings layer above, behind the same `EXO_TIERED_KV_CACHE=1` flag:
+
+- **`SSDKVCacheStore`** (`src/exo/worker/engines/mlx/ssd_cache.py`): spill via
+  `save_prompt_cache`, exact-match restore, restart-recovery scan, LRU size
+  cap, cache-signature guard (model/quant-swap refusal), SSD-eligibility check
+  for exotic classes. Wired into `KVPrefixCache` (spill on eviction, restore on
+  RAM miss, `clear()` wipes both tiers).
+- **Prefix-SSD restore** (the highest-value refinement): the store now restores
+  the **longest common prefix** across SSD entries, not just exact match. Each
+  spilled entry writes a compact int32 `.tokens.npy` sidecar (≈200 KB for a
+  50k-token prompt) so the in-RAM index does longest-common-prefix matching
+  without touching the (large) KV file. On a re-send-context-after-restart
+  request (same 50k system prompt + 2k new turns), the SSD tier restores the
+  50k prefix and only the 2k suffix is prefilled. Partial restore trims the
+  loaded cache to the prefix; entries with non-trimmable layers
+  (`ArraysCache`/`RotatingKVCache`/`DeepseekV4Cache`) refuse partial restore
+  (no snapshot on the SSD tier) but still serve exact match.
+- **Recovery scan loads the sidecar** so prefix restore works after a restart.
+- Tests: `test_ssd_cache.py` — 23 tests (round-trip, recovery, LRU cap,
+  signature refusal, 9 prefix-restore unit/integration cases). All green;
+  `basedpyright` 0 errors, `ruff` clean.
+
+**Build tag:** `v1.0.72-ssd-tier-dev1` (commit `c8f1895e`).
+
+Still NOT ported (future work): Phase 1 paged-block RAM manager (O(1) LRU +
+chain-hash + COW — the persistence value doesn't require it), Phase 4 boundary
+snapshot offload, dashboard hit-rate UI.

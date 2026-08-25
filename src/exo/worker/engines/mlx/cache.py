@@ -505,12 +505,17 @@ class KVPrefixCache:
                 best_index, best_length = i, length
 
         if best_index is None:
-            # No RAM hit: check the SSD cold tier for an exact-match restore
-            # (oMLX doc 01, Phase 2/3 — the restart / eviction-recovery path
-            # that skips the full re-prefill). Exact-match only: a *prefix*
-            # SSD restore is a later refinement; the RAM tier still serves
-            # partial hits. Best-effort: a restore miss/ineligibility falls
-            # through to a fresh cache (today's behaviour).
+            # No RAM hit: check the SSD cold tier. Two restore modes
+            # (oMLX doc 01):
+            #   1. Exact-match restore — the re-run-same-prompt-after-restart
+            #      path (Phase 2/3). No trim; full reuse.
+            #   2. Prefix restore — the agentic re-send-context path: a long
+            #      shared system prompt + a few new turns. Loads the SSD entry
+            #      with the longest common prefix, trims it to the prefix, and
+            #      only prefills the suffix. Refused for non-trimmable entries
+            #      (no snapshot on the SSD tier) — those degrade to a fresh
+            #      cache. Best-effort throughout: any miss/ineligibility falls
+            #      through to a fresh cache (today's behaviour).
             if self._ssd_store is not None:
                 restored, restored_tokens = self._ssd_store.restore(
                     prompt_tokens, model_id=self.model_id
@@ -520,8 +525,6 @@ class KVPrefixCache:
                         f"SSD KV cache restored: {restored_tokens}/{max_length} "
                         f"tokens — skipping re-prefill"
                     )
-                    # Add it back to the RAM tier so subsequent requests hit
-                    # RAM (the SSD entry is re-spilled on a future eviction).
                     self._access_counter += 1
                     self.prompts.append(prompt_tokens)
                     self.caches.append(restored)
@@ -531,7 +534,44 @@ class KVPrefixCache:
                     self._last_used.append(self._access_counter)
                     self._chained.append(False)  # restored, not a chained ext
                     remaining = prompt_tokens[restored_tokens:]
-                    return restored, remaining, None, restored_tokens >= max_length
+                    return (
+                        restored,
+                        remaining,
+                        None,
+                        restored_tokens >= max_length,
+                    )
+                # Prefix restore: longest common prefix across SSD entries.
+                restored, prefix_len = self._ssd_store.restore_prefix(
+                    prompt_tokens, model_id=self.model_id
+                )
+                if restored is not None and prefix_len > 0:
+                    loaded_len = cache_length(restored)
+                    if loaded_len > prefix_len:
+                        trim_cache(restored, loaded_len - prefix_len, None)
+                        for layer in restored:
+                            if isinstance(
+                                layer,
+                                (ArraysCache, RotatingKVCache, DeepseekV4Cache),
+                            ):
+                                continue
+                            if hasattr(layer, "offset"):
+                                layer.offset = prefix_len
+                    logger.info(
+                        f"SSD KV prefix restored: {prefix_len}/{max_length} "
+                        f"tokens — prefilling the suffix"
+                    )
+                    self._access_counter += 1
+                    # Store the truncated prompt so a future request that
+                    # extends this prefix hits RAM directly.
+                    self.prompts.append(prompt_tokens[:prefix_len])
+                    self.caches.append(restored)
+                    self._snapshots.append(None)
+                    self._media_regions.append(query_regions)
+                    self.prefill_tps.append(0.0)
+                    self._last_used.append(self._access_counter)
+                    self._chained.append(False)
+                    remaining = prompt_tokens[prefix_len:]
+                    return restored, remaining, None, prefix_len >= max_length
             return make_kv_cache(model), prompt_tokens, None, False
 
         # #2261: force a clean prefill after chained prefix-cache extensions
