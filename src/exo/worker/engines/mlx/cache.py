@@ -1005,44 +1005,78 @@ class KVPrefixCache:
         ``memory_guard.eviction_*_bytes``) so eviction is correct whether or
         not admission rejection is on; the legacy ``get_memory_used_percentage``
         is only the fallback when the reclaim model can't be computed.
-        """
-        if len(self.caches) == 0:
-            return 0
 
+        TP deadlock guard: in tensor-parallel mode ``_memory_pressure_exceeds``
+        runs an ``all_gather`` (a collective).  The original loop short-
+        circuited on the LOCAL ``len(self.caches) > 0`` check *before* the
+        collective — so if rank 0 had 0 entries and rank 1 had 1+, rank 0
+        exited the loop (and the function) without calling all_gather while
+        rank 1 blocked inside all_gather waiting for rank 0.  Rank 0 then
+        moved to the next collective (``mx_barrier`` in
+        ``flush_prefill_for_decode``) and blocked there.  Mutual deadlock →
+        the ``decode stalled: no tokens for 120s`` watchdog.
+
+        The fix: both ranks ALWAYS call ``_memory_pressure_exceeds`` (the
+        collective) once per iteration, then do a SECOND collective
+        (``all_sum``) to agree on whether ANY rank still has caches to
+        evict.  Both ranks exit the loop at the same iteration — same number
+        of all_gathers, same number of all_sums — so the collectives can
+        never desync.  A rank with 0 caches participates in the collectives
+        but skips the local eviction.
+        """
         self._ensure_chained_parallel()
         evicted_count = 0
         # Evict LRU entries until below threshold (or the retry cap, whichever
         # comes first — see the docstring on the cap's purpose).
-        while (
-            len(self.caches) > 0
-            and evicted_count < _MAX_PREFILL_EVICTION_RETRIES
-            and self._memory_pressure_exceeds(threshold)
-        ):
-            lru_index = self._last_used.index(min(self._last_used))
-            evicted_tokens = len(self.prompts[lru_index])
-            # Spill the LRU entry to the SSD cold tier *before* dropping it
-            # (oMLX doc 01, Phase 2). Best-effort + eligible-only: a non-SSD-
-            # eligible entry (exotic cache class) or a disabled tier is simply
-            # dropped, exactly as before the SSD tier existed.
-            if self._ssd_store is not None:
-                self._ssd_store.spill(
-                    self.prompts[lru_index],
-                    self.caches[lru_index],
-                    model_id=self.model_id,
+        while evicted_count < _MAX_PREFILL_EVICTION_RETRIES:
+            # Collective pressure check — BOTH ranks must always participate,
+            # even if this rank has 0 caches.  Without this, a rank with 0
+            # caches exits the loop while the other blocks on all_gather →
+            # TP collective deadlock (see docstring above).
+            if not self._memory_pressure_exceeds(threshold):
+                break
+            # Both ranks agree pressure is high.  But only ranks with caches
+            # can actually evict.  Collective decision: does ANY rank still
+            # have a cache to evict?  If not, we're done (pressure persists
+            # but nothing more to reclaim — the preflight estimator handles
+            # admission/rejection).  This all_sum must run on BOTH ranks so
+            # they exit the loop at the same iteration.
+            local_can_evict = len(self.caches) > 0
+            if self._group is not None:
+                any_can_evict_arr = mx.distributed.all_sum(
+                    mx.array(1.0 if local_can_evict else 0.0),
+                    group=self._group,
                 )
-            self.prompts.pop(lru_index)
-            self.caches.pop(lru_index)
-            self._snapshots.pop(lru_index)
-            self._media_regions.pop(lru_index)
-            self._last_used.pop(lru_index)
-            self.prefill_tps.pop(lru_index)
-            self._chained.pop(lru_index)
-
+                mx.eval(any_can_evict_arr)
+                any_can_evict = int(any_can_evict_arr.item()) > 0
+            else:
+                any_can_evict = local_can_evict
+            if not any_can_evict:
+                break
+            # Evict the LRU entry locally (only if this rank has caches).
+            if local_can_evict:
+                lru_index = self._last_used.index(min(self._last_used))
+                evicted_tokens = len(self.prompts[lru_index])
+                # Spill the LRU entry to the SSD cold tier *before* dropping
+                # it (oMLX doc 01, Phase 2). Best-effort + eligible-only.
+                if self._ssd_store is not None:
+                    self._ssd_store.spill(
+                        self.prompts[lru_index],
+                        self.caches[lru_index],
+                        model_id=self.model_id,
+                    )
+                self.prompts.pop(lru_index)
+                self.caches.pop(lru_index)
+                self._snapshots.pop(lru_index)
+                self._media_regions.pop(lru_index)
+                self._last_used.pop(lru_index)
+                self.prefill_tps.pop(lru_index)
+                self._chained.pop(lru_index)
+                logger.info(
+                    f"KV cache evicted LRU entry ({evicted_tokens} tokens) "
+                    f"due to memory usage (threshold={threshold:.2f})"
+                )
             evicted_count += 1
-            logger.info(
-                f"KV cache evicted LRU entry ({evicted_tokens} tokens) "
-                f"due to memory usage (threshold={threshold:.2f})"
-            )
 
         if evicted_count > 0:
             gc.collect()
