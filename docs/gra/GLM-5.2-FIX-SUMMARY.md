@@ -358,3 +358,81 @@ New (vendored model + tests + cards):
 - `resources/inference_model_cards/avlp12--GLM-5.2-Alis-MLX-Dynamic-2.3bpw.toml`
 - `resources/inference_model_cards/mlx-community--GLM-5.2-DQ4plus-q8.toml`
 - `resources/inference_model_cards/mlx-community--GLM-5.2-mxfp4.toml`
+
+---
+
+## Post-Dev9 Fixes — TP Collective Stall (Intermittent)
+
+After dev9, the cluster intermittently hit `decode stalled: no tokens for
+120.0s (hung distributed collective)`. Several fixes were applied in sequence;
+the final root cause was a broken cache-state evaluation in
+`flush_prefill_for_decode`.
+
+### Fix A — Shallow KV copy on TP critical path (commit `c86f57df`)
+
+Eliminated multi-GB `deepcopy` of KV caches on `add_kv_cache` /
+`update_kv_cache` / `get_kv_cache`. MLX arrays are immutable;
+`copy.copy(layer)` shares array data — O(layers) not O(KV bytes).
+
+### Fix B — Flush prefill transients before decode (commit `bbb3190e`)
+
+`flush_prefill_for_decode()` — `mx.eval([c.state ...])` + `gc.collect()` +
+`mx.clear_cache()` + `mx_barrier` between prefill and decode. Reclaims Metal
+buffer pool filled by long-prefill intermediate activations.
+
+### Fix C — gc.collect before clear_cache + periodic reclaim (commit `4800d95e`)
+
+Added `gc.collect()` before `mx.clear_cache()` in the flush (release Python
+refs so Metal buffers are reclaimable) and periodic `gc.collect()` +
+`mx.clear_cache()` every 32 decode tokens in `ExoBatchGenerator.step()`.
+
+### Fix D — TP collective deadlock in KV eviction loop (commit `fa47a075`)
+
+The `_evict_until_under` while loop short-circuited on LOCAL
+`len(self.caches) > 0` BEFORE calling `_memory_pressure_exceeds` (which runs
+`all_gather` COLLECTIVE). When ranks had different cache entry counts, one
+rank exited without calling `all_gather` while the other blocked inside it.
+Fixed by restructuring the loop so both ranks ALWAYS call the collective once
+per iteration, then do a second collective to agree on whether any rank still
+has caches to evict.
+
+### Fix E — CacheList KV state evaluation (commit `b36895da`) — ROOT CAUSE
+
+**Root cause of the remaining intermittent stall.** GLM-5.2 / DeepSeek-V3 MLA
+models use `CacheList` (a tuple of two `KVCache` objects per layer). The
+`flush_prefill_for_decode` function did:
+
+```python
+with contextlib.suppress(Exception):
+    mx.eval([c.state for c in cache])
+```
+
+But `CacheList.state` delegates to each sub-cache's `.state`, and
+`KVCache.state` raises `AttributeError` when `keys is None` (uninitialised
+indexer cache on shared layers, or the second sub-cache before first use). A
+single raising sub-cache aborted the *entire* list comprehension, so
+`contextlib.suppress` silently skipped evaluation of **all** layers.
+
+The full prefill lazy graph (KV writes, `trim(2)` ops) was left pending. The
+first decode step then evaluated the entire prefill graph + decode forward as
+one giant Metal command buffer. On one rank this completed in time; on the
+other it intermittently stalled, hanging the JACCL TP collective
+(`Fence::wait`) → decode stall watchdog.
+
+**Fix:** Replaced the naive `c.state` comprehension with
+`collect_evalable_cache_arrays()`, a recursive walker that:
+- Recurses into `CacheList.caches` (and any wrapper exposing `.caches`)
+- Tries `.state` on each *leaf* cache individually
+- Skips caches that raise (uninitialised — `keys is None` — nothing to eval)
+- Flattens nested state tuples/lists into a flat list of `mx.array`s
+
+This guarantees every *populated* cache layer is force-evaluated regardless
+of sibling caches' state, so the prefill graph is fully materialised before
+`gc.collect()` + `mx.clear_cache()` + `mx_barrier`.
+
+**Verification on cluster:** 25,520-token cold prefill (0.1% cache hit) + 100
+decode tokens completed in 145s with **zero** stall errors. Prefix-cache hit
+(99.9% cached) completed in 7.7s. All 5 test scenarios passed with no
+`stall`/`hung`/`Fence` errors in the logs.
+
+**Artifact:** `EXO-1.0.72-tp-cachelist-eval-fix-dev1.dmg`
