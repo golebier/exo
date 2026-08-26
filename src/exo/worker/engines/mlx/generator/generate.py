@@ -439,6 +439,66 @@ def prefill(
     return tokens_per_sec, num_tokens, snapshots[:-1] if snapshots else []
 
 
+def collect_evalable_cache_arrays(cache: KVCacheType) -> list[mx.array]:
+    """Recursively collect evalable mx.arrays from a (possibly nested) cache.
+
+    MLX is lazy: prefill leaves the KV writes and post-prefill ``trim(2)``
+    operations as an unevaluated graph.  ``flush_prefill_for_decode`` must
+    force-evaluate these so their intermediate arrays become reclaimable
+    *before* the first decode step.
+
+    The naive ``mx.eval([c.state for c in cache])`` is broken for models that
+    use ``CacheList`` (e.g. GLM-5.2 / DeepSeek-V3 MLA, which wraps two
+    ``KVCache`` objects per layer): ``CacheList.state`` delegates to each
+    sub-cache's ``.state``, and ``KVCache.state`` raises
+    ``AttributeError('NoneType' has no 'shape')`` when ``keys`` is ``None``
+    (uninitialised indexer cache on shared layers, or the second sub-cache
+    before first use).  A single raising sub-cache aborts the *entire*
+    list comprehension, so the old ``contextlib.suppress(Exception)`` wrapper
+    silently skipped evaluation of **all** layers — leaving the full prefill
+    graph pending.  The first decode step then evaluated prefill + decode as
+    one giant Metal command buffer, intermittently stalling the JACCL
+    collective (``Fence::wait``) → ``decode stalled: no tokens for 120s``.
+
+    This walker recurses into ``CacheList.caches`` and tries ``.state`` on each
+    *leaf* cache individually, skipping any that raise (they have nothing to
+    evaluate — ``keys`` is ``None``).  This guarantees that every *populated*
+    cache layer is force-evaluated regardless of sibling caches' state.
+    """
+    arrays: list[mx.array] = []
+    for entry in cache:
+        # CacheList (and any wrapper exposing `.caches`) — recurse into
+        # sub-caches so one uninitialized sibling can't abort the rest.
+        sub_caches: object = getattr(entry, "caches", None)
+        if sub_caches is not None and hasattr(sub_caches, "__iter__"):
+            arrays.extend(collect_evalable_cache_arrays(list(sub_caches)))  # type: ignore[reportUnknownArgumentType]
+            continue
+        # Leaf cache (KVCache / QuantizedKVCache / RotatingKVCache /
+        # ArraysCache).  Try to read `.state`; skip if it raises (uninitialised
+        # — `keys is None`).  `.state` returns a (possibly nested) tuple/list
+        # of mx.arrays (keys, values [, offset]).
+        try:
+            state: object = getattr(entry, "state", None)
+        except Exception:  # noqa: BLE001 — uninitialized cache; nothing to eval
+            continue
+        if state is None:
+            continue
+        flatten_state_into(state, arrays)
+    return arrays
+
+
+def flatten_state_into(state: object, out: list[mx.array]) -> None:
+    """Recursively flatten a cache `.state` into a list of mx.arrays."""
+    if isinstance(state, mx.array):
+        out.append(state)
+    elif isinstance(state, (list, tuple)):
+        state_list: list[object] = list(cast(list[object] | tuple[object, ...], state))
+        for item in state_list:
+            flatten_state_into(item, out)
+    # Scalars / None → ignore (e.g. offset returned as a Python int by some
+    # cache implementations).
+
+
 def flush_prefill_for_decode(
     cache: KVCacheType,
     group: mx.distributed.Group | None,
@@ -453,18 +513,22 @@ def flush_prefill_for_decode(
     one rank hangs the collective (``Fence::wait``), tripping the
     ``decode stalled: no tokens for 120s`` watchdog.
 
-    This mirrors the pipeline-parallel prefill path's ``mx.eval([c.state ...])``
-    (which forces evaluation of the lazy cache-trim graph) and the eviction
-    path's ``gc.collect()`` + ``mx.clear_cache()`` (which reclaims freed
-    buffers), then adds an ``mx_barrier`` so both ranks enter decode together.
-    Called after prefill + prefix-cache save, before the first decode step.
+    Force-evaluates the cache state (via ``_collect_evalable_cache_arrays``,
+    which robustly handles ``CacheList`` / nested / partially-initialised
+    caches), then runs the eviction path's ``gc.collect()`` +
+    ``mx.clear_cache()`` (reclaim freed Metal buffers) and an ``mx_barrier`` so
+    both ranks enter decode together.  Called after prefill + prefix-cache
+    save, before the first decode step.
     """
     # Force-evaluate the cache state so pending lazy ops (the post-prefill
     # ``c.trim(2)`` and the last prefill chunk's KV writes) complete and their
-    # intermediate arrays become reclaimable.  ``.state`` is the evalable
-    # surface mlx-lm exposes (keys/values/offset); matches the pipeline path.
-    with contextlib.suppress(Exception):
-        mx.eval([c.state for c in cache])  # type: ignore[reportUnknownMemberType]
+    # intermediate arrays become reclaimable.  Must handle CacheList / nested
+    # caches and skip uninitialized sub-caches — see
+    # ``_collect_evalable_cache_arrays`` for why the naive ``c.state`` approach
+    # silently no-ops on GLM-5.2 / DeepSeek-V3 MLA models.
+    arrays = collect_evalable_cache_arrays(cache)
+    if arrays:
+        mx.eval(arrays)  # type: ignore[reportArgumentType]
     # Release Python references to prefill intermediate activations (attention
     # scores, hidden states from the 49k-token forward pass) so the Metal
     # buffers they hold can be reclaimed.  Without gc.collect() these Python
