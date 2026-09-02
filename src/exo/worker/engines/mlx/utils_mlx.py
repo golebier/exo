@@ -542,7 +542,11 @@ def load_tokenizer_for_model_id(
     # GLM-5.2 (and GLM-5.1) use the same backtick-XCTS tool-call delimiters as
     # GLM-4.7, but their chat template omits the trailing `XCTS that the
     # glm47 parser requires. Use the dedicated glm52 parser for these models.
-    if "glm-5.2" in model_id_lower or "glm-5.1" in model_id_lower:
+    if (
+        "glm-5.2" in model_id_lower
+        or "glm-5.1" in model_id_lower
+        or "glm-5.3" in model_id_lower
+    ):
         from exo.worker.engines.mlx.tool_parsers.glm52 import (
             parse_tool_call as glm52_parse,
         )

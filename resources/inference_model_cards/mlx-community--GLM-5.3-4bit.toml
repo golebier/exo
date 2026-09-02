@@ -1,0 +1,23 @@
+model_id = "mlx-community/GLM-5.3-4bit"
+n_layers = 93
+hidden_size = 6144
+num_key_value_heads = 64
+supports_tensor = true
+tasks = ["TextGeneration"]
+family = "glm"
+quantization = "4bit"
+base_model = "GLM-5.3"
+capabilities = ["text", "vision", "thinking"]
+reasoning_dialect = "post_last_user"
+context_length = 1048576
+backends = ["MlxMetal", "MlxCuda", "MlxCpu"]
+[storage_size]
+in_bytes = 395094087168
+
+# Source: https://huggingface.co/mlx-community/GLM-5.3-4bit
+# Source: https://huggingface.co/zai-org/GLM-5.3
+# Architecture: glm5_next (Glm5NextForConditionalGeneration) — VLM with
+# DSA sparse MLA + gated-delta (GDN) linear attention + pooled indexer.
+[sampling_defaults]
+temperature = 1.0
+top_p = 0.95
