@@ -1,5 +1,4 @@
 import contextlib
-import gc
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -36,10 +35,8 @@ from exo.worker.engines.mlx.cache import (
 from exo.worker.engines.mlx.constants import DEFAULT_TOP_LOGPROBS, MAX_TOKENS
 from exo.worker.engines.mlx.generator.generate import (
     ban_token_ids,
-    bind_chunk_guard,
     eos_ids_from_tokenizer,
     extract_top_logprobs,
-    flush_prefill_for_decode,
     patch_embed_tokens,
     prefill,
 )
@@ -167,10 +164,6 @@ class ExoBatchGenerator:
         if self.kv_prefix_cache is not None and (
             not is_bench or task_params.use_prefix_cache
         ):
-            # Evict prefix-cache headroom BEFORE lookup + prefill (#2251): trim
-            # the persistent cache down to the prefill watermark so its
-            # allocations can't starve the transient prefill activations.
-            self.kv_prefix_cache.evict_for_prefill_headroom()
             cache, remaining_tokens, matched_index, is_exact_hit = (
                 self.kv_prefix_cache.get_kv_cache(
                     self.model, all_prompt_tokens, media_regions=media_regions
@@ -184,23 +177,7 @@ class ExoBatchGenerator:
                 )
                 prompt_tokens = remaining_tokens
         else:
-            # #1990: mlx-lm's BatchGenerator does multi-sequence batched
-            # trim/extend on a single node, where QuantizedKVCache's state can
-            # desync across the batched sequences. Skip KV quantization in
-            # single-node batched mode (``group is None``); distributed mode
-            # (each rank holds one sequence shard) is unaffected.
-            single_node = self.group is None
-            cache = make_kv_cache(self.model, force_plain=single_node)
-
-        # Preflight admission: reject a prompt whose prefill peak won't fit even
-        # after the headroom eviction above (oMLX raise_if_prefill_exceeds). A
-        # clean rejection instead of an OOM crash.
-        if self.kv_prefix_cache is not None:
-            self.kv_prefix_cache.preflight_or_raise(
-                self.model,
-                num_prompt_tokens=len(all_prompt_tokens),
-                cached_tokens=prefix_hit_length,
-            )
+            cache = make_kv_cache(self.model)
 
         seed = task_params.seed if task_params.seed is not None else 42
         mx.random.seed(seed)
@@ -263,7 +240,6 @@ class ExoBatchGenerator:
                     self.group,
                     on_prefill_progress,
                     distributed_prompt_progress_callback,
-                    chunk_guard=bind_chunk_guard(self.kv_prefix_cache, self.model),
                 )
 
         prefix_cache_hit: Literal["none", "partial", "exact"] = "none"
@@ -302,14 +278,6 @@ class ExoBatchGenerator:
                 media_regions,
                 prefill_tps=_prefill_tps,
             )
-
-        # Flush prefill transients + reclaim the Metal buffer pool + sync ranks
-        # before the first decode step.  Without this, a long prefill's
-        # intermediate arrays fill the buffer pool and the first decode step
-        # stalls on allocation under memory pressure, hanging the TP
-        # all-reduce collective (the ``decode stalled: no tokens for 120s``
-        # watchdog).  See flush_prefill_for_decode.
-        flush_prefill_for_decode(cache, self.group)
 
         last_tokens = prompt_tokens[-2:]
 
@@ -506,16 +474,6 @@ class ExoBatchGenerator:
         _step_elapsed = time.perf_counter() - _step_tic
         _overhead = _step_elapsed - _next_elapsed
         self._step_count += 1
-        # Periodically reclaim Metal buffers accumulated by decode-step
-        # intermediates (attention activations, logits).  Under the memory
-        # pressure of a large-context decode (e.g. 49k tokens on a ~200 GB
-        # model in 256 GB RAM) these can fill the buffer pool and stall the
-        # TP all-reduce collective — the ``decode stalled: no tokens for
-        # 120s`` watchdog.  gc.collect() releases the Python references so
-        # mx.clear_cache() can actually reclaim the Metal buffers.
-        if self._step_count % 32 == 0:
-            gc.collect()
-            mx.clear_cache()
         if self._step_count % 64 == 0 and responses:
             logger.debug(
                 f"step overhead: {_overhead * 1000:.2f}ms (next={_next_elapsed * 1000:.2f}ms total={_step_elapsed * 1000:.2f}ms)"

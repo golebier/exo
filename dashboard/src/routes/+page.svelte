@@ -41,6 +41,7 @@
     previewNodeFilter,
     createConversation,
     setSelectedChatModel,
+    setDecodeStallTimeout,
     selectedChatModel,
     sendMessage,
     thinkingEnabled,
@@ -903,6 +904,7 @@
     sharding: "Pipeline" | "Tensor";
     instanceType: InstanceMeta;
     minNodes: number;
+    decodeStallTimeout: number | null;
   }
 
   function saveLaunchDefaults(): void {
@@ -911,6 +913,7 @@
       sharding: selectedSharding,
       instanceType: selectedInstanceType,
       minNodes: selectedMinNodes,
+      decodeStallTimeout: selectedDecodeStallTimeout,
     };
     try {
       localStorage.setItem(LAUNCH_DEFAULTS_KEY, JSON.stringify(defaults));
@@ -951,6 +954,10 @@
       selectedMinNodes = defaults.minNodes;
     }
 
+    // Apply decode stall watchdog override (null ⇒ server default)
+    selectedDecodeStallTimeout = defaults.decodeStallTimeout ?? null;
+    setDecodeStallTimeout(selectedDecodeStallTimeout);
+
     // Only apply model if it exists in the available models
     if (
       defaults.modelId &&
@@ -963,6 +970,42 @@
 
   let selectedInstanceType = $state<InstanceMeta>("MlxRing");
   let selectedMinNodes = $state<number>(1);
+  // Decode stall watchdog override for the next chat request.
+  // null ⇒ server default (EXO_DECODE_STALL_TIMEOUT, 120s); 0 ⇒ disabled;
+  // >0 ⇒ custom bound in seconds. Persisted in launch defaults.
+  let selectedDecodeStallTimeout = $state<number | null>(null);
+
+  const decodeStallMode = $derived(
+    selectedDecodeStallTimeout === null
+      ? "default"
+      : selectedDecodeStallTimeout === 0
+        ? "disabled"
+        : "custom",
+  );
+
+  function setDecodeStallMode(mode: "default" | "custom" | "disabled"): void {
+    if (mode === "default") {
+      selectedDecodeStallTimeout = null;
+    } else if (mode === "disabled") {
+      selectedDecodeStallTimeout = 0;
+    } else {
+      // Custom: keep an existing custom value, else default to 300s.
+      selectedDecodeStallTimeout =
+        selectedDecodeStallTimeout && selectedDecodeStallTimeout > 0
+          ? selectedDecodeStallTimeout
+          : 300;
+    }
+    setDecodeStallTimeout(selectedDecodeStallTimeout);
+    saveLaunchDefaults();
+  }
+
+  function setDecodeStallCustomValue(value: number): void {
+    if (Number.isFinite(value) && value > 0) {
+      selectedDecodeStallTimeout = value;
+      setDecodeStallTimeout(value);
+      saveLaunchDefaults();
+    }
+  }
   let minNodesInitialized = $state(false);
   let launchingModelId = $state<string | null>(null);
   let instanceDownloadExpandedNodes = $state<Set<string>>(new Set());
@@ -6264,6 +6307,110 @@
                           >
                         </div>
                       {/each}
+                    </div>
+                  </div>
+
+                  <!-- Decode Stall Watchdog (per-model) -->
+                  <div>
+                    <div class="text-xs text-white/50 font-mono mb-2">
+                      Decode Stall Watchdog:
+                    </div>
+                    <div class="flex gap-2 flex-wrap">
+                      <button
+                        type="button"
+                        onclick={() => setDecodeStallMode("default")}
+                        class="flex items-center gap-2 py-1.5 px-3 text-xs font-mono border rounded transition-all duration-200 cursor-pointer {decodeStallMode ===
+                        'default'
+                          ? 'bg-transparent text-exo-yellow border-exo-yellow'
+                          : 'bg-transparent text-white/70 border-exo-medium-gray/50 hover:border-exo-yellow/50'}"
+                      >
+                        <span
+                          class="w-3 h-3 rounded-full border-2 flex items-center justify-center {decodeStallMode ===
+                          'default'
+                            ? 'border-exo-yellow'
+                            : 'border-exo-medium-gray'}"
+                        >
+                          {#if decodeStallMode === "default"}
+                            <span class="w-1.5 h-1.5 rounded-full bg-exo-yellow"
+                            ></span>
+                          {/if}
+                        </span>
+                        Default (120s)
+                      </button>
+                      <button
+                        type="button"
+                        onclick={() => setDecodeStallMode("custom")}
+                        class="flex items-center gap-2 py-1.5 px-3 text-xs font-mono border rounded transition-all duration-200 cursor-pointer {decodeStallMode ===
+                        'custom'
+                          ? 'bg-transparent text-exo-yellow border-exo-yellow'
+                          : 'bg-transparent text-white/70 border-exo-medium-gray/50 hover:border-exo-yellow/50'}"
+                      >
+                        <span
+                          class="w-3 h-3 rounded-full border-2 flex items-center justify-center {decodeStallMode ===
+                          'custom'
+                            ? 'border-exo-yellow'
+                            : 'border-exo-medium-gray'}"
+                        >
+                          {#if decodeStallMode === "custom"}
+                            <span class="w-1.5 h-1.5 rounded-full bg-exo-yellow"
+                            ></span>
+                          {/if}
+                        </span>
+                        Custom
+                      </button>
+                      <button
+                        type="button"
+                        onclick={() => setDecodeStallMode("disabled")}
+                        class="flex items-center gap-2 py-1.5 px-3 text-xs font-mono border rounded transition-all duration-200 cursor-pointer {decodeStallMode ===
+                        'disabled'
+                          ? 'bg-transparent text-exo-yellow border-exo-yellow'
+                          : 'bg-transparent text-white/70 border-exo-medium-gray/50 hover:border-exo-yellow/50'}"
+                      >
+                        <span
+                          class="w-3 h-3 rounded-full border-2 flex items-center justify-center {decodeStallMode ===
+                          'disabled'
+                            ? 'border-exo-yellow'
+                            : 'border-exo-medium-gray'}"
+                        >
+                          {#if decodeStallMode === "disabled"}
+                            <span class="w-1.5 h-1.5 rounded-full bg-exo-yellow"
+                            ></span>
+                          {/if}
+                        </span>
+                        Disabled
+                      </button>
+                    </div>
+                    {#if decodeStallMode === "custom"}
+                      <div
+                        class="mt-2 flex items-center gap-2 pl-1 in:fade={{ duration: 150 }}"
+                      >
+                        <span class="text-[10px] text-white/50 font-mono w-20"
+                          >Seconds:</span
+                        >
+                        <input
+                          type="number"
+                          min="1"
+                          step="10"
+                          value={selectedDecodeStallTimeout ?? 300}
+                          onchange={(e) =>
+                            setDecodeStallCustomValue(
+                              Number((e.target as HTMLInputElement).value),
+                            )}
+                          class="flex-1 bg-exo-dark-gray text-white/90 text-xs font-mono border border-exo-medium-gray/50 rounded px-2 py-1 focus:border-exo-yellow/60 focus:outline-none"
+                        />
+                      </div>
+                    {/if}
+                    <div
+                      class="text-[10px] text-white/40 font-mono mt-1.5 leading-snug"
+                    >
+                      Bounds how long the API waits for the next decode token
+                      before failing the request — guards against hung
+                      multi-node collectives (Fence::wait). Default uses the
+                      server's
+                      <code class="text-exo-yellow/80"
+                        >EXO_DECODE_STALL_TIMEOUT</code
+                      > (120s). 0 disables the watchdog (a true stall can then
+                      hang the request forever).
                     </div>
                   </div>
 

@@ -6,6 +6,15 @@ from mlx_lm.generate import GenerationBatch
 
 _PRECOMPUTE_TOP_K = 20
 
+# How often to clear the MLX computation-graph cache during batch decode.
+# mlx_lm's stream_generate clears every 256 tokens; the original
+# GenerationBatch._step NEVER clears, so the graph grows unboundedly.
+# On TP (JACCL) clusters this eventually exhausts the Metal command
+# buffer and manifests as a permanent Fence::wait collective hang.
+# 128 (half of stream_generate's interval) gives extra headroom for the
+# larger per-step graph that batch + MoE sharding produces.
+_CLEAR_CACHE_EVERY = 128
+
 
 @dataclass
 class BatchTopKLogprobs:
@@ -36,6 +45,18 @@ class _TopKBuffer:
     needs_topk: bool = False
     pending: BatchTopKLogprobs = field(default_factory=BatchTopKLogprobs)
     ready: BatchTopKLogprobs = field(default_factory=BatchTopKLogprobs)
+
+
+def _get_step_counter(batch: GenerationBatch) -> int:
+    """Return the per-batch decode step counter (0-indexed)."""
+    return cast(int, getattr(batch, "_exo_step_count", 0))
+
+
+def _increment_step_counter(batch: GenerationBatch) -> int:
+    """Increment and return the new step count."""
+    count = _get_step_counter(batch) + 1
+    batch._exo_step_count = count  # pyright: ignore[reportAttributeAccessIssue]
+    return count
 
 
 def _get_buffer(batch: GenerationBatch) -> _TopKBuffer:
@@ -122,6 +143,15 @@ def _patched_step(self: GenerationBatch) -> tuple[list[int], list[mx.array]]:
         mx.eval(inputs, *current_lp)
     else:
         mx.eval(inputs)
+
+    # Periodically clear the computation-graph cache, mirroring
+    # stream_generate's ``if n % 256 == 0: mx.clear_cache()``.  Without
+    # this the batch decode path accumulates intermediates indefinitely;
+    # on TP clusters the Metal command buffer eventually fills and JACCL
+    # collectives hang permanently (Fence::wait deadlock).
+    step_count = _increment_step_counter(self)
+    if step_count % _CLEAR_CACHE_EVERY == 0:
+        mx.clear_cache()
 
     token_list = cast(list[int], inputs.tolist())
     for sti, ti in zip(self.tokens, token_list, strict=True):

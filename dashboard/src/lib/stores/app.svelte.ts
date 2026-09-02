@@ -550,6 +550,10 @@ class AppStore {
   ttftMs = $state<number | null>(null); // Time to first token in ms
   tps = $state<number | null>(null); // Tokens per second
   totalTokens = $state<number>(0); // Total tokens in current response
+  // Per-request decode stall watchdog override (seconds). null ⇒ server
+  // default (EXO_DECODE_STALL_TIMEOUT, 120s); 0 disables; >0 custom bound.
+  // Mirrors the dashboard's "Decode Stall Watchdog" advanced option.
+  decodeStallTimeout = $state<number | null>(null);
   prefillProgress = $state<PrefillProgress | null>(null);
 
   // Abort controller for stopping generation
@@ -1751,6 +1755,9 @@ class AppStore {
           stream: true,
           logprobs: true,
           top_logprobs: 5,
+          ...(this.decodeStallTimeout !== null && {
+            decode_stall_timeout: this.decodeStallTimeout,
+          }),
         }),
       });
 
@@ -1974,6 +1981,9 @@ class AppStore {
           stream: true,
           logprobs: true,
           top_logprobs: 5,
+          ...(this.decodeStallTimeout !== null && {
+            decode_stall_timeout: this.decodeStallTimeout,
+          }),
         }),
       });
 
@@ -2127,6 +2137,10 @@ class AppStore {
     // Clear stats when model changes
     this.ttftMs = null;
     this.tps = null;
+  }
+
+  setDecodeStallTimeout(value: number | null): void {
+    this.decodeStallTimeout = value;
   }
 
   /**
@@ -2550,6 +2564,9 @@ class AppStore {
           stream: true,
           logprobs: true,
           top_logprobs: 5,
+          ...(this.decodeStallTimeout !== null && {
+            decode_stall_timeout: this.decodeStallTimeout,
+          }),
           ...(enableThinking != null && {
             enable_thinking: enableThinking,
           }),
@@ -3708,6 +3725,8 @@ export const clearEditingImage = () => appStore.clearEditingImage();
 export const clearChat = () => appStore.clearChat();
 export const setSelectedChatModel = (modelId: string) =>
   appStore.setSelectedModel(modelId);
+export const setDecodeStallTimeout = (value: number | null) =>
+  appStore.setDecodeStallTimeout(value);
 export const selectPreviewModel = (modelId: string | null) =>
   appStore.selectPreviewModel(modelId);
 export const togglePreviewNodeFilter = (nodeId: string) =>

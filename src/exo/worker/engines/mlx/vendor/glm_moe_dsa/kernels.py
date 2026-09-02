@@ -40,16 +40,18 @@ def _detach_import_error(exc: Exception) -> Exception:
 # attention path. An upstream ``omlx`` install is also accepted as a fallback
 # so users who pip-installed oMLX with custom kernels get them transparently.
 #
-# The native ``_ext`` import is DEFERRED (lazy) rather than performed at this
-# module's import time. ``_ext.so`` links ``Metal.framework`` + ``libmlx.dylib``
-# and importing it eagerly initialises the Metal device — which MUST NOT happen
-# before ``mx.distributed.init(backend="jaccl")`` in the runner. The jaccl
-# GPU-RDMA backend needs to own the Metal device's first initialisation; an
-# earlier eager import (issue: JACCL warmup all_sum hangs on rank 1, plus Metal
-# command-buffer OOM during prefill) corrupts that setup. The first kernel
-# lookup happens during model load/inference, well after distributed init, so
-# resolving lazily on first access is safe. Set EXO_NATIVE_GLM_KERNELS=0 to
-# force the fallback path (skip the native import entirely).
+# The native ``_ext`` import is DEFERRED (lazy) and DEFAULT-OFF (opt-in via
+# ``EXO_NATIVE_GLM_KERNELS=1``). ``_ext.so`` links ``Metal.framework`` +
+# ``libmlx.dylib`` and importing it eagerly initialises the Metal device —
+# which MUST NOT happen before ``mx.distributed.init(backend="jaccl")`` in the
+# runner. The jaccl GPU-RDMA backend needs to own the Metal device's first
+# initialisation; an earlier eager import (issue: JACCL warmup all_sum hangs
+# on rank 1, plus Metal command-buffer OOM during prefill) corrupts that
+# setup. The first kernel lookup happens during model load/inference, well
+# after distributed init, so resolving lazily on first access is safe.
+# Native kernels are disabled by default because they change Metal
+# command-buffer timing and, under TP, can perturb the collective ordering
+# that the sync-eval fix depends on.
 _native_fast: Any = None
 _native_import_error: Exception | None = None
 _native_resolved: bool = False
@@ -68,15 +70,21 @@ def _resolve_native_fast() -> Any:
 
     import os
 
-    if os.environ.get("EXO_NATIVE_GLM_KERNELS", "").strip().lower() in (
-        "0",
-        "false",
-        "no",
-        "off",
+    # Native kernels are **opt-in** (default-off). The native ``_ext``
+    # extension changes Metal command-buffer timing and, under TP, can
+    # perturb the collective ordering that the sync-eval fix in
+    # ``opt_batch_gen._patched_step`` depends on. Operators who want the
+    # native sparse-MLA / exact-block-attention fast path set
+    # ``EXO_NATIVE_GLM_KERNELS=1``.
+    if os.environ.get("EXO_NATIVE_GLM_KERNELS", "").strip().lower() not in (
+        "1",
+        "true",
+        "yes",
+        "on",
     ):
         logger.info(
-            "EXO_NATIVE_GLM_KERNELS=0: native GLM kernels disabled by env; "
-            "using standard attention fallback path."
+            "EXO_NATIVE_GLM_KERNELS not enabled: native GLM kernels are "
+            "default-off (opt-in via =1); using standard attention fallback."
         )
         return None
 

@@ -84,16 +84,40 @@ class TestVendoredFastModuleImports:
 
 
 class TestDispatchFallbackBehavior:
-    """When unbuilt, the dispatch must report all GLM symbols unavailable.
+    """When unbuilt (the default), the dispatch must report all GLM symbols
+    unavailable.
 
     EXO's mx.fast ships none of the GLM-specific symbols, so ``has()`` must
     return False for every required symbol and the model code falls through
     to the standard attention path. This is the causal-safety guarantee from
     GLM-5.2-RESEARCH-RESULTS.md §5.
+
+    Native kernels are **default-off** (opt-in via ``EXO_NATIVE_GLM_KERNELS=1``).
+    Without that env var, ``_resolve_native_fast()`` short-circuits to ``None``
+    before even attempting the import, so ``native_available()`` is always
+    ``False`` and all GLM-specific symbols are unavailable.
     """
 
     def test_native_available_is_bool(self) -> None:
         assert isinstance(glm_kernels.fast.native_available(), bool)
+
+    def test_native_default_off_without_env(self) -> None:
+        """Native kernels must be unavailable when EXO_NATIVE_GLM_KERNELS is
+        not set (the default-off safety guarantee)."""
+        import os
+
+        # These tests run without EXO_NATIVE_GLM_KERNELS set, so native must
+        # be off. We don't manipulate os.environ here because the module-level
+        # ``_native_resolved`` guard caches the result; the test environment
+        # simply doesn't set the env var.
+        assert os.environ.get("EXO_NATIVE_GLM_KERNELS", "") in (
+            "",
+            "0",
+            "false",
+            "no",
+            "off",
+        )
+        assert not glm_kernels.fast.native_available()
 
     def test_glm_symbols_unavailable_when_unbuilt(self) -> None:
         if glm_kernels.fast.native_available():
@@ -123,7 +147,11 @@ class TestDispatchFallbackBehavior:
         if glm_kernels.fast.native_available():
             assert err is None
         else:
-            assert isinstance(err, BaseException)
+            # When native is default-off (env var not set), _resolve_native_fast
+            # short-circuits before attempting the import, so there's no import
+            # error — just None (not enabled, not broken). When native is
+            # opt-in but the extension isn't built, there IS an import error.
+            assert err is None or isinstance(err, BaseException)
 
 
 class TestPatchStartupSummary:
@@ -137,9 +165,11 @@ class TestPatchStartupSummary:
             assert missing == []
             assert import_error is None
         else:
-            # When unbuilt, every required symbol is missing.
+            # When unbuilt/default-off, every required symbol is missing.
             assert sorted(missing) == sorted(REQUIRED_GLM_SYMBOLS)
-            assert isinstance(import_error, BaseException)
+            # import_error is None when default-off (no import attempted),
+            # or an exception when opt-in but extension not built.
+            assert import_error is None or isinstance(import_error, BaseException)
 
     def test_apply_patch_does_not_raise_when_unbuilt(self) -> None:
         # apply_glm_moe_dsa_patch is idempotent; calling it again must not

@@ -370,7 +370,23 @@ def prefill(
 
     is_pipeline = _has_pipeline_communication_layer(model)
 
-    prefill_step_size = 4096
+    # Adaptive prefill step size: MLA attention creates a scores matrix of
+    # (num_heads × step_size × position) per layer.  At 128 heads × 4 bytes,
+    # a 4096-token chunk at position 60k needs ~126 GB — more than the
+    # ~51 GB headroom on a 256 GB node with a ~199 GB model.  Shrink the
+    # step as the total context grows so peak attention fits.
+    #   4096 at < 16k tokens  → max ~33 GB scores
+    #   2048 at 16k–32k       → max ~33 GB scores
+    #   1024 at 32k–64k       → max ~32 GB scores
+    #    512 at > 64k         → max ~33 GB scores
+    if num_tokens > 64000:
+        prefill_step_size = 512
+    elif num_tokens > 32000:
+        prefill_step_size = 1024
+    elif num_tokens > 16000:
+        prefill_step_size = 2048
+    else:
+        prefill_step_size = 4096
 
     try:
         if is_pipeline and num_tokens >= prefill_step_size:

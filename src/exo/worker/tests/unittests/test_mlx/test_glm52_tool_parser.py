@@ -45,7 +45,15 @@ class TestGlm52ToolParsing:
     """
 
     def test_single_argument(self) -> None:
-        text = "get_weather" + _AK_OPEN + "location" + _AK_CLOSE + _AV_OPEN + "San Francisco" + _AV_CLOSE
+        text = (
+            "get_weather"
+            + _AK_OPEN
+            + "location"
+            + _AK_CLOSE
+            + _AV_OPEN
+            + "San Francisco"
+            + _AV_CLOSE
+        )
         result = glm52_parse(text)
         assert result["name"] == "get_weather"
         assert result["arguments"]["location"] == "San Francisco"
@@ -53,8 +61,18 @@ class TestGlm52ToolParsing:
     def test_multiple_arguments(self) -> None:
         text = (
             "get_weather"
-            + _AK_OPEN + "location" + _AK_CLOSE + _AV_OPEN + "San Francisco" + _AV_CLOSE
-            + _AK_OPEN + "unit" + _AK_CLOSE + _AV_OPEN + "celsius" + _AV_CLOSE
+            + _AK_OPEN
+            + "location"
+            + _AK_CLOSE
+            + _AV_OPEN
+            + "San Francisco"
+            + _AV_CLOSE
+            + _AK_OPEN
+            + "unit"
+            + _AK_CLOSE
+            + _AV_OPEN
+            + "celsius"
+            + _AV_CLOSE
         )
         result = glm52_parse(text)
         assert result["name"] == "get_weather"

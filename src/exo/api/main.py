@@ -845,7 +845,9 @@ class API:
         )
 
     async def _token_chunk_stream(
-        self, command_id: CommandId
+        self,
+        command_id: CommandId,
+        decode_stall_timeout: float | None = None,
     ) -> AsyncGenerator[
         TokenChunk | ErrorChunk | ToolCallChunk | PrefillProgressChunk, None
     ]:
@@ -860,6 +862,14 @@ class API:
 
             with recv as token_chunks:
                 decode_started = False
+                # Per-request override of the decode stall watchdog (None ⇒
+                # fall back to the global EXO_DECODE_STALL_TIMEOUT).  Set from
+                # the dashboard's per-model "Decode Stall Watchdog" control.
+                effective_decode_stall_timeout = (
+                    decode_stall_timeout
+                    if decode_stall_timeout is not None
+                    else EXO_DECODE_STALL_TIMEOUT
+                )
                 while True:
                     # Stall watchdog: bound the wait for the next chunk so a
                     # hung mlx ``Fence::wait`` collective (which blocks the
@@ -868,7 +878,7 @@ class API:
                     # separate process and can observe the absence of chunks.
                     # See EXO_DECODE_STALL_TIMEOUT / EXO_PREFILL_STALL_TIMEOUT.
                     stall_timeout = (
-                        EXO_DECODE_STALL_TIMEOUT
+                        effective_decode_stall_timeout
                         if decode_started
                         else EXO_PREFILL_STALL_TIMEOUT
                     )
@@ -925,7 +935,9 @@ class API:
                 del self._text_generation_queues[command_id]
 
     async def _collect_text_generation_with_stats(
-        self, command_id: CommandId
+        self,
+        command_id: CommandId,
+        decode_stall_timeout: float | None = None,
     ) -> BenchChatCompletionResponse:
         sampler = PowerSampler(get_node_system=lambda: self.state.node_system)
         text_parts: list[str] = []
@@ -938,7 +950,9 @@ class API:
         async with anyio.create_task_group() as tg:
             tg.start_soon(sampler.run)
 
-            async for chunk in self._token_chunk_stream(command_id):
+            async for chunk in self._token_chunk_stream(
+                command_id, decode_stall_timeout=decode_stall_timeout
+            ):
                 if isinstance(chunk, PrefillProgressChunk):
                     continue
 
@@ -1064,7 +1078,10 @@ class API:
                 with_sse_keepalive(
                     generate_chat_stream(
                         command.command_id,
-                        self._token_chunk_stream(command.command_id),
+                        self._token_chunk_stream(
+                            command.command_id,
+                            decode_stall_timeout=payload.decode_stall_timeout,
+                        ),
                     ),
                 ),
                 media_type="text/event-stream",
@@ -1084,7 +1101,10 @@ class API:
             # ``PrefillMemoryExceededError``) instead of a truncated 200.
             return await build_chat_completion_response(
                 command.command_id,
-                self._token_chunk_stream(command.command_id),
+                self._token_chunk_stream(
+                    command.command_id,
+                    decode_stall_timeout=payload.decode_stall_timeout,
+                ),
             )
 
     async def bench_chat_completions(
@@ -1111,7 +1131,10 @@ class API:
                 with_sse_keepalive(
                     generate_chat_stream(
                         command.command_id,
-                        self._token_chunk_stream(command.command_id),
+                        self._token_chunk_stream(
+                            command.command_id,
+                            decode_stall_timeout=payload.decode_stall_timeout,
+                        ),
                     ),
                 ),
                 media_type="text/event-stream",
@@ -1122,7 +1145,10 @@ class API:
                 },
             )
 
-        return await self._collect_text_generation_with_stats(command.command_id)
+        return await self._collect_text_generation_with_stats(
+            command.command_id,
+            decode_stall_timeout=payload.decode_stall_timeout,
+        )
 
     async def _validate_model_has_instance(self, model_id: ModelId) -> ModelId:
         """Validate a model has an active instance.

@@ -247,6 +247,12 @@ class ChatCompletionRequest(BaseModel):
     tool_choice: str | dict[str, Any] | None = None
     parallel_tool_calls: bool | None = None
     user: str | None = None
+    # Per-request override for the decode stall watchdog (seconds).  None ⇒
+    # use the global ``EXO_DECODE_STALL_TIMEOUT``; ``0`` disables the watchdog;
+    # ``>0`` bounds the wait for the next decode token before failing the
+    # request.  Set from the dashboard's per-model "Decode Stall Watchdog"
+    # advanced option.  Only honored by the OpenAI chat/bench adapters.
+    decode_stall_timeout: float | None = None
 
 
 class BenchChatCompletionRequest(ChatCompletionRequest):

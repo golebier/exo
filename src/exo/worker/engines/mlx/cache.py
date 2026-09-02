@@ -294,8 +294,12 @@ def has_non_kv_caches(cache: KVCacheType) -> bool:
     return any(is_non_trimmable_cache_entry(c) for c in cache)
 
 
-def _copy_kv_cache(cache: KVCacheType) -> KVCacheType:
+def _copy_kv_cache(cache: KVCacheType) -> KVCacheType:  # pyright: ignore[reportUnusedFunction]
     """Copy a KV cache for prefix-cache storage, sharing MLX array data.
+
+    .. note:: Currently unused by the runtime (reverted to ``deepcopy`` to
+       match the known-working version), but retained for tests and potential
+       future re-enablement.
 
     For standard append-only KV caches (``KVCache``/``QuantizedKVCache``) a
     shallow per-layer copy is O(1) in KV size: MLX arrays are immutable and
@@ -427,7 +431,7 @@ class KVPrefixCache:
         """Add a new cache entry. Evicts LRU entries if memory is high."""
         self._evict_if_needed()
         self.prompts.append(prompt_tokens)
-        self.caches.append(_copy_kv_cache(cache))
+        self.caches.append(deepcopy(cache))
         self._snapshots.append(ssm_snapshots)
         self._media_regions.append(media_regions or [])
         self.prefill_tps.append(prefill_tps)
@@ -455,7 +459,7 @@ class KVPrefixCache:
             merged.extend(snapshots)
 
         self.prompts[index] = prompt_tokens
-        self.caches[index] = _copy_kv_cache(cache)
+        self.caches[index] = deepcopy(cache)
         self._snapshots[index] = merged or None
         self._media_regions[index] = media_regions or []
         self.prefill_tps[index] = prefill_tps
@@ -639,7 +643,7 @@ class KVPrefixCache:
         if restore_snap is None and has_ssm:
             return make_kv_cache(model), prompt_tokens, None, False
 
-        prompt_cache = _copy_kv_cache(self.caches[best_index])
+        prompt_cache = deepcopy(self.caches[best_index])
         tokens_to_trim = cached_length - restore_pos
         if tokens_to_trim > 0:
             trim_cache(prompt_cache, tokens_to_trim, restore_snap)

@@ -29,8 +29,12 @@ tool_call_start = _TC_OPEN
 tool_call_end = _TC_CLOSE
 
 _ARG_KV_PATTERN = re.compile(
-    re.escape(_AK_OPEN) + r"(.*?)" + re.escape(_AK_CLOSE)
-    + re.escape(_AV_OPEN) + r"(.*?)" + re.escape(_AV_CLOSE),
+    re.escape(_AK_OPEN)
+    + r"(.*?)"
+    + re.escape(_AK_CLOSE)
+    + re.escape(_AV_OPEN)
+    + r"(.*?)"
+    + re.escape(_AV_CLOSE),
     re.DOTALL,
 )
 

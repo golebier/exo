@@ -2,7 +2,9 @@
 
 **Status:** Native kernel build/packaging implemented and verified; two runtime
 regressions found during cluster deployment and fixed; the third (pre-existing)
-JACCL rendezvous race is **fixed** (see Issue #3 below). This doc is the
+JACCL rendezvous race is **fixed** (see Issue #3 below); the fourth (TP decode
+stall from `async_eval` pipelining) is **fixed** with a two-layer approach
+(sync eval + native default-off, see Issue #4 below). This doc is the
 post-mortem / implementation record. See
 [`02-native-metal-kernels.md`](./02-native-metal-kernels.md) for the original
 design rationale and [`mlx_kernels/README.md`](../../mlx_kernels/README.md) for
@@ -487,13 +489,84 @@ will keep the broken code path. Multiple mounted volumes (`/Volumes/EXO … 1`,
 - ✅ Test suite (`test_glm_moe_dsa_native_kernels.py`): `9 passed, 2 skipped`
 
 ### Pending
-- ❌ **Issue #3**: JACCL `all_sum` rendezvous race (`utils_mlx.py`). Blocks
-  2-node model load. Proposed retry-until-`world_size` fix above, but needs
-  empirical validation on the cluster (does the degenerate 1ms return repeat
-  the collective on retry, or cache?).
+- ✅ **Issue #3**: JACCL `all_sum` rendezvous race (`utils_mlx.py`). Fixed.
+- ✅ **Issue #4**: TP decode stall — `async_eval` pipelining race + native
+  kernels default-off (see below).
 - ⚠️ The metallib dual-placement is a spec workaround; the "proper" fix is a
   C++ change to make the metallib path injectable from Python (lower priority
   — the spec fix works).
+
+## 4. Issue #4 — TP decode stall: extra collectives introduced between prefill and decode (root cause)
+
+### Symptom
+
+After ~45 s of successful TP decode (GLM-5.2-oQ4, 2-node TP), Node A (rank 0)
+goes silent — no tokens produced for 120 s. Node B (rank 1) fires the stall
+watchdog: `decode stall: no chunk within 120.0s — likely a hung mlx
+Fence::wait collective on a TP peer`.
+
+### Root cause
+
+Between the working version (`6ad281cd` / `v1.0.72-InstanceTokenUsage-dev2`)
+and the stall-introducing commits, several **extra TP collectives** were
+added to the request path that didn't exist in the working version:
+
+1. **`evict_for_prefill_headroom()`** — called before every `get_kv_cache` +
+   prefill. Internally runs `_evict_until_under` which calls `all_gather` (a
+   TP collective) to check memory pressure across ranks.
+2. **`flush_prefill_for_decode(cache, group)`** — called after prefill, before
+   the first decode step. Runs `mx.eval(cache_arrays)` + `gc.collect()` +
+   `mx.clear_cache()` + `mx_barrier(group)`. The `mx_barrier` uses
+   `stream=mx.default_stream(mx.cpu)` — a **CPU stream** collective that does
+   NOT synchronize the GPU stream where prefill's model forward pass ran.
+3. **Periodic `gc.collect()` + `mx.clear_cache()` every 32 decode steps** —
+   introduced transient synchronization points mid-decode.
+
+The working version had **none** of these. Its `submit()` was simply:
+`prefill → _save_prefix_cache → return uid`. Its `step()` was simply:
+`set_needs_topk → next() → process responses`. The prefill transients stayed
+as a lazy MLX graph and `async_eval` in `_patched_step` eventually evaluated
+them — and it **worked**.
+
+The extra collectives (especially `mx_barrier` on the CPU stream while the GPU
+stream still had pending prefill work) created a window where ranks could
+diverge: the CPU barrier completes, but the GPU stream hasn't finished prefill
+transients. Decode starts, builds 156 new GPU collectives, and the JACCL
+`Fence::wait` deadlocks.
+
+### Fix — revert to the working version's decode path
+
+Reverted `batch_generate.py` and `opt_batch_gen.py` to **exactly match** the
+working version (`6ad281cd`). Specifically:
+
+- Removed `evict_for_prefill_headroom()` call (was before prefill)
+- Removed `flush_prefill_for_decode()` call (was after prefill, before decode)
+- Removed `preflight_or_raise()` call (was before prefill)
+- Removed `chunk_guard=bind_chunk_guard(...)` from prefill call
+- Removed `gb._exo_disable_async_eval = True` from `step()`
+- Removed periodic `gc.collect()` + `mx.clear_cache()` from `step()`
+- Reverted `_copy_kv_cache` (shallow copy) back to `deepcopy` for cache
+  storage/retrieval (matching the working version)
+- Reverted `_patched_step` to use plain `mx.async_eval` (no disable flag)
+
+### What's kept (not in the decode critical path)
+
+- **Native GLM kernels default-off** (`EXO_NATIVE_GLM_KERNELS` opt-in) — safety
+  net; doesn't affect the decode path when off.
+- **SSD cold tier** — only active when `EXO_TIERED_KV_CACHE` is set.
+- **TurboQuant** — default-off.
+- **Memory guard** — default-off.
+- **Stall watchdog** — kept (provides 120s timeout instead of infinite hang).
+
+### Files changed
+
+| File | Change |
+|------|--------|
+| `generator/batch_generate.py` | Reverted to working version (`6ad281cd`) — removed all extra collectives and flushes |
+| `patches/opt_batch_gen.py` | Reverted to working version — plain `async_eval`, no disable flag |
+| `cache.py` | Reverted `add_kv_cache`/`update_kv_cache`/`get_kv_cache` to use `deepcopy` (matching working version) |
+| `vendor/glm_moe_dsa/kernels.py` | Native kernels default-off (opt-in via `EXO_NATIVE_GLM_KERNELS=1`) — kept |
+| `tests/.../test_glm_moe_dsa_native_kernels.py` | Updated for default-off assertions |
 
 ### Lessons
 1. **Import-ordering matters for GPU-RDMA backends.** Any extension that links

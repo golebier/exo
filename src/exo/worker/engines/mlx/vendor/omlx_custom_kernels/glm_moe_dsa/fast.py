@@ -226,9 +226,7 @@ def dsa_indexer_scores(
         pool_idx = mx.arange(P)
         query_idx = mx.arange(mask_q_offset + 1, mask_q_offset + L + 1)
         mask = pool_idx < query_idx[:, None] // mask_ratio
-        scores = mx.where(
-            mask[None, None], scores, mx.finfo(scores.dtype).min
-        )
+        scores = mx.where(mask[None, None], scores, mx.finfo(scores.dtype).min)
     return scores
 
 

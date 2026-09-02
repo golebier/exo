@@ -273,15 +273,19 @@ def mlx_distributed_init(
 
         logger.info(f"Rank {rank} mlx distributed initialization complete")
 
-        # Note: the RDMA data path was already validated by
-        # ``_probe_rdma_interface`` (which runs a full ``all_sum`` in a
-        # subprocess with both ranks participating simultaneously).  We do
-        # NOT run an in-process warmup collective here: JACCL's ``all_sum``
-        # can complete unilaterally when only one rank has initialised, which
-        # desynchronises the group's collective counter and hangs the slower
-        # rank's model-loading collectives.  If the in-process group is
-        # broken, model loading's first real collective (which both ranks
-        # enter in lockstep) will surface it.
+        # Warm up the distributed backend with a trivial collective *before*
+        # the long, collective-free model-loading phase.  This catches a
+        # broken RDMA data path immediately rather than after 78 layers, and
+        # — critically — synchronises both ranks' JACCL collective counters
+        # so that the subsequent model-loading and decode collectives are
+        # paired correctly.  Without this warmup the counters can drift out
+        # of sync, and after ~40 s of decode (78 MoE layers × all_sum per
+        # step) the mismatch surfaces as a permanent ``Fence::wait`` hang —
+        # the ``decode stalled: no tokens for 120s`` watchdog.
+        if isinstance(bound_instance.instance, MlxJacclInstance):
+            logger.info(f"Rank {rank} warming up JACCL data path")
+            mx.eval(mx.distributed.all_sum(mx.array(1.0), group=group))
+            logger.info(f"Rank {rank} JACCL warmup complete")
 
         return group
 
