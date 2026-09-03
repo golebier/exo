@@ -128,6 +128,84 @@ def _strip_redundant_model_file(model_path: Path) -> None:
         pass
 
 
+def _is_vlm_model_type(model_path: Path) -> bool:
+    """Return True when the model_type is a VLM registered under ``mlx_vlm.models``.
+
+    EXO's load path defaults to ``mlx_lm.load_model``, which resolves model
+    classes via ``importlib.import_module(f"mlx_lm.models.{model_type}")``.
+    VLM model types (e.g. ``glm5_next``) are registered under
+    ``mlx_vlm.models`` by EXO's patches, NOT ``mlx_lm.models``, so
+    ``mlx_lm.load_model`` raises ``ValueError: Model type ... not supported``.
+
+    This check lets the load path fall back to ``mlx_vlm.load_model`` (which
+    handles nested ``text_config``/``vision_config`` + weight sanitisation)
+    for VLMs while leaving text-only models on the ``mlx_lm`` path untouched.
+    """
+    config_path = model_path / "config.json"
+    if not config_path.exists():
+        return False
+    try:
+        with open(config_path) as f:
+            loaded: object = json.load(f)  # type: ignore[reportAny]  # json.load returns Any; validated below
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(loaded, dict):
+        return False
+    config: dict[str, Any] = cast("dict[str, Any]", loaded)
+    model_type = config.get("model_type")
+    if not isinstance(model_type, str):
+        return False
+    # A VLM model type resolves under mlx_vlm.models (registered by patches)
+    # but NOT under mlx_lm.models. Text-only types (glm_moe_dsa, deepseek_v3,
+    # qwen3, ...) resolve under mlx_lm.models and take the fast path.
+    try:
+        import importlib
+
+        importlib.import_module(f"mlx_vlm.models.{model_type}")
+    except ImportError:
+        return False  # Not a VLM type known to mlx_vlm
+    try:
+        import importlib
+
+        importlib.import_module(f"mlx_lm.models.{model_type}")
+    except ImportError:
+        return True  # VLM-only: present in mlx_vlm but absent from mlx_lm
+    return False  # Registered in both — use the mlx_lm path
+
+
+def load_model_vlm_aware(
+    model_path: Path,
+    lazy: bool,
+    strict: bool,  # noqa: ARG001  # strict unused by mlx_vlm
+) -> tuple[nn.Module, dict[str, Any]]:
+    """Load a model via ``mlx_vlm`` for VLM types, else ``mlx_lm``.
+
+    Mirrors the ``mlx_lm.load_model`` return shape ``(model, config)`` so
+    callers don't need to branch. For VLM model types (see
+    ``_is_vlm_model_type``), delegates to ``mlx_vlm.load_model`` which handles
+    the nested ``text_config``/``vision_config`` split, weight sanitisation,
+    and ``ModelConfig``/``Model``/``VisionModel``/``LanguageModel`` class
+    layout that ``mlx_lm`` does not understand.
+    """
+    if _is_vlm_model_type(model_path):
+        logger.info(f"Loading VLM model from {model_path} via mlx_vlm")
+        # mlx_vlm ships no type stubs; suppress stub/member/attr diagnostics.
+        import mlx_vlm.utils as _vlm_utils
+
+        model = _vlm_utils.load_model(model_path, lazy=lazy)  # type: ignore[reportUnknownMemberType,reportAttributeAccessIssue]
+        config_path = model_path / "config.json"
+        try:
+            with open(config_path) as f:
+                loaded: object = json.load(f)  # type: ignore[reportAny]  # json.load returns Any; validated below
+        except (OSError, json.JSONDecodeError):
+            loaded = {}
+        config: dict[str, Any] = (
+            cast("dict[str, Any]", loaded) if isinstance(loaded, dict) else {}
+        )
+        return cast(nn.Module, model), config
+    return load_model(model_path, lazy=lazy, strict=strict)
+
+
 def get_weights_size(model_shard_meta: ShardMetadata) -> Memory:
     return Memory.from_float_kb(
         (model_shard_meta.end_layer - model_shard_meta.start_layer)
@@ -372,7 +450,7 @@ def load_mlx_items(
         model_path = build_model_path(bound_instance.bound_shard.model_card.model_id)
         start_time = time.perf_counter()
         _strip_redundant_model_file(model_path)
-        model, _ = load_model(model_path, lazy=True, strict=False)
+        model, _ = load_model_vlm_aware(model_path, lazy=True, strict=False)
         # Eval layers one by one for progress reporting
         try:
             inner = get_inner_model(model)
@@ -436,7 +514,7 @@ def shard_and_load(
     model_path = build_model_path(shard_metadata.model_card.model_id)
 
     _strip_redundant_model_file(model_path)
-    model, _ = load_model(model_path, lazy=True, strict=False)
+    model, _ = load_model_vlm_aware(model_path, lazy=True, strict=False)
     logger.debug(model)
     if hasattr(model, "model") and isinstance(model.model, DeepseekV3Model):  # type: ignore
         pass

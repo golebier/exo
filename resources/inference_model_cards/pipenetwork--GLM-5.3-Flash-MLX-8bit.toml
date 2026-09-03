@@ -2,7 +2,12 @@ model_id = "pipenetwork/GLM-5.3-Flash-MLX-8bit"
 n_layers = 45
 hidden_size = 4096
 num_key_value_heads = 64
-supports_tensor = true
+supports_tensor = false
+# NOTE: GLM-5.3-Flash is a hybrid-attention VLM (sparse MLA + gated-delta
+# linear attn + pooled indexer). Its layer projections don't match any
+# existing TP sharding strategy, so it runs via pipeline parallelism
+# (model-agnostic layer slicing) until a dedicated Glm5NextShardingStrategy
+# is added. The text-only glm_moe_dsa variants keep supports_tensor=true.
 tasks = ["TextGeneration"]
 family = "glm"
 quantization = "8bit"
