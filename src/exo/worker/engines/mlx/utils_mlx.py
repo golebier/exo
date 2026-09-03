@@ -68,6 +68,66 @@ from exo.worker.engines.mlx.types import Model
 from exo.worker.runner.bootstrap import logger
 
 
+def _strip_redundant_model_file(model_path: Path) -> None:
+    """Drop ``model_file`` from config.json when EXO already registers the model_type.
+
+    Some MLX conversions (e.g. ``pipenetwork/GLM-5.3-MLX-mixed-4_8bit``) ship a
+    repo-local ``<model_type>.py`` and set ``config.json["model_file"]`` to it.
+    mlx-lm then loads that file as ``custom_model.Model``, bypassing the model
+    class EXO registers via ``patches/`` — which breaks tensor-parallel
+    sharding (``auto_parallel`` only recognises EXO's ``GlmMoeDsaModel`` etc.).
+
+    When ``model_type`` resolves to an EXO-registered ``mlx_lm.models.<type>``
+    module, the repo's custom file is redundant (and usually older), so strip
+    ``model_file`` and let mlx-lm use EXO's TP-aware class. Idempotent: leaves
+    configs without ``model_file`` untouched, and preserves the original as
+    ``config.json.orig-model-file``.
+    """
+    config_path = model_path / "config.json"
+    if not config_path.exists():
+        return
+    try:
+        with open(config_path) as f:
+            loaded: object = json.load(f)  # type: ignore[reportAny]  # json.load returns Any; validated below
+    except (OSError, json.JSONDecodeError):
+        return
+    if not isinstance(loaded, dict):
+        return
+    config: dict[str, Any] = cast("dict[str, Any]", loaded)
+    model_file = config.get("model_file")
+    if not model_file:
+        return
+    model_type = config.get("model_type")
+    if not model_type:
+        return
+    # Only strip when EXO has a registered model for this model_type (i.e.
+    # mlx_lm.models.<model_type> imports successfully thanks to a patch).
+    try:
+        import importlib
+
+        importlib.import_module(f"mlx_lm.models.{model_type}")
+    except ImportError:
+        return  # No EXO-registered class — keep the repo's custom file.
+    backup = model_path / "config.json.orig-model-file"
+    if not backup.exists():
+        try:
+            import shutil
+
+            shutil.copy2(config_path, backup)
+        except OSError:
+            pass
+    config.pop("model_file", None)
+    try:
+        with open(config_path, "w") as f:
+            json.dump(config, f, indent=2)
+        logger.info(
+            f"Stripped redundant model_file={model_file!r} from {config_path} "
+            f"(model_type={model_type!r} is EXO-registered); backup at {backup}"
+        )
+    except OSError:
+        pass
+
+
 def get_weights_size(model_shard_meta: ShardMetadata) -> Memory:
     return Memory.from_float_kb(
         (model_shard_meta.end_layer - model_shard_meta.start_layer)
@@ -311,6 +371,7 @@ def load_mlx_items(
         logger.info(f"Single device used for {bound_instance.instance}")
         model_path = build_model_path(bound_instance.bound_shard.model_card.model_id)
         start_time = time.perf_counter()
+        _strip_redundant_model_file(model_path)
         model, _ = load_model(model_path, lazy=True, strict=False)
         # Eval layers one by one for progress reporting
         try:
@@ -374,6 +435,7 @@ def shard_and_load(
 ) -> Generator[ModelLoadingResponse, None, tuple[nn.Module, TokenizerWrapper]]:
     model_path = build_model_path(shard_metadata.model_card.model_id)
 
+    _strip_redundant_model_file(model_path)
     model, _ = load_model(model_path, lazy=True, strict=False)
     logger.debug(model)
     if hasattr(model, "model") and isinstance(model.model, DeepseekV3Model):  # type: ignore

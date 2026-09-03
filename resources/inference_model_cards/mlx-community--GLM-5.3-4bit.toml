@@ -1,5 +1,5 @@
 model_id = "mlx-community/GLM-5.3-4bit"
-n_layers = 93
+n_layers = 78
 hidden_size = 6144
 num_key_value_heads = 64
 supports_tensor = true
@@ -7,17 +7,19 @@ tasks = ["TextGeneration"]
 family = "glm"
 quantization = "4bit"
 base_model = "GLM-5.3"
-capabilities = ["text", "vision", "thinking"]
+capabilities = ["text", "thinking"]
 reasoning_dialect = "post_last_user"
 context_length = 1048576
 backends = ["MlxMetal", "MlxCuda", "MlxCpu"]
 [storage_size]
-in_bytes = 395094087168
+in_bytes = 418321321530
 
 # Source: https://huggingface.co/mlx-community/GLM-5.3-4bit
 # Source: https://huggingface.co/zai-org/GLM-5.3
-# Architecture: glm5_next (Glm5NextForConditionalGeneration) — VLM with
-# DSA sparse MLA + gated-delta (GDN) linear attention + pooled indexer.
+# NOTE: This MLX conversion uses the GLM-5.2 text architecture
+# (GlmMoeDsaForCausalLM / model_type=glm_moe_dsa), NOT the glm5_next VLM.
+# It is a text-only model with DSA sparse MLA + pooled indexer (no vision).
+# EXO already supports glm_moe_dsa via vendor/glm_moe_dsa.
 [sampling_defaults]
 temperature = 1.0
 top_p = 0.95

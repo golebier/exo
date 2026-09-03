@@ -1,6 +1,6 @@
 model_id = "pipenetwork/GLM-5.3-Flash-MLX-8bit"
-n_layers = 93
-hidden_size = 6144
+n_layers = 45
+hidden_size = 4096
 num_key_value_heads = 64
 supports_tensor = true
 tasks = ["TextGeneration"]
@@ -12,12 +12,13 @@ reasoning_dialect = "post_last_user"
 context_length = 1048576
 backends = ["MlxMetal", "MlxCuda", "MlxCpu"]
 [storage_size]
-in_bytes = 790188174336
+in_bytes = 334126804629
 
 # Source: https://huggingface.co/pipenetwork/GLM-5.3-Flash-MLX-8bit
 # Source: https://huggingface.co/zai-org/GLM-5.3-Flash
 # Architecture: glm5_next (Glm5NextForConditionalGeneration) — VLM with
 # DSA sparse MLA + gated-delta (GDN) linear attention + pooled indexer.
+# Registered via patches/glm5_next (vendored under vendor/glm5_next).
 [sampling_defaults]
 temperature = 1.0
 top_p = 0.95

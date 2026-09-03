@@ -1,0 +1,26 @@
+model_id = "pipenetwork/GLM-5.3-MLX-mixed-4_8bit"
+n_layers = 78
+hidden_size = 6144
+num_key_value_heads = 64
+supports_tensor = true
+tasks = ["TextGeneration"]
+family = "glm"
+quantization = "8bit-mixed"
+base_model = "GLM-5.3"
+capabilities = ["text", "thinking"]
+reasoning_dialect = "post_last_user"
+context_length = 1048576
+backends = ["MlxMetal", "MlxCuda", "MlxCpu"]
+[storage_size]
+in_bytes = 427746878904
+
+# Source: https://huggingface.co/pipenetwork/GLM-5.3-MLX-mixed-4_8bit
+# Architecture: GlmMoeDsaForCausalLM / model_type=glm_moe_dsa (text-only, NOT the
+# glm5_next VLM). This repo ships a repo-local glm_moe_dsa.py + sets
+# config.json["model_file"], which mlx-lm would load as custom_model.Model —
+# bypassing EXO's TP-aware GlmMoeDsaModel. EXO strips the redundant model_file
+# at load time (utils_mlx._strip_redundant_model_file) so the EXO-registered
+# class is used and tensor-parallel sharding works.
+[sampling_defaults]
+temperature = 1.0
+top_p = 0.95
