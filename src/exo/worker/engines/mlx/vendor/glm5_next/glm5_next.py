@@ -3,9 +3,9 @@
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_vlm.models.base import InputEmbeddingsFeatures, LanguageModelOutput
+from mlx_vlm.models.base import InputEmbeddingsFeatures
 from .config import ModelConfig
-from .language import LanguageModel
+from .language import LanguageModel, LanguageModelOutput
 from .vision import VisionModel
 
 

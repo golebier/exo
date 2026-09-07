@@ -1,17 +1,32 @@
 # ruff: noqa
 # pyright: reportUnknownMemberType=false, reportUnknownVariableType=false, reportUnknownArgumentType=false, reportUnknownParameterType=false, reportMissingParameterType=false, reportMissingTypeArgument=false, reportMissingTypeStubs=false, reportAny=false, reportArgumentType=false, reportAttributeAccessIssue=false, reportCallIssue=false, reportConstantRedefinition=false, reportGeneralTypeIssues=false, reportIncompatibleMethodOverride=false, reportIncompatibleVariableOverride=false, reportIndexIssue=false, reportMissingImports=false, reportOperatorIssue=false, reportOptionalCall=false, reportOptionalIterable=false, reportOptionalMemberAccess=false, reportOptionalOperand=false, reportOptionalSubscript=false, reportPrivateImportUsage=false, reportPrivateUsage=false, reportUnnecessaryComparison=false, reportUnusedImport=false, reportUnusedVariable=false
 import logging
+from dataclasses import dataclass
 from typing import Any, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
 
 from mlx_vlm.models.base import (
-    LanguageModelOutput,
+    LanguageModelOutput as _MlxVlmLanguageModelOutput,
     create_attention_mask,
     create_ssm_mask,
     scaled_dot_product_attention,
 )
+
+
+@dataclass
+class LanguageModelOutput(_MlxVlmLanguageModelOutput):
+    """LanguageModelOutput that also supports mx.array-style indexing.
+
+    exo drives generation with mlx_lm's ``generate_step``, which subscripts
+    the model output directly (``logits[:, -1, :]``), while mlx_vlm expects
+    the dataclass shape (``out.logits``). Supporting both keeps the vendored
+    model usable from either code path.
+    """
+
+    def __getitem__(self, item: Any) -> mx.array:
+        return self.logits[item]
 from mlx_vlm.models.cache import ArraysCache, CacheList, KVCache
 from exo.worker.engines.mlx.vendor.deepseek_v4.hyper_connection import (
     HyperConnection,

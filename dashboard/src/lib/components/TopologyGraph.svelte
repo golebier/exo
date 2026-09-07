@@ -214,6 +214,26 @@
       .attr("stroke-linejoin", "round")
       .style("animation", "none");
 
+    // Red arrowhead marker for RDMA/Thunderbolt edges
+    const rdmaMarker = defs
+      .append("marker")
+      .attr("id", "arrowhead-rdma")
+      .attr("viewBox", "0 0 10 10")
+      .attr("refX", "10")
+      .attr("refY", "5")
+      .attr("markerWidth", "11")
+      .attr("markerHeight", "11")
+      .attr("orient", "auto-start-reverse");
+    rdmaMarker
+      .append("path")
+      .attr("d", "M 0 0 L 10 5 L 0 10")
+      .attr("fill", "none")
+      .attr("stroke", "rgba(248,113,113,0.95)")
+      .attr("stroke-width", "1.6")
+      .attr("stroke-linecap", "round")
+      .attr("stroke-linejoin", "round")
+      .style("animation", "none");
+
     if (nodeIds.length === 0) {
       svg
         .append("text")
@@ -302,12 +322,15 @@
       ip: string;
       ifaceLabel: string;
       missingIface: boolean;
+      isRdma: boolean;
     };
     type PairEntry = {
       a: string;
       b: string;
       aToB: boolean;
       bToA: boolean;
+      rdmaAToB: boolean;
+      rdmaBToA: boolean;
       connections: ConnectionInfo[];
     };
     type DebugEdgeLabelEntry = {
@@ -331,11 +354,19 @@
         b,
         aToB: false,
         bToA: false,
+        rdmaAToB: false,
+        rdmaBToA: false,
         connections: [],
       };
 
-      if (edge.source === a) entry.aToB = true;
-      else entry.bToA = true;
+      const isRdma = !!(edge.sourceRdmaIface || edge.sinkRdmaIface);
+      if (edge.source === a) {
+        if (isRdma) entry.rdmaAToB = true;
+        else entry.aToB = true;
+      } else {
+        if (isRdma) entry.rdmaBToA = true;
+        else entry.bToA = true;
+      }
 
       let ip: string;
       let ifaceLabel: string;
@@ -358,6 +389,7 @@
         ip,
         ifaceLabel,
         missingIface,
+        isRdma,
       });
       pairMap.set(key, entry);
     });
@@ -367,14 +399,8 @@
       const posB = positionById[entry.b];
       if (!posA || !posB) return;
 
-      // Base dashed line
-      linksGroup
-        .append("line")
-        .attr("x1", posA.x)
-        .attr("y1", posA.y)
-        .attr("x2", posB.x)
-        .attr("y2", posB.y)
-        .attr("class", "graph-link");
+      const hasTcp = entry.aToB || entry.bToA;
+      const hasRdma = entry.rdmaAToB || entry.rdmaBToA;
 
       // Calculate midpoint and direction for arrows
       const dx = posB.x - posA.x;
@@ -387,34 +413,95 @@
       const tipOffset = 16; // Distance from center for arrow tips
       const carrier = 2; // Short segment length for arrow orientation
 
-      // Arrow A -> B (if connection exists in that direction)
-      if (entry.aToB) {
-        const tipX = mx - ux * tipOffset;
-        const tipY = my - uy * tipOffset;
-        arrowsGroup
+      // --- TCP/IP connection: base dashed line + gray arrows ---
+      if (hasTcp) {
+        // Base dashed line
+        linksGroup
           .append("line")
-          .attr("x1", tipX - ux * carrier)
-          .attr("y1", tipY - uy * carrier)
-          .attr("x2", tipX)
-          .attr("y2", tipY)
-          .attr("stroke", "none")
-          .attr("fill", "none")
-          .attr("marker-end", "url(#arrowhead)");
+          .attr("x1", posA.x)
+          .attr("y1", posA.y)
+          .attr("x2", posB.x)
+          .attr("y2", posB.y)
+          .attr("class", "graph-link");
+
+        // Arrow A -> B (if TCP connection exists in that direction)
+        if (entry.aToB) {
+          const tipX = mx - ux * tipOffset;
+          const tipY = my - uy * tipOffset;
+          arrowsGroup
+            .append("line")
+            .attr("x1", tipX - ux * carrier)
+            .attr("y1", tipY - uy * carrier)
+            .attr("x2", tipX)
+            .attr("y2", tipY)
+            .attr("stroke", "none")
+            .attr("fill", "none")
+            .attr("marker-end", "url(#arrowhead)");
+        }
+
+        // Arrow B -> A (if TCP connection exists in that direction)
+        if (entry.bToA) {
+          const tipX = mx + ux * tipOffset;
+          const tipY = my + uy * tipOffset;
+          arrowsGroup
+            .append("line")
+            .attr("x1", tipX + ux * carrier)
+            .attr("y1", tipY + uy * carrier)
+            .attr("x2", tipX)
+            .attr("y2", tipY)
+            .attr("stroke", "none")
+            .attr("fill", "none")
+            .attr("marker-end", "url(#arrowhead)");
+        }
       }
 
-      // Arrow B -> A (if connection exists in that direction)
-      if (entry.bToA) {
-        const tipX = mx + ux * tipOffset;
-        const tipY = my + uy * tipOffset;
-        arrowsGroup
+      // --- RDMA/Thunderbolt connection: parallel red line + red arrows ---
+      // Drawn offset perpendicular to the TCP line so it never covers it.
+      if (hasRdma) {
+        const rdmaOffset = 8; // Perpendicular offset from the TCP line
+        const ox = -uy * rdmaOffset;
+        const oy = ux * rdmaOffset;
+
+        linksGroup
           .append("line")
-          .attr("x1", tipX + ux * carrier)
-          .attr("y1", tipY + uy * carrier)
-          .attr("x2", tipX)
-          .attr("y2", tipY)
-          .attr("stroke", "none")
-          .attr("fill", "none")
-          .attr("marker-end", "url(#arrowhead)");
+          .attr("x1", posA.x + ox)
+          .attr("y1", posA.y + oy)
+          .attr("x2", posB.x + ox)
+          .attr("y2", posB.y + oy)
+          .attr("class", "graph-link-rdma");
+
+        const rmx = mx + ox;
+        const rmy = my + oy;
+
+        // Arrow A -> B (if RDMA connection exists in that direction)
+        if (entry.rdmaAToB) {
+          const tipX = rmx - ux * tipOffset;
+          const tipY = rmy - uy * tipOffset;
+          arrowsGroup
+            .append("line")
+            .attr("x1", tipX - ux * carrier)
+            .attr("y1", tipY - uy * carrier)
+            .attr("x2", tipX)
+            .attr("y2", tipY)
+            .attr("stroke", "none")
+            .attr("fill", "none")
+            .attr("marker-end", "url(#arrowhead-rdma)");
+        }
+
+        // Arrow B -> A (if RDMA connection exists in that direction)
+        if (entry.rdmaBToA) {
+          const tipX = rmx + ux * tipOffset;
+          const tipY = rmy + uy * tipOffset;
+          arrowsGroup
+            .append("line")
+            .attr("x1", tipX + ux * carrier)
+            .attr("y1", tipY + uy * carrier)
+            .attr("x2", tipX)
+            .attr("y2", tipY)
+            .attr("stroke", "none")
+            .attr("fill", "none")
+            .attr("marker-end", "url(#arrowhead-rdma)");
+        }
       }
 
       // Collect debug labels for later positioning at edges
@@ -1238,6 +1325,12 @@
     stroke-dasharray: 4, 4;
     opacity: 0.8;
     animation: flowAnimation 0.75s linear infinite;
+  }
+  /* RDMA/Thunderbolt link — solid red line, parallel to the TCP/IP dashed line */
+  :global(.graph-link-rdma) {
+    stroke: rgba(248, 113, 113, 0.95);
+    stroke-width: 1.5px;
+    opacity: 0.9;
   }
   @keyframes flowAnimation {
     from {
