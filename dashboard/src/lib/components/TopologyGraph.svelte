@@ -341,6 +341,8 @@
       my: number;
     };
     const pairMap = new Map<string, PairEntry>();
+    // Nodes that have at least one TCP/IP connection (they connect via the switch)
+    const tcpNodes = new Set<string>();
     const debugEdgeLabels: DebugEdgeLabelEntry[] = [];
     edges.forEach((edge) => {
       if (!edge.source || !edge.target || edge.source === edge.target) return;
@@ -360,6 +362,10 @@
       };
 
       const isRdma = !!(edge.sourceRdmaIface || edge.sinkRdmaIface);
+      if (!isRdma) {
+        tcpNodes.add(edge.source);
+        tcpNodes.add(edge.target);
+      }
       if (edge.source === a) {
         if (isRdma) entry.rdmaAToB = true;
         else entry.aToB = true;
@@ -399,7 +405,6 @@
       const posB = positionById[entry.b];
       if (!posA || !posB) return;
 
-      const hasTcp = entry.aToB || entry.bToA;
       const hasRdma = entry.rdmaAToB || entry.rdmaBToA;
 
       // Calculate midpoint and direction for arrows
@@ -413,47 +418,8 @@
       const tipOffset = 16; // Distance from center for arrow tips
       const carrier = 2; // Short segment length for arrow orientation
 
-      // --- TCP/IP connection: base dashed line + gray arrows ---
-      if (hasTcp) {
-        // Base dashed line
-        linksGroup
-          .append("line")
-          .attr("x1", posA.x)
-          .attr("y1", posA.y)
-          .attr("x2", posB.x)
-          .attr("y2", posB.y)
-          .attr("class", "graph-link");
-
-        // Arrow A -> B (if TCP connection exists in that direction)
-        if (entry.aToB) {
-          const tipX = mx - ux * tipOffset;
-          const tipY = my - uy * tipOffset;
-          arrowsGroup
-            .append("line")
-            .attr("x1", tipX - ux * carrier)
-            .attr("y1", tipY - uy * carrier)
-            .attr("x2", tipX)
-            .attr("y2", tipY)
-            .attr("stroke", "none")
-            .attr("fill", "none")
-            .attr("marker-end", "url(#arrowhead)");
-        }
-
-        // Arrow B -> A (if TCP connection exists in that direction)
-        if (entry.bToA) {
-          const tipX = mx + ux * tipOffset;
-          const tipY = my + uy * tipOffset;
-          arrowsGroup
-            .append("line")
-            .attr("x1", tipX + ux * carrier)
-            .attr("y1", tipY + uy * carrier)
-            .attr("x2", tipX)
-            .attr("y2", tipY)
-            .attr("stroke", "none")
-            .attr("fill", "none")
-            .attr("marker-end", "url(#arrowhead)");
-        }
-      }
+      // TCP/IP connections are drawn as spokes to the central switch below —
+      // no direct node-to-node TCP line here.
 
       // --- RDMA/Thunderbolt connection: parallel red line + red arrows ---
       // Drawn offset perpendicular to the TCP line so it never covers it.
@@ -520,6 +486,79 @@
         });
       }
     });
+
+    // --- TCP/IP connections: central switch with dashed spokes to each node ---
+    // TCP/IP traffic goes through a network switch, so draw a switch icon at
+    // the center of the topology and connect every TCP-capable node to it.
+    if (numNodes > 1 && tcpNodes.size > 0) {
+      const switchWidth = Math.max(36, Math.min(64, nodeRadius * 0.55));
+      const switchHeight = switchWidth * 0.42;
+      const sx = centerX - switchWidth / 2;
+      const sy = safeCenterY - switchHeight / 2;
+
+      // Spokes from each TCP node to the switch center
+      nodesWithPositions.forEach((n) => {
+        if (!tcpNodes.has(n.id)) return;
+        linksGroup
+          .append("line")
+          .attr("x1", n.x)
+          .attr("y1", n.y)
+          .attr("x2", centerX)
+          .attr("y2", safeCenterY)
+          .attr("class", "graph-link");
+      });
+
+      // Switch body (drawn on top of the spokes so lines end at its edge)
+      const switchG = svg.append("g").attr("class", "switch-group");
+      switchG
+        .append("rect")
+        .attr("x", sx)
+        .attr("y", sy)
+        .attr("width", switchWidth)
+        .attr("height", switchHeight)
+        .attr("rx", 3)
+        .attr("fill", "#1a1a1a")
+        .attr("stroke", "rgba(179,179,179,0.9)")
+        .attr("stroke-width", 1.5);
+
+      // Status LEDs on the switch front panel
+      const ledCount = 4;
+      const ledR = Math.max(1.2, switchHeight * 0.09);
+      const ledSpacing = switchWidth / (ledCount + 1);
+      for (let i = 0; i < ledCount; i++) {
+        switchG
+          .append("circle")
+          .attr("cx", sx + ledSpacing * (i + 1))
+          .attr("cy", sy + switchHeight * 0.35)
+          .attr("r", ledR)
+          .attr("fill", "rgba(255,215,0,0.9)");
+      }
+
+      // Port slots along the bottom of the front panel
+      const portWidth = switchWidth / (ledCount + 2);
+      for (let i = 0; i < ledCount; i++) {
+        switchG
+          .append("rect")
+          .attr("x", sx + ledSpacing * (i + 1) - portWidth * 0.3)
+          .attr("y", sy + switchHeight * 0.6)
+          .attr("width", portWidth * 0.6)
+          .attr("height", switchHeight * 0.22)
+          .attr("rx", 1)
+          .attr("fill", "rgba(0,0,0,0.45)");
+      }
+
+      // Label below the switch
+      switchG
+        .append("text")
+        .attr("x", centerX)
+        .attr("y", sy + switchHeight + 11)
+        .attr("text-anchor", "middle")
+        .attr("fill", "rgba(179,179,179,0.85)")
+        .attr("font-size", isMinimized ? 7 : 9)
+        .attr("letter-spacing", "0.1em")
+        .attr("font-family", "SF Mono, Monaco, monospace")
+        .text("SWITCH");
+    }
 
     // Render debug labels at viewport edges/corners
     if (debugEdgeLabels && debugEdgeLabels.length > 0) {
