@@ -22,6 +22,7 @@ from exo.shared.types.tasks import GenerationTask, Task, TaskId
 from exo.shared.types.worker.runner_response import (
     CancelledResponse,
     FinishedResponse,
+    GenerationResponse,
 )
 from exo.utils.channels import mp_channel
 from exo.worker.engines.base import Engine
@@ -201,3 +202,150 @@ def test_chunk_generated_always_emitted_alongside_usage() -> None:
     chunk_events = [e for e in collector.events if isinstance(e, ChunkGenerated)]
     assert len(chunk_events) == 1
     assert chunk_events[0].chunk is chunk
+
+
+# ── Regression: one InstanceTokensUpdated per request, even when the parser
+#    splits a single final response into multiple chunks ──────────────────
+#
+# Historically, when a DSML tool call and its leading text arrived on the
+# *same final token* (carrying finish_reason + usage), `_parse_dsml_stream`
+# yielded both a ``TokenChunk`` (the "before" text, which retained
+# finish_reason + usage) and a ``ToolCallChunk``. ``Runner.send_chunk`` then
+# emitted ``InstanceTokensUpdated`` for *each*, double-counting the request's
+# tokens (and the SSE adapter terminated early so the client never saw the
+# tool call). These tests pin the fix: the "before" text is an intermediate
+# chunk with no finish_reason/usage, so exactly one emission occurs.
+
+
+def _drive_parser_through_runner(
+    responses: Iterable[GenerationResponse],
+) -> tuple[Runner, _EventCollector]:
+    """Run simulated GenerationResponses through the DeepSeek-V3.2 parser chain
+    and feed each resulting chunk to ``Runner.send_chunk``."""
+    from collections.abc import Generator
+
+    from exo.shared.types.common import ModelId
+    from exo.worker.runner.llm_inference.model_output_parsers import (
+        count_reasoning_tokens,
+        map_responses_to_chunks,
+        parse_deepseek_v32,
+    )
+
+    model_id = ModelId("mlx-community/DeepSeek-V3.2")
+    runner, collector = _make_runner()
+
+    def source() -> Generator[GenerationResponse]:
+        yield from responses
+
+    gen = count_reasoning_tokens(parse_deepseek_v32(source()))
+    for response in gen:
+        chunk = map_responses_to_chunks(response, model_id)
+        if chunk is not None:
+            runner.send_chunk(chunk, COMMAND_ID)
+
+    return runner, collector
+
+
+def test_inline_dsml_tool_call_on_final_token_emits_once() -> None:
+    """Text + complete DSML block on the same final token (with usage).
+
+    Pre-fix this emitted TWO ``InstanceTokensUpdated`` events (one for the
+    before-text ``TokenChunk`` that kept finish_reason+usage, one for the
+    ``ToolCallChunk``) — double-counting the request.
+    """
+    from exo.worker.engines.mlx.vendor.dsml_encoding import (
+        DSML_TOKEN,
+        TOOL_CALLS_END,
+        TOOL_CALLS_START,
+    )
+
+    responses = [
+        GenerationResponse(text="tok0 ", token=0, finish_reason=None, usage=None),
+        GenerationResponse(text="tok1 ", token=1, finish_reason=None, usage=None),
+        GenerationResponse(
+            text=(
+                "Sure."
+                f"{TOOL_CALLS_START}\n"
+                f'<{DSML_TOKEN}invoke name="get_weather">\n'
+                f'<{DSML_TOKEN}parameter name="city" string="true">NYC'
+                f"</{DSML_TOKEN}parameter>\n"
+                f"</{DSML_TOKEN}invoke>\n"
+                f"{TOOL_CALLS_END}"
+            ),
+            token=99,
+            finish_reason="stop",
+            usage=_usage(prompt=100, completion=7),
+        ),
+    ]
+
+    _runner, collector = _drive_parser_through_runner(responses)
+
+    emitted = _instance_tokens_events(collector.events)
+    assert len(emitted) == 1, (
+        f"expected exactly one InstanceTokensUpdated for the request, got "
+        f"{len(emitted)} (double-count regression): {emitted}"
+    )
+    assert emitted[0].prompt_tokens == 100
+    assert emitted[0].completion_tokens == 7
+
+
+def test_split_dsml_tool_call_emits_once() -> None:
+    """Text on earlier tokens, DSML block on the final token (with usage).
+
+    This path was already correct; it pins the behaviour alongside the inline
+    case so the two stay consistent.
+    """
+    from exo.worker.engines.mlx.vendor.dsml_encoding import (
+        DSML_TOKEN,
+        TOOL_CALLS_END,
+        TOOL_CALLS_START,
+    )
+
+    responses = [
+        GenerationResponse(text="Sure. ", token=0, finish_reason=None, usage=None),
+        GenerationResponse(
+            text="Let me check. ", token=1, finish_reason=None, usage=None
+        ),
+        GenerationResponse(
+            text=(
+                f"{TOOL_CALLS_START}\n"
+                f'<{DSML_TOKEN}invoke name="get_weather">\n'
+                f'<{DSML_TOKEN}parameter name="city" string="true">NYC'
+                f"</{DSML_TOKEN}parameter>\n"
+                f"</{DSML_TOKEN}invoke>\n"
+                f"{TOOL_CALLS_END}"
+            ),
+            token=99,
+            finish_reason="stop",
+            usage=_usage(prompt=100, completion=7),
+        ),
+    ]
+
+    _runner, collector = _drive_parser_through_runner(responses)
+
+    emitted = _instance_tokens_events(collector.events)
+    assert len(emitted) == 1
+    assert emitted[0].prompt_tokens == 100
+    assert emitted[0].completion_tokens == 7
+
+
+def test_plain_text_final_token_emits_once() -> None:
+    """A normal (non-tool-call) final token emits exactly once."""
+
+    responses = [
+        GenerationResponse(text="Hello", token=0, finish_reason=None, usage=None),
+        GenerationResponse(text=" world", token=1, finish_reason=None, usage=None),
+        GenerationResponse(
+            text="!",
+            token=2,
+            finish_reason="stop",
+            usage=_usage(prompt=50, completion=3),
+        ),
+    ]
+
+    _runner, collector = _drive_parser_through_runner(responses)
+
+    emitted = _instance_tokens_events(collector.events)
+    assert len(emitted) == 1
+    assert emitted[0].prompt_tokens == 50
+    assert emitted[0].completion_tokens == 3

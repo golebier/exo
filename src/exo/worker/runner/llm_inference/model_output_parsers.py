@@ -292,7 +292,16 @@ def _parse_dsml_stream(
                 dsml_start = response.text.index(tool_calls_start)
                 before = response.text[:dsml_start]
                 if before:
-                    yield response.model_copy(update={"text": before})
+                    # The "before" text is an *intermediate* chunk: the terminal
+                    # chunk for this request is the ToolCallResponse below. It must
+                    # NOT carry the final response's ``finish_reason``/``usage`` —
+                    # otherwise (a) ``Runner.send_chunk`` emits ``InstanceTokensUpdated``
+                    # twice (double-counting the request's tokens) and (b) the SSE
+                    # adapter terminates the stream at this chunk and the tool call
+                    # is never delivered to the client.
+                    yield response.model_copy(
+                        update={"text": before, "finish_reason": None, "usage": None}
+                    )
                 yield _try_parse_tool_call(response.text[dsml_start:], response)
             else:
                 yield response
