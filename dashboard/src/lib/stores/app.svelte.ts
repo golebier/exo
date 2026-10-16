@@ -228,6 +228,8 @@ interface RawStateResponse {
       MlxJacclInstance?: Instance;
     }
   >;
+  // Live task state: tagged task objects (e.g. { TextGeneration: { taskStatus, instanceId, ... } })
+  tasks?: Record<string, Record<string, unknown>>;
   // Cumulative in/out token accounting per instance (creation until deletion).
   instanceTokenUsage?: Record<string, InstanceTokenUsage>;
   runners?: Record<string, unknown>;
@@ -302,6 +304,42 @@ export interface InstanceTokenUsage {
   requestCount: number;
 }
 
+// One session's live token accounting, as served by GET /session-usage.
+export interface SessionUsageEntry {
+  sessionId: string;
+  promptTokens: number;
+  completionTokens: number;
+  requestCount: number;
+  inFlight: number;
+  // Running counters for requests still streaming (absent on older EXO).
+  inFlightPromptTokens?: number;
+  inFlightCompletionTokens?: number;
+  lastActiveSecondsAgo: number | null;
+}
+
+// Durable all-time totals for one instance, as served by GET /session-usage.
+// Survives restarts and instance recreation (keyed by model + engine type
+// server-side); absent on older EXO.
+export interface LifetimeUsageEntry {
+  promptTokens: number;
+  completionTokens: number;
+  requestCount: number;
+}
+
+export interface SessionUsageResponse {
+  instances: Record<string, SessionUsageEntry[]>;
+  lifetime?: Record<string, LifetimeUsageEntry>;
+}
+
+// Usage summed over the sessions that are active right now (or were very
+// recently) on one instance — the "live" line of the instance card.
+export interface InstanceActiveUsage {
+  promptTokens: number;
+  completionTokens: number;
+  requestCount: number;
+  activeSessions: number;
+}
+
 export interface Message {
   id: string;
   role: "user" | "assistant" | "system";
@@ -330,6 +368,17 @@ export interface Conversation {
 
 const STORAGE_KEY = "exo-conversations";
 const IMAGE_PARAMS_STORAGE_KEY = "exo-image-generation-params";
+// Task type tags that represent a generation session occupying an instance.
+const GENERATION_TASK_TAGS = [
+  "TextGeneration",
+  "ImageGeneration",
+  "ImageEdits",
+] as const;
+// A session counts as active while it has requests in flight or completed
+// within this window (mirrors the exo-router idle hold).
+// A session counts as "active" for this long after its last completed
+// request, so short gaps between an agent's turns keep it visible.
+export const ACTIVE_SESSION_GRACE_SECONDS = 300;
 
 // Image generation params interface matching backend API
 export interface ImageGenerationParams {
@@ -558,6 +607,96 @@ class AppStore {
   topologyData = $state<TopologyData | null>(null);
   instances = $state<Record<string, unknown>>({});
   instanceTokenUsage = $state<Record<string, InstanceTokenUsage>>({});
+  // Live cluster task state (tagged task objects keyed by task id).
+  rawTasks = $state<Record<string, Record<string, unknown>>>({});
+  // Live per-session token usage per instance (GET /session-usage).
+  rawSessionUsage = $state<Record<string, SessionUsageEntry[]>>({});
+  // Durable lifetime token totals per instance (GET /session-usage).
+  rawLifetimeUsage = $state<Record<string, LifetimeUsageEntry>>({});
+
+  // Number of chat sessions (conversations) attributed to each instance,
+  // matched via the conversation's model id to the instance's model id.
+  get instanceSessionCounts(): Record<string, number> {
+    const counts: Record<string, number> = {};
+    for (const conversation of this.conversations) {
+      if (!conversation.modelId) continue;
+      for (const [instanceId, instanceWrapped] of Object.entries(
+        this.instances,
+      )) {
+        if (
+          this.extractInstanceModelId(instanceWrapped) === conversation.modelId
+        ) {
+          counts[instanceId] = (counts[instanceId] ?? 0) + 1;
+        }
+      }
+    }
+    return counts;
+  }
+
+  // Live in-flight generation sessions per instance, from cluster task state.
+  // Counts Pending/Running generation tasks (same in-flight definition the
+  // exo master uses), so API traffic from tools like pi agent is included —
+  // unlike instanceSessionCounts which only sees dashboard-local conversations.
+  get instanceActiveSessions(): Record<string, number> {
+    const counts: Record<string, number> = {};
+    for (const task of Object.values(this.rawTasks)) {
+      if (!task || typeof task !== "object") continue;
+      const tag = GENERATION_TASK_TAGS.find((t) => t in task);
+      if (!tag) continue;
+      const inner = task[tag] as
+        | { taskStatus?: string; instanceId?: string }
+        | undefined;
+      if (!inner?.instanceId) continue;
+      if (inner.taskStatus === "Pending" || inner.taskStatus === "Running") {
+        counts[inner.instanceId] = (counts[inner.instanceId] ?? 0) + 1;
+      }
+    }
+    return counts;
+  }
+
+  // Live token usage summed over the sessions currently active on each
+  // instance — the "now" line of the instance card. A session counts as
+  // active while it has requests in flight or completed within
+  // ACTIVE_SESSION_GRACE_SECONDS. In-flight requests contribute their
+  // running (approximate) counters so the numbers move while a generation
+  // is still streaming.
+  get instanceActiveUsage(): Record<string, InstanceActiveUsage> {
+    const result: Record<string, InstanceActiveUsage> = {};
+    for (const [instanceId, sessions] of Object.entries(this.rawSessionUsage)) {
+      let promptTokens = 0;
+      let completionTokens = 0;
+      let requestCount = 0;
+      let activeSessions = 0;
+      for (const session of sessions) {
+        const active =
+          session.inFlight > 0 ||
+          (session.lastActiveSecondsAgo ?? Infinity) <=
+            ACTIVE_SESSION_GRACE_SECONDS;
+        if (!active) continue;
+        promptTokens +=
+          session.promptTokens + (session.inFlightPromptTokens ?? 0);
+        completionTokens +=
+          session.completionTokens + (session.inFlightCompletionTokens ?? 0);
+        requestCount += session.requestCount + session.inFlight;
+        activeSessions += 1;
+      }
+      if (activeSessions > 0) {
+        result[instanceId] = {
+          promptTokens,
+          completionTokens,
+          requestCount,
+          activeSessions,
+        };
+      }
+    }
+    return result;
+  }
+  // Durable all-time totals per instance (GET /session-usage `lifetime`),
+  // preferred over /state's per-instance counters which reset whenever an
+  // instance is recreated.
+  get instanceLifetimeUsage(): Record<string, LifetimeUsageEntry> {
+    return this.rawLifetimeUsage;
+  }
   runners = $state<Record<string, unknown>>({});
   instanceLinks = $state<Record<string, RawInstanceLink>>({});
   featureFlags = $state<Record<string, boolean>>({});
@@ -1352,6 +1491,20 @@ class AppStore {
         this.refreshConversationModelFromInstances();
       }
       this.instanceTokenUsage = data.instanceTokenUsage ?? {};
+      // Live task state for real active-session counting
+      this.rawTasks = data.tasks ?? {};
+      // Live per-session usage for the instance cards' "now" line.
+      // Older EXO builds don't expose /session-usage — keep the last data then.
+      try {
+        const usageResponse = await fetch("/session-usage");
+        if (usageResponse.ok) {
+          const usageData =
+            (await usageResponse.json()) as SessionUsageResponse;
+          this.rawSessionUsage = usageData.instances ?? {};
+        }
+      } catch {
+        // endpoint missing or request failed — non-fatal
+      }
       if (data.runners) {
         this.runners = data.runners;
       }
@@ -1743,7 +1896,10 @@ class AppStore {
 
       const response = await fetch("/v1/chat/completions", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          "X-Pi-Session-Id": `conv-${targetConversationId}`,
+        },
         body: JSON.stringify({
           model: modelToUse,
           messages: apiMessages,
@@ -1966,7 +2122,10 @@ class AppStore {
 
       const response = await fetch("/v1/chat/completions", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          "X-Pi-Session-Id": `conv-${targetConversationId}`,
+        },
         body: JSON.stringify({
           model: modelToUse,
           messages: apiMessages,
@@ -2541,6 +2700,7 @@ class AppStore {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
+          "X-Pi-Session-Id": `conv-${targetConversationId}`,
         },
         body: JSON.stringify({
           model: modelToUse,
@@ -3627,6 +3787,15 @@ export const prefillProgress = () => appStore.prefillProgress;
 export const topologyData = () => appStore.topologyData;
 export const instances = () => appStore.instances;
 export const instanceTokenUsage = () => appStore.instanceTokenUsage;
+export const instanceSessionCounts = () => appStore.instanceSessionCounts;
+/** Live in-flight generation sessions per instance (from cluster task state). */
+export const instanceActiveSessions = () => appStore.instanceActiveSessions;
+/** Live token usage summed over sessions active on each instance. */
+export const instanceActiveUsage = () => appStore.instanceActiveUsage;
+/** Durable all-time token totals per instance (survive restarts). */
+export const instanceLifetimeUsage = () => appStore.instanceLifetimeUsage;
+/** Per-session usage entries per instance, most-recent-first. */
+export const instanceSessionUsage = () => appStore.rawSessionUsage;
 export const runners = () => appStore.runners;
 export const instanceLinks = () => appStore.instanceLinks;
 export const featureFlags = () => appStore.featureFlags;

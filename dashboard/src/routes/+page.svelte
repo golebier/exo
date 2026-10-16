@@ -30,6 +30,11 @@
     clearChat,
     instances,
     instanceTokenUsage,
+    instanceLifetimeUsage,
+    instanceActiveSessions,
+    instanceActiveUsage,
+    instanceSessionUsage,
+    ACTIVE_SESSION_GRACE_SECONDS,
     runners,
     downloads,
     placementPreviews,
@@ -89,6 +94,9 @@
   const update = $derived(lastUpdate());
   const instanceData = $derived(instances());
   const instanceTokenUsageData = $derived(instanceTokenUsage());
+  const instanceLifetimeUsageData = $derived(instanceLifetimeUsage());
+  const instanceActiveSessionsData = $derived(instanceActiveSessions());
+  const instanceActiveUsageData = $derived(instanceActiveUsage());
   const runnersData = $derived(runners());
   const downloadsData = $derived(downloads());
   const previewsData = $derived(placementPreviews());
@@ -2458,6 +2466,42 @@
     const i = Math.floor(Math.log(tokens) / Math.log(1000)) - 1;
     const value = tokens / Math.pow(1000, i + 1);
     return parseFloat(value.toFixed(1)) + units[i];
+  }
+
+  // Tooltip listing each session contributing to an instance's live line.
+  function activeSessionsTooltip(instanceId: string): string {
+    const sessions = instanceSessionUsage()[instanceId] ?? [];
+    const active = sessions
+      .filter(
+        (s) =>
+          s.inFlight > 0 ||
+          (s.lastActiveSecondsAgo ?? Infinity) <= ACTIVE_SESSION_GRACE_SECONDS,
+      )
+      .sort(
+        (a, b) =>
+          (a.lastActiveSecondsAgo ?? Infinity) -
+          (b.lastActiveSecondsAgo ?? Infinity),
+      );
+    if (active.length === 0) {
+      return "No active sessions on this instance right now";
+    }
+    const lines = active.map(
+      (s) =>
+        `${shortSessionId(s.sessionId)}: ↓${formatTokenCount(
+          s.promptTokens + (s.inFlightPromptTokens ?? 0),
+        )} ↑${formatTokenCount(
+          s.completionTokens + (s.inFlightCompletionTokens ?? 0),
+        )} ${s.requestCount + s.inFlight} req${
+          s.inFlight > 0 ? ` (${s.inFlight} streaming)` : ""
+        }`,
+    );
+    return `Active sessions on this instance:\n${lines.join("\n")}`;
+  }
+
+  function shortSessionId(sessionId: string): string {
+    if (sessionId === "dashboard") return "dashboard";
+    if (sessionId.startsWith("conv-")) return sessionId.slice(0, 17);
+    return sessionId.slice(0, 8);
   }
 
   function getNodeLabel(nodeId: string): string {
@@ -5588,26 +5632,64 @@
                           </div>
                         {/if}
                         {#if isReady || isRunning || isWarmingUp}
-                          {@const tokenUsage = instanceTokenUsageData[id]}
+                          {@const tokenUsage =
+                            instanceLifetimeUsageData[id] ??
+                            instanceTokenUsageData[id]}
+                          {@const activeUsage = instanceActiveUsageData[id]}
                           <div
-                            class="mt-1 flex items-center gap-1.5 text-[11px] font-mono text-white/55"
+                            class="mt-1 space-y-0.5 text-[11px] font-mono text-white/55"
                           >
-                            <span title="Input tokens"
-                              >↓ {formatTokenCount(
-                                tokenUsage?.promptTokens ?? 0,
-                              )}</span
+                            <div
+                              class="flex items-center gap-1.5"
+                              title={activeSessionsTooltip(id)}
                             >
-                            <span class="text-white/20">·</span>
-                            <span title="Output tokens"
-                              >↑ {formatTokenCount(
-                                tokenUsage?.completionTokens ?? 0,
-                              )}</span
-                            >
-                            <span class="text-white/20">·</span>
-                            <span title="Completed requests"
-                              >{tokenUsage?.requestCount ?? 0}
-                              req</span
-                            >
+                              <span
+                                title="Input tokens for sessions active on this instance now (live — includes API traffic such as pi agent, not just dashboard chats)"
+                                >↓ {formatTokenCount(
+                                  activeUsage?.promptTokens ?? 0,
+                                )}</span
+                              >
+                              <span class="text-white/20">·</span>
+                              <span
+                                title="Output tokens for sessions active on this instance now"
+                                >↑ {formatTokenCount(
+                                  activeUsage?.completionTokens ?? 0,
+                                )}</span
+                              >
+                              <span class="text-white/20">·</span>
+                              <span
+                                title="Requests (completed + in flight) for sessions active on this instance now"
+                                >{activeUsage?.requestCount ?? 0}
+                                req</span
+                              >
+                              <span class="text-white/20">·</span>
+                              <span
+                                title="Active generation sessions on this instance right now (live — includes API traffic such as pi agent, not just dashboard chats)"
+                                >{instanceActiveSessionsData[id] ?? 0}
+                                active</span
+                              >
+                            </div>
+                            <div class="flex items-center gap-1.5">
+                              <span
+                                title="All-time input tokens — every past and present session on this instance"
+                                >Σ↓ {formatTokenCount(
+                                  tokenUsage?.promptTokens ?? 0,
+                                )}</span
+                              >
+                              <span class="text-white/20">·</span>
+                              <span
+                                title="All-time output tokens — every past and present session on this instance"
+                                >Σ↑ {formatTokenCount(
+                                  tokenUsage?.completionTokens ?? 0,
+                                )}</span
+                              >
+                              <span class="text-white/20">·</span>
+                              <span
+                                title="All-time completed requests — every past and present session on this instance"
+                                >{tokenUsage?.requestCount ?? 0}
+                                req</span
+                              >
+                            </div>
                           </div>
                         {/if}
                         {#if debugEnabled && instanceConnections.length > 0}
@@ -7167,26 +7249,64 @@
                             </div>
                           {/if}
                           {#if isReady || isRunning || isWarmingUp}
-                            {@const tokenUsage = instanceTokenUsageData[id]}
+                            {@const tokenUsage =
+                              instanceLifetimeUsageData[id] ??
+                              instanceTokenUsageData[id]}
+                            {@const activeUsage = instanceActiveUsageData[id]}
                             <div
-                              class="mt-1 flex items-center gap-1.5 text-[11px] font-mono text-white/55"
+                              class="mt-1 space-y-0.5 text-[11px] font-mono text-white/55"
                             >
-                              <span title="Input tokens"
-                                >↓ {formatTokenCount(
-                                  tokenUsage?.promptTokens ?? 0,
-                                )}</span
+                              <div
+                                class="flex items-center gap-1.5"
+                                title={activeSessionsTooltip(id)}
                               >
-                              <span class="text-white/20">·</span>
-                              <span title="Output tokens"
-                                >↑ {formatTokenCount(
-                                  tokenUsage?.completionTokens ?? 0,
-                                )}</span
-                              >
-                              <span class="text-white/20">·</span>
-                              <span title="Completed requests"
-                                >{tokenUsage?.requestCount ?? 0}
-                                req</span
-                              >
+                                <span
+                                  title="Input tokens for sessions active on this instance now (live — includes API traffic such as pi agent, not just dashboard chats)"
+                                  >↓ {formatTokenCount(
+                                    activeUsage?.promptTokens ?? 0,
+                                  )}</span
+                                >
+                                <span class="text-white/20">·</span>
+                                <span
+                                  title="Output tokens for sessions active on this instance now"
+                                  >↑ {formatTokenCount(
+                                    activeUsage?.completionTokens ?? 0,
+                                  )}</span
+                                >
+                                <span class="text-white/20">·</span>
+                                <span
+                                  title="Requests (completed + in flight) for sessions active on this instance now"
+                                  >{activeUsage?.requestCount ?? 0}
+                                  req</span
+                                >
+                                <span class="text-white/20">·</span>
+                                <span
+                                  title="Active generation sessions on this instance right now (live — includes API traffic such as pi agent, not just dashboard chats)"
+                                  >{instanceActiveSessionsData[id] ?? 0}
+                                  active</span
+                                >
+                              </div>
+                              <div class="flex items-center gap-1.5">
+                                <span
+                                  title="All-time input tokens — every past and present session on this instance"
+                                  >Σ↓ {formatTokenCount(
+                                    tokenUsage?.promptTokens ?? 0,
+                                  )}</span
+                                >
+                                <span class="text-white/20">·</span>
+                                <span
+                                  title="All-time output tokens — every past and present session on this instance"
+                                  >Σ↑ {formatTokenCount(
+                                    tokenUsage?.completionTokens ?? 0,
+                                  )}</span
+                                >
+                                <span class="text-white/20">·</span>
+                                <span
+                                  title="All-time completed requests — every past and present session on this instance"
+                                  >{tokenUsage?.requestCount ?? 0}
+                                  req</span
+                                >
+                              </div>
                             </div>
                           {/if}
                           {#if debugEnabled && instanceConnections.length > 0}

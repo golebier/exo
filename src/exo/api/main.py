@@ -5,6 +5,7 @@ import json
 import random
 import time
 from collections.abc import AsyncGenerator, Awaitable, Callable, Iterable
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from http import HTTPStatus
 from pathlib import Path
@@ -102,6 +103,7 @@ from exo.api.types import (
     TraceResponse,
     TraceStatsResponse,
     TurboQuantSetting,
+    Usage,
     normalize_image_size,
 )
 from exo.api.types.claude_api import (
@@ -184,6 +186,7 @@ from exo.shared.types.events import (
     Event,
     IndexedEvent,
     InstanceDeleted,
+    InstanceTokensUpdated,
     TracesMerged,
 )
 from exo.shared.types.instance_link import InstanceLink, InstanceLinkId
@@ -240,6 +243,51 @@ def _require_disaggregation_enabled() -> None:
         )
 
 
+# Fallback session id for requests without a session header (e.g. dashboard chats).
+_DEFAULT_SESSION_ID = "dashboard"
+# Upper bound on tracked sessions per instance so the in-memory map stays small.
+_MAX_TRACKED_SESSIONS_PER_INSTANCE = 200
+# Durable all-time token totals, persisted across restarts. Event-sourced
+# per-instance totals reset whenever an instance is recreated (restart,
+# topology change); this sidecar keeps the true lifetime numbers per
+# (instance type, model).
+_LIFETIME_USAGE_FILE = _API_EVENT_LOG_DIR / "lifetime_token_usage.json"
+
+
+@dataclass
+class _SessionTokenUsage:
+    """Live token accounting for one session on one instance (in-memory)."""
+
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    request_count: int = 0
+    last_active_ts: float = 0.0
+
+
+@dataclass
+class _CommandInflightUsage:
+    """Running counters for one in-flight request.
+
+    Approximate until the request completes: completion tokens are counted
+    one per TokenChunk and the prompt estimate comes from prefill progress.
+    The exact totals land in the session bucket on the terminating chunk.
+    """
+
+    session_id: str
+    instance_id: InstanceId | None = None
+    prompt_tokens_estimate: int = 0
+    completion_tokens: int = 0
+
+
+@dataclass
+class _LifetimeUsage:
+    """All-time token totals for one (instance type, model) pair."""
+
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    request_count: int = 0
+
+
 class API:
     def __init__(
         self,
@@ -263,6 +311,16 @@ class API:
         self.last_completed_election: int = 0
         self.port = port
         self._sent_image_hashes: set[str] = set()
+        # Live per-session token accounting (in-memory). Sessions are
+        # identified via the x-pi-session-id header ("dashboard" by default).
+        # The Σ line's all-time totals come from the persisted sidecar store
+        # below, because the event-sourced per-instance counters reset
+        # whenever an instance is recreated.
+        self._session_token_usage: dict[InstanceId, dict[str, _SessionTokenUsage]] = {}
+        self._session_inflight: dict[str, int] = {}
+        self._command_inflight_usage: dict[CommandId, _CommandInflightUsage] = {}
+        # Durable lifetime totals (survive restarts / instance recreation).
+        self._lifetime_usage: dict[str, _LifetimeUsage] = self._load_lifetime_usage()
 
         self.paused: bool = False
         self.paused_ev: anyio.Event = anyio.Event()
@@ -406,6 +464,7 @@ class API:
         self.app.get("/ollama/api/version")(self.ollama_version)
 
         self.app.get("/state")(self.get_state)
+        self.app.get("/session-usage")(self.get_session_usage)
         self.app.get("/state/{path:path}")(self.get_state)
         self.app.get("/events")(self.stream_events)
         self.app.post("/download/start")(self.start_download)
@@ -843,14 +902,26 @@ class API:
         )
 
     async def _token_chunk_stream(
-        self, command_id: CommandId
+        self, command_id: CommandId, session_id: str | None = None
     ) -> AsyncGenerator[
         TokenChunk | ErrorChunk | ToolCallChunk | PrefillProgressChunk, None
     ]:
         """Yield chunks for a given command until completion.
 
-        This is the internal low-level stream used by all API adapters.
+        This is the internal low-level stream used by all API adapters. When
+        ``session_id`` is given, the request is counted as in-flight for that
+        session with live running counters, and the terminating chunk's usage
+        is attributed to the (instance, session) bucket for live per-session
+        accounting.
         """
+        inflight: _CommandInflightUsage | None = None
+        if session_id is not None:
+            self._session_inflight[session_id] = (
+                self._session_inflight.get(session_id, 0) + 1
+            )
+            inflight = _CommandInflightUsage(session_id=session_id)
+            self._command_inflight_usage[command_id] = inflight
+        settled = False
         try:
             self._text_generation_queues[command_id], recv = channel[
                 TokenChunk | ErrorChunk | ToolCallChunk | PrefillProgressChunk
@@ -858,11 +929,45 @@ class API:
 
             with recv as token_chunks:
                 async for chunk in token_chunks:
-                    yield chunk
+                    if inflight is not None:
+                        if inflight.instance_id is None:
+                            inflight.instance_id = self._instance_for_command(
+                                command_id
+                            )
+                        if isinstance(chunk, PrefillProgressChunk):
+                            inflight.prompt_tokens_estimate = max(
+                                inflight.prompt_tokens_estimate, chunk.total_tokens
+                            )
+                        elif isinstance(chunk, TokenChunk):
+                            inflight.completion_tokens += 1
                     if isinstance(chunk, PrefillProgressChunk):
+                        yield chunk
                         continue
                     if chunk.finish_reason is not None:
+                        # Settle everything BEFORE yielding the terminating
+                        # chunk: streaming adapters stop consuming at the final
+                        # chunk, so the generator may never resume after this
+                        # yield. Usage attribution and in-flight bookkeeping
+                        # must both happen while we still control the flow.
+                        # Same termination semantics as the runner's token
+                        # accounting: only the final TokenChunk / ToolCallChunk
+                        # carries usage, exactly once per request.
+                        if (
+                            session_id is not None
+                            and isinstance(chunk, (TokenChunk, ToolCallChunk))
+                            and chunk.usage is not None
+                        ):
+                            instance_id = self._instance_for_command(command_id)
+                            if instance_id is not None:
+                                self._record_session_tokens(
+                                    instance_id, session_id, chunk.usage
+                                )
+                        if session_id is not None:
+                            self._settle_inflight(command_id, session_id)
+                            settled = True
+                        yield chunk
                         break
+                    yield chunk
 
         except anyio.get_cancelled_exc_class():
             command = TaskCancelled(cancelled_command_id=command_id)
@@ -872,6 +977,11 @@ class API:
                 )
             raise
         finally:
+            if session_id is not None and not settled:
+                # Aborted before a terminating chunk arrived (client
+                # disconnect, error): no usage to attribute, just drop the
+                # live in-flight counters.
+                self._settle_inflight(command_id, session_id)
             await self._send(TaskFinished(finished_command_id=command_id))
             if command_id in self._text_generation_queues:
                 del self._text_generation_queues[command_id]
@@ -1002,9 +1112,10 @@ class API:
         return command
 
     async def chat_completions(
-        self, payload: ChatCompletionRequest
+        self, payload: ChatCompletionRequest, request: Request
     ) -> ChatCompletionResponse | StreamingResponse:
         """OpenAI Chat Completions API - adapter."""
+        session_id = self._session_id_from_request(request)
         task_params = await chat_request_to_text_generation(payload)
         validated_model = await self._validate_model_has_instance(task_params.model)
         task_params = task_params.model_copy(update={"model": validated_model})
@@ -1016,7 +1127,9 @@ class API:
                 with_sse_keepalive(
                     generate_chat_stream(
                         command.command_id,
-                        self._token_chunk_stream(command.command_id),
+                        self._token_chunk_stream(
+                            command.command_id, session_id=session_id
+                        ),
                     ),
                 ),
                 media_type="text/event-stream",
@@ -1030,10 +1143,182 @@ class API:
             return StreamingResponse(
                 collect_chat_response(
                     command.command_id,
-                    self._token_chunk_stream(command.command_id),
+                    self._token_chunk_stream(command.command_id, session_id=session_id),
                 ),
                 media_type="application/json",
             )
+
+    def _session_id_from_request(self, request: Request) -> str:
+        """Identify the session a request belongs to.
+
+        pi agent (via exo-router) sends x-pi-session-id; x-agent-id and
+        x-session-id are accepted as fallbacks. Requests without a session
+        header (e.g. dashboard chats) share the "dashboard" bucket.
+        """
+        for header in ("x-pi-session-id", "x-agent-id", "x-session-id"):
+            value = request.headers.get(header)
+            if value:
+                return value
+        return _DEFAULT_SESSION_ID
+
+    def _instance_for_command(self, command_id: CommandId) -> InstanceId | None:
+        """Resolve which instance is serving a command from live task state."""
+        for task in self.state.tasks.values():
+            if getattr(task, "command_id", None) == command_id:
+                return task.instance_id
+        return None
+
+    def _settle_inflight(self, command_id: CommandId, session_id: str) -> None:
+        """Drop one request's live counters and decrement its session's in-flight count."""
+        self._command_inflight_usage.pop(command_id, None)
+        remaining = self._session_inflight.get(session_id, 0) - 1
+        if remaining > 0:
+            self._session_inflight[session_id] = remaining
+        else:
+            self._session_inflight.pop(session_id, None)
+
+    def _record_session_tokens(
+        self, instance_id: InstanceId, session_id: str, usage: Usage
+    ) -> None:
+        """Fold one completed request's usage into the live session bucket."""
+        per_instance = self._session_token_usage.setdefault(instance_id, {})
+        entry = per_instance.get(session_id)
+        if entry is None:
+            entry = _SessionTokenUsage()
+            per_instance[session_id] = entry
+        entry.prompt_tokens += usage.prompt_tokens
+        entry.completion_tokens += usage.completion_tokens
+        entry.request_count += 1
+        entry.last_active_ts = time.time()
+        if len(per_instance) > _MAX_TRACKED_SESSIONS_PER_INSTANCE:
+            oldest = min(per_instance, key=lambda sid: per_instance[sid].last_active_ts)
+            del per_instance[oldest]
+
+    def _lifetime_key(self, instance: Instance) -> str:
+        """Stable identity for an instance card across restarts.
+
+        Instance ids are recreated on restart / topology change; the
+        (concrete instance type, model) pair is what the user thinks of as
+        "the same instance".
+        """
+        return f"{type(instance).__name__}::{instance.shard_assignments.model_id}"
+
+    def _load_lifetime_usage(self) -> dict[str, _LifetimeUsage]:
+        """Load durable lifetime totals from disk (best-effort)."""
+        try:
+            raw = cast(
+                "dict[str, dict[str, int]]",
+                json.loads(_LIFETIME_USAGE_FILE.read_text()),
+            )
+            return {
+                str(key): _LifetimeUsage(
+                    prompt_tokens=value["promptTokens"],
+                    completion_tokens=value["completionTokens"],
+                    request_count=value["requestCount"],
+                )
+                for key, value in raw.items()
+            }
+        except FileNotFoundError:
+            return {}
+        except Exception as e:
+            logger.warning(
+                f"Ignoring unreadable lifetime usage file {_LIFETIME_USAGE_FILE}: {e}"
+            )
+            return {}
+
+    def _persist_lifetime_usage(self) -> None:
+        """Atomically write durable lifetime totals (best-effort)."""
+        try:
+            _LIFETIME_USAGE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            tmp = _LIFETIME_USAGE_FILE.with_name(_LIFETIME_USAGE_FILE.name + ".tmp")
+            tmp.write_text(
+                json.dumps(
+                    {
+                        key: {
+                            "promptTokens": usage.prompt_tokens,
+                            "completionTokens": usage.completion_tokens,
+                            "requestCount": usage.request_count,
+                        }
+                        for key, usage in self._lifetime_usage.items()
+                    }
+                )
+            )
+            tmp.replace(_LIFETIME_USAGE_FILE)
+        except Exception as e:
+            logger.warning(f"Failed to persist lifetime usage: {e}")
+
+    def _fold_lifetime_usage(
+        self, instance: Instance, prompt_tokens: int, completion_tokens: int
+    ) -> None:
+        """Fold one completed request's usage into the durable lifetime totals."""
+        key = self._lifetime_key(instance)
+        entry = self._lifetime_usage.setdefault(key, _LifetimeUsage())
+        entry.prompt_tokens += prompt_tokens
+        entry.completion_tokens += completion_tokens
+        entry.request_count += 1
+        self._persist_lifetime_usage()
+
+    async def get_session_usage(self) -> dict[str, Any]:
+        """Live per-session token usage, grouped by instance.
+
+        Consumed by the dashboard: the instance card's "active" line sums the
+        sessions that are in flight or were active recently (including the
+        running counters of requests still streaming), while the Σ line shows
+        the durable lifetime totals from the persisted sidecar store.
+        """
+        now = time.time()
+        # Aggregate live counters per (instance, session).
+        inflight: dict[InstanceId, dict[str, list[int]]] = {}
+        for command in self._command_inflight_usage.values():
+            if command.instance_id is None:
+                continue
+            per_instance = inflight.setdefault(command.instance_id, {})
+            acc = per_instance.setdefault(command.session_id, [0, 0])
+            acc[0] += command.prompt_tokens_estimate
+            acc[1] += command.completion_tokens
+        # Recorded sessions, plus synthetic entries for in-flight sessions
+        # that have not completed a request yet.
+        per_instance_sessions: dict[InstanceId, dict[str, _SessionTokenUsage]] = {
+            instance_id: dict(sessions)
+            for instance_id, sessions in self._session_token_usage.items()
+        }
+        for instance_id, sessions in inflight.items():
+            recorded = per_instance_sessions.setdefault(instance_id, {})
+            for session_id in sessions:
+                recorded.setdefault(session_id, _SessionTokenUsage())
+
+        instances: dict[str, list[dict[str, Any]]] = {}
+        for instance_id, sessions in per_instance_sessions.items():
+            live = inflight.get(instance_id, {})
+            instances[str(instance_id)] = [
+                {
+                    "sessionId": session_id,
+                    "promptTokens": entry.prompt_tokens,
+                    "completionTokens": entry.completion_tokens,
+                    "requestCount": entry.request_count,
+                    "inFlight": self._session_inflight.get(session_id, 0),
+                    "inFlightPromptTokens": live.get(session_id, [0, 0])[0],
+                    "inFlightCompletionTokens": live.get(session_id, [0, 0])[1],
+                    "lastActiveSecondsAgo": (
+                        round(now - entry.last_active_ts, 1)
+                        if entry.last_active_ts
+                        else None
+                    ),
+                }
+                for session_id, entry in sessions.items()
+            ]
+        # Durable lifetime totals, mapped to the instances currently in state.
+        lifetime: dict[str, dict[str, int]] = {}
+        for instance_id, instance in self.state.instances.items():
+            usage = self._lifetime_usage.get(self._lifetime_key(instance))
+            if usage is None:
+                continue
+            lifetime[str(instance_id)] = {
+                "promptTokens": usage.prompt_tokens,
+                "completionTokens": usage.completion_tokens,
+                "requestCount": usage.request_count,
+            }
+        return {"instances": instances, "lifetime": lifetime}
 
     async def bench_chat_completions(
         self, payload: BenchChatCompletionRequest
@@ -2061,6 +2346,17 @@ class API:
                 self.state = apply(self.state, i_event)
                 event = i_event.event
 
+                if isinstance(event, InstanceTokensUpdated):
+                    # Fold into the durable lifetime store too — the
+                    # event-sourced per-instance totals reset when instances
+                    # are recreated, this sidecar survives restarts.
+                    instance = self.state.instances.get(event.instance_id)
+                    if instance is not None:
+                        self._fold_lifetime_usage(
+                            instance,
+                            event.prompt_tokens,
+                            event.completion_tokens,
+                        )
                 if isinstance(event, ChunkGenerated):
                     if queue := self._image_generation_queues.get(
                         event.command_id, None
