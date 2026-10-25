@@ -9,6 +9,7 @@ import mlx.core as mx
 from mlx_lm.tokenizer_utils import TokenizerWrapper
 
 from exo.shared.constants import EXO_MAX_CONCURRENT_REQUESTS
+from exo.shared.models.model_cards import TranslationCardConfig
 from exo.shared.types.chunks import ErrorChunk, GenerationChunk, PrefillProgressChunk
 from exo.shared.types.common import ModelId
 from exo.shared.types.events import ChunkGenerated, Event
@@ -98,6 +99,7 @@ class SequentialGenerator(Engine):
     cancel_receiver: MpReceiver[TaskId]
     event_sender: MpSender[Event]
     vision_processor: VisionProcessor | None = None
+    translation: TranslationCardConfig | None = None
     check_for_cancel_every: int = 50
 
     _cancelled_tasks: set[TaskId] = field(default_factory=set, init=False)
@@ -124,6 +126,7 @@ class SequentialGenerator(Engine):
             tokenizer=self.tokenizer,
             group=self.group,
             model_id=self.model_id,
+            translation=self.translation,
         )
 
     def submit(
@@ -225,7 +228,9 @@ class SequentialGenerator(Engine):
         else:
             output_generator = apply_all_parsers(
                 queue.gen(),
-                apply_chat_template(self.tokenizer, task.task_params),
+                apply_chat_template(
+                    self.tokenizer, task.task_params, translation=self.translation
+                ),
                 self.tool_parser,
                 self.tokenizer,
                 type(self.model),
@@ -249,7 +254,9 @@ class SequentialGenerator(Engine):
 
     def _build_generator(self, task: TextGeneration) -> Generator[GenerationResponse]:
         _check_for_debug_prompts(task.task_params)
-        prompt = apply_chat_template(self.tokenizer, task.task_params)
+        prompt = apply_chat_template(
+            self.tokenizer, task.task_params, translation=self.translation
+        )
 
         def on_prefill_progress(processed: int, total: int) -> None:
             if self.device_rank == 0:
@@ -330,6 +337,7 @@ class BatchGenerator(Engine):
     event_sender: MpSender[Event]
     check_for_cancel_every: int = 50
     vision_processor: VisionProcessor | None = None
+    translation: TranslationCardConfig | None = None
 
     _cancelled_tasks: set[TaskId] = field(default_factory=set, init=False)
     _maybe_queue: list[TextGeneration] = field(default_factory=list, init=False)
@@ -361,6 +369,7 @@ class BatchGenerator(Engine):
             tokenizer=self.tokenizer,
             group=self.group,
             model_id=self.model_id,
+            translation=self.translation,
         )
 
     def submit(
@@ -424,7 +433,9 @@ class BatchGenerator(Engine):
             else:
                 output_generator = apply_all_parsers(
                     queue.gen(),
-                    apply_chat_template(self.tokenizer, task.task_params),
+                    apply_chat_template(
+                        self.tokenizer, task.task_params, translation=self.translation
+                    ),
                     self.tool_parser,
                     self.tokenizer,
                     type(self.model),
@@ -508,7 +519,9 @@ class BatchGenerator(Engine):
 
     def _start_task(self, task: TextGeneration) -> int:
         _check_for_debug_prompts(task.task_params)
-        prompt = apply_chat_template(self.tokenizer, task.task_params)
+        prompt = apply_chat_template(
+            self.tokenizer, task.task_params, translation=self.translation
+        )
 
         def on_prefill_progress(processed: int, total: int) -> None:
             if self.device_rank == 0:

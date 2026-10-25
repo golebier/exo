@@ -83,6 +83,7 @@ def entrypoint(
                 model_id=bound_instance.bound_shard.model_card.model_id,
                 event_sender=event_sender_downcast,
                 cancel_receiver=cancel_receiver,
+                translation=bound_instance.bound_shard.model_card.translation,
             )
 
         runner = Runner(bound_instance, builder, event_sender_downcast, task_receiver)

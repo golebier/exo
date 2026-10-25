@@ -27,6 +27,8 @@ class LanguageModelOutput(_MlxVlmLanguageModelOutput):
 
     def __getitem__(self, item: Any) -> mx.array:
         return self.logits[item]
+
+
 from mlx_vlm.models.cache import ArraysCache, CacheList, KVCache
 from exo.worker.engines.mlx.vendor.deepseek_v4.hyper_connection import (
     HyperConnection,

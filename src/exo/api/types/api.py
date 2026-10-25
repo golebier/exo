@@ -247,6 +247,9 @@ class ChatCompletionRequest(BaseModel):
     tool_choice: str | dict[str, Any] | None = None
     parallel_tool_calls: bool | None = None
     user: str | None = None
+    # Per-request translation pair override (translation models only).
+    translation_source_lang_code: str | None = None
+    translation_target_lang_code: str | None = None
 
 
 class BenchChatCompletionRequest(ChatCompletionRequest):

@@ -72,3 +72,22 @@ class TestGlm5MatchesGlm52:
 
     def test_glm_in_glm47(self) -> None:
         assert "glm" in "mlx-community/glm-4.7-4bit".lower()
+
+
+class TestGemmaEosTokens:
+    """Tests for gemma-family EOS token detection."""
+
+    def test_translategemma(self) -> None:
+        # Gemma-2 based chat model: <eos>=1, <end_of_turn>=106
+        eos = get_eos_token_ids_for_model(
+            ModelId("mlx-community/translategemma-27b-it-bf16")
+        )
+        assert eos == [1, 106]
+
+    def test_gemma2(self) -> None:
+        eos = get_eos_token_ids_for_model(ModelId("mlx-community/gemma-2-27b-it"))
+        assert eos == [1, 106]
+
+    def test_gemma3_keeps_extra_token(self) -> None:
+        eos = get_eos_token_ids_for_model(ModelId("mlx-community/gemma-3-27b-it"))
+        assert eos == [1, 106, 50]

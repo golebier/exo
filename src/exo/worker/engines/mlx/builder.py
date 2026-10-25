@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import mlx.core as mx
 from mlx_lm.tokenizer_utils import TokenizerWrapper
 
+from exo.shared.models.model_cards import TranslationCardConfig
 from exo.shared.types.common import ModelId
 from exo.shared.types.events import Event
 from exo.shared.types.tasks import TaskId
@@ -34,6 +35,7 @@ class MlxBuilder(Builder):
     model_id: ModelId
     event_sender: MpSender[Event]
     cancel_receiver: MpReceiver[TaskId]
+    translation: TranslationCardConfig | None = None
     inference_model: Model | None = None
     tokenizer: TokenizerWrapper | None = None
     group: mx.distributed.Group | None = None
@@ -96,6 +98,7 @@ class MlxBuilder(Builder):
                 cancel_receiver=self.cancel_receiver,
                 event_sender=self.event_sender,
                 vision_processor=vision_processor,
+                translation=self.translation,
             )
         else:
             logger.info("using BatchGenerator")
@@ -110,4 +113,5 @@ class MlxBuilder(Builder):
                 cancel_receiver=self.cancel_receiver,
                 event_sender=self.event_sender,
                 vision_processor=vision_processor,
+                translation=self.translation,
             )

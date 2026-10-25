@@ -21,6 +21,7 @@ from exo.api.types import (
     TopLogprobItem,
     Usage,
 )
+from exo.shared.models.model_cards import TranslationCardConfig
 from exo.shared.types.common import ModelId
 from exo.shared.types.memory import Memory
 from exo.shared.types.text_generation import (
@@ -443,6 +444,7 @@ def warmup_inference(
     tokenizer: TokenizerWrapper,
     group: mx.distributed.Group | None,
     model_id: ModelId,
+    translation: TranslationCardConfig | None = None,
 ) -> int:
     logger.info(f"warming up inference for instance: {model_id}")
 
@@ -457,10 +459,22 @@ def warmup_inference(
         temperature=0.0,
     )
 
-    warmup_prompt = apply_chat_template(
-        tokenizer=tokenizer,
-        task_params=warmup_task_params,
-    )
+    try:
+        warmup_prompt = apply_chat_template(
+            tokenizer=tokenizer,
+            task_params=warmup_task_params,
+            translation=translation,
+        )
+    except Exception as e:
+        # Some models ship chat templates that hard-require content shapes
+        # EXO's warmup message does not satisfy (e.g. TranslateGemma's
+        # structured translation content). Warmup only needs to exercise the
+        # forward pass, so fall back to a raw prompt and keep loading.
+        logger.warning(
+            f"Chat template failed during warmup ({e!r}); "
+            f"falling back to a raw prompt for {model_id}"
+        )
+        warmup_prompt = "Prompt to warm up the inference engine. Repeat this."
 
     tokens_generated = 0
 

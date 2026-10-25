@@ -175,6 +175,8 @@ async def chat_request_to_text_generation(
         presence_penalty=request.presence_penalty,
         frequency_penalty=request.frequency_penalty,
         images=images,
+        translation_source_lang_code=request.translation_source_lang_code,
+        translation_target_lang_code=request.translation_target_lang_code,
     )
 
 

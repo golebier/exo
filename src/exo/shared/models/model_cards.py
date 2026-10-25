@@ -139,6 +139,19 @@ class VisionCardConfig(FrozenModel):
     processor_repo: str | None = None
 
 
+class TranslationCardConfig(FrozenModel):
+    """Language pair for models whose chat template requires structured
+    translation content (e.g. TranslateGemma).
+
+    When set, EXO adapts plain chat messages into the structured form the
+    template demands:
+    ``content: [{type: 'text', source_lang_code, target_lang_code, text}]``.
+    """
+
+    source_lang_code: str
+    target_lang_code: str
+
+
 class SamplingValues(FrozenModel):
     temperature: float | None = None
     top_p: float | None = None
@@ -175,6 +188,7 @@ class ModelCard(FrozenModel):
     trust_remote_code: bool = True
     is_custom: bool = False
     vision: VisionCardConfig | None = None
+    translation: TranslationCardConfig | None = None
     sampling_defaults: SamplingDefaults = Field(default_factory=SamplingDefaults)
 
     @model_validator(mode="after")
@@ -183,6 +197,20 @@ class ModelCard(FrozenModel):
             detected = detect_vision_from_config(self.model_id)
             if detected is not None:
                 object.__setattr__(self, "vision", detected)
+        return self
+
+    @model_validator(mode="after")
+    def _autodetect_translation(self) -> "ModelCard":
+        # TranslateGemma models ship chat templates that hard-require a
+        # structured translation language pair. Without one every request
+        # fails at template rendering. Give the family a usable default;
+        # requests may override the pair per call.
+        if self.translation is None and "translategemma" in str(self.model_id).lower():
+            object.__setattr__(
+                self,
+                "translation",
+                TranslationCardConfig(source_lang_code="en", target_lang_code="pl"),
+            )
         return self
 
     @model_validator(mode="after")

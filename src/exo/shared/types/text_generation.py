@@ -132,6 +132,12 @@ class TextGenerationTaskParams(BaseModel, frozen=True):
     images: list[Base64Image] = Field(default_factory=list)
     image_hashes: dict[int, Base64ImageHash] = Field(default_factory=dict)
 
+    # Per-request override for the translation language pair declared on the
+    # model card (only takes effect for translation models, i.e. cards whose
+    # [translation] section / autodetected pair is present).
+    translation_source_lang_code: str | None = None
+    translation_target_lang_code: str | None = None
+
     prefill_endpoint: str | None = None
 
     def with_card_sampling_defaults(self) -> "TextGenerationTaskParams":

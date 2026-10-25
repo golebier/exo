@@ -27,7 +27,7 @@ from mlx_lm.models.cache import KVCache
 from mlx_lm.models.deepseek_v3 import DeepseekV3Model
 from mlx_lm.tokenizer_utils import TokenizerWrapper
 
-from exo.shared.models.model_cards import ModelId
+from exo.shared.models.model_cards import ModelId, TranslationCardConfig
 from exo.worker.engines.mlx.constants import TRUST_REMOTE_CODE
 
 try:
@@ -128,6 +128,156 @@ def _strip_redundant_model_file(model_path: Path) -> None:
         pass
 
 
+def derive_mixed_precision_quantization(model_path: Path) -> dict[str, Any] | None:
+    """Derive per-tensor quantization overrides for mixed-precision exports.
+
+    Returns a ``model_config`` fragment for :func:`mlx_lm.utils.load_model`:
+    ``{"quantization": {**global_entries, **module_path: {group_size, bits}}}``.
+    mlx_lm's loader natively honours per-module entries in
+    ``config["quantization"]`` (its own fine-grained save path writes the same
+    shape), so this makes every module construct at the bit width and group
+    size its weights are actually packed at — before ``load_weights`` validates
+    shapes and before the first forward pass would dequantize.
+
+    Two details make this correct:
+
+    * **Key mapping**: ``nn.quantize``'s class predicate receives *module*
+      paths (e.g. ``language_model.model.embed_tokens``), which frequently
+      differ from raw safetensors names (e.g. ``model.language_model.embed_tokens``).
+      A throwaway model instance is constructed and its ``sanitize()`` is run
+      over the (lazy) weights so the derived keys come out in module-path
+      space — exactly what the loader will compare against.
+    * **Anchored math**: the packed/scales shapes alone cannot disambiguate
+      ``(bits=4, group=128)`` from ``(bits=8, group=64)``. The throwaway
+      model's *unquantized* module weights anchor ``in_features`` per module,
+      from which both values follow exactly:
+
+          bits        = packed_last * 32 / in_features
+          group_size  = in_features / scales_last
+
+    Returns ``None`` when the config already declares per-tensor entries, the
+    model is not quantized, or the model type cannot be resolved, in which
+    case loading proceeds unchanged.
+    """
+    config_path = model_path / "config.json"
+    if not config_path.exists():
+        return None
+    try:
+        with open(config_path) as f:
+            loaded: object = json.load(f)  # type: ignore[reportAny]  # json.load returns Any; validated below
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(loaded, dict):
+        return None
+    config: dict[str, Any] = cast("dict[str, Any]", loaded)
+    quantization_value: object = config.get("quantization")
+    if not isinstance(quantization_value, dict):
+        return None
+    quantization = cast("dict[str, Any]", quantization_value)
+    global_bits_value: object = quantization.get("bits")
+    global_group_size_value: object = quantization.get("group_size", 128)  # type: ignore[reportAny]  # Any from dict[str, Any].get
+    if not isinstance(global_bits_value, int) or not isinstance(
+        global_group_size_value, int
+    ):
+        return None
+    global_bits = global_bits_value
+    global_group_size = global_group_size_value
+    if any(isinstance(value, dict) for value in quantization.values()):  # type: ignore[reportAny]  # values() is Any under dict[str, Any]
+        return None  # exporter already declared per-tensor entries; trust it
+    model_type = config.get("model_type")
+    if not isinstance(model_type, str) or config.get("model_file") is not None:
+        return None  # remote-code models are out of scope; load unchanged
+    weight_files = sorted(model_path.glob("model*.safetensors"))
+    if not weight_files:
+        return None
+    # Resolve the model class exactly like mlx_lm's loader does so the
+    # throwaway instance matches the one load_model will build.
+    try:
+        import importlib
+
+        module: object = importlib.import_module(f"mlx_lm.models.{model_type}")
+    except ImportError:
+        return None
+    model_class = getattr(module, "Model", None)
+    model_args_class = getattr(module, "ModelArgs", None)
+    if not isinstance(model_class, type) or not isinstance(model_args_class, type):
+        return None
+    weights: dict[str, Any] = {}
+    for shard_path in weight_files:
+        try:
+            shard_weights: object = mx.load(
+                str(shard_path)
+            )  # lazy arrays: shapes only, no payload read
+        except Exception:
+            return None
+        if not isinstance(shard_weights, dict):
+            return None
+        weights.update(cast("dict[str, Any]", shard_weights))
+    try:
+        model_args = model_args_class.from_dict(config)  # type: ignore[reportAny,reportAttributeAccessIssue]  # third-party ModelArgs
+        throwaway: object = model_class(model_args)  # type: ignore[reportAny,reportCallIssue]  # third-party Model
+    except Exception:
+        # Class resolution/args failures also fail inside load_model with a
+        # clearer error; fall through to an unchanged load.
+        return None
+    sanitize = getattr(throwaway, "sanitize", None)
+    if callable(sanitize):
+        try:
+            sanitized: object = sanitize(weights)
+        except Exception:
+            return None
+        if isinstance(sanitized, dict):
+            weights = cast("dict[str, Any]", sanitized)
+    overrides: dict[str, dict[str, int]] = {}
+    for path, throwaway_module in throwaway.named_modules():  # type: ignore[reportUnknownArgumentType,reportUnknownVariableType,reportAttributeAccessIssue]  # mlx ships no stubs
+        module_weight: object = getattr(throwaway_module, "weight", None)  # type: ignore[reportUnknownArgumentType]
+        stored_weight: object = weights.get(f"{path}.weight")
+        stored_scales: object = weights.get(f"{path}.scales")
+        if not isinstance(module_weight, mx.array):
+            continue
+        if not isinstance(stored_weight, mx.array) or not isinstance(
+            stored_scales, mx.array
+        ):
+            continue  # module stored unquantized; the loader keeps it plain too
+        in_features = module_weight.shape[
+            -1
+        ]  # plain unquantized weight: (out, in) / (vocab, dims) / (experts, out, in)
+        scales_last = stored_scales.shape[-1]
+        packed_last = stored_weight.shape[-1]
+        if in_features == 0 or scales_last == 0:
+            continue
+        stored_biases: object = weights.get(f"{path}.biases")
+        if (
+            isinstance(stored_biases, mx.array)
+            and stored_biases.shape[-1] != scales_last
+        ):
+            continue  # inconsistent export; leave to the loader to surface
+        derived_bits = packed_last * 32 / in_features
+        derived_group_size = in_features / scales_last
+        if (
+            derived_bits.is_integer()
+            and 1 <= int(derived_bits) <= 8
+            and derived_group_size.is_integer()
+            and int(derived_group_size) >= 1
+            and (
+                int(derived_bits) != global_bits
+                or int(derived_group_size) != global_group_size
+            )
+        ):
+            overrides[path] = {
+                "group_size": int(derived_group_size),
+                "bits": int(derived_bits),
+            }
+    del weights
+    if not overrides:
+        return None
+    logger.info(
+        f"Derived mixed-precision quantization overrides for {len(overrides)} module(s) "
+        f"in {model_path.name} (config.json declared bits={global_bits}, group_size={global_group_size})"
+    )
+    return {"quantization": {**quantization, **overrides}}
+
+
 def _is_vlm_model_type(model_path: Path) -> bool:
     """Return True when the model_type is a VLM registered under ``mlx_vlm.models``.
 
@@ -173,6 +323,48 @@ def _is_vlm_model_type(model_path: Path) -> bool:
     return False  # Registered in both — use the mlx_lm path
 
 
+def _requires_bfloat16_activations(config: dict[str, Any]) -> bool:
+    """Return True for large-MoE models that overflow float16 activations.
+
+    Models with >=512 routed experts and hidden_size >=4096 (Qwen3.5-397B
+    JANG_1L & friends) legitimately produce activations far beyond float16's
+    ±65504 range: their shared-expert down projections carry weight outliers
+    up to ±15, which drive intermediate outputs to ~2e5. In float16 that
+    overflows to inf, NaNs the residual stream and collapses generation to a
+    degenerate repeated token (argmax of all-NaN logits = token 0 = "!").
+    The JANG ecosystem runs exactly these models in bfloat16; mirror that
+    rule so float16-only hardware stays on the float16 path.
+    """
+    text_config_value: object = config.get("text_config")
+    text_config: dict[str, Any] = (
+        cast("dict[str, Any]", text_config_value)
+        if isinstance(text_config_value, dict)
+        else config
+    )
+    n_experts = 0
+    for key in ("num_experts", "num_local_experts", "n_routed_experts"):
+        value: object = text_config.get(key)
+        if isinstance(value, int) and not isinstance(value, bool):
+            n_experts = max(n_experts, value)
+    hidden_value: object = text_config.get("hidden_size")
+    hidden_size = hidden_value if isinstance(hidden_value, int) else 0
+    return n_experts >= 512 and hidden_size >= 4096
+
+
+def _maybe_enable_bfloat16_activations(
+    model: nn.Module, config: dict[str, Any], model_name: str
+) -> None:
+    """Switch large-MoE models to bfloat16 activations (see ``_requires_bfloat16_activations``)."""
+    if not _requires_bfloat16_activations(config):
+        return
+    # mlx ships no stubs; set_dtype's return type is unknown to the checker.
+    model.set_dtype(mx.bfloat16)  # type: ignore[reportUnknownMemberType]
+    logger.info(
+        f"bfloat16 activations enabled for {model_name} "
+        f"(large MoE; float16 activations would overflow to inf)"
+    )
+
+
 def load_model_vlm_aware(
     model_path: Path,
     lazy: bool,
@@ -202,8 +394,19 @@ def load_model_vlm_aware(
         config: dict[str, Any] = (
             cast("dict[str, Any]", loaded) if isinstance(loaded, dict) else {}
         )
+        _maybe_enable_bfloat16_activations(
+            cast(nn.Module, model), config, model_path.name
+        )
         return cast(nn.Module, model), config
-    return load_model(model_path, lazy=lazy, strict=strict)
+    mixed_precision = derive_mixed_precision_quantization(model_path)
+    if mixed_precision is not None:
+        model, config = load_model(
+            model_path, lazy=lazy, strict=strict, model_config=mixed_precision
+        )
+    else:
+        model, config = load_model(model_path, lazy=lazy, strict=strict)
+    _maybe_enable_bfloat16_activations(model, config, model_path.name)
+    return model, config
 
 
 def get_weights_size(model_shard_meta: ShardMetadata) -> Memory:
@@ -608,6 +811,12 @@ def get_eos_token_ids_for_model(model_id: ModelId) -> list[int] | None:
         return [248046, 248044]
     elif "gemma-4" in model_id_lower or "gemma-3" in model_id_lower:
         return [1, 106, 50]
+    elif "gemma" in model_id_lower:
+        # Gemma-2 family chat models (incl. translategemma) terminate turns
+        # with <end_of_turn> (106); their tokenizer/generation configs only
+        # declare <eos> (1), so generation would otherwise run to max_tokens
+        # emitting <end_of_turn> repeatedly.
+        return [1, 106]
     return None
 
 
@@ -964,9 +1173,103 @@ def render_chat_template(
     return prompt
 
 
+def adapt_messages_for_translation_template(
+    messages: list[dict[str, ChatTemplateValue]],
+    source_lang_code: str,
+    target_lang_code: str,
+) -> list[dict[str, Any]]:
+    """Adapt generic chat messages for translation-style chat templates.
+
+    Some models (e.g. TranslateGemma) ship chat templates that hard-require
+    structured translation content:
+
+    - the conversation must start with a user message and strictly alternate
+      user/assistant (``raise_exception`` otherwise),
+    - a system role is forbidden,
+    - user ``content`` must be a one-item iterable of
+      ``{type: 'text', source_lang_code, target_lang_code, text}``,
+    - assistant ``content`` must be a plain string.
+
+    Plain OpenAI-style messages (string content, optional system messages)
+    fail all four requirements, so EXO adapts them when the model card
+    declares a ``[translation]`` language pair:
+
+    - system/developer messages are dropped (the language pair replaces the
+      system prompt role for these models),
+    - user content is normalized to its text and wrapped into the structured
+      form with the card's language pair,
+    - consecutive same-role messages are collapsed to preserve alternation,
+    - leading assistant messages are dropped so the conversation starts with
+      a user message,
+    - assistant content is normalized to a plain string.
+    """
+    adapted: list[dict[str, Any]] = []
+    dropped_system = 0
+    for msg in messages:
+        role = msg.get("role")
+        if role not in ("user", "assistant"):
+            dropped_system += 1
+            continue
+        text = _translation_content_text(msg.get("content"))
+        if role == "user":
+            if adapted and adapted[-1]["role"] == "user":
+                # Collapse consecutive user messages to keep alternation.
+                previous_items = cast("list[dict[str, Any]]", adapted[-1]["content"])
+                previous_item = previous_items[0]
+                previous_item["text"] = f"{previous_item['text']}\n{text}"
+                continue
+            adapted.append(
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "source_lang_code": source_lang_code,
+                            "target_lang_code": target_lang_code,
+                            "text": text,
+                        }
+                    ],
+                }
+            )
+        else:
+            if not adapted:
+                continue  # Conversation must start with a user message.
+            if adapted[-1]["role"] == "assistant":
+                # Collapse consecutive assistant messages to keep alternation.
+                adapted[-1]["content"] = f"{adapted[-1]['content']}\n{text}"
+                continue
+            adapted.append({"role": "assistant", "content": text})
+    if dropped_system:
+        logger.info(
+            f"Translation template: dropped {dropped_system} system/developer message(s) "
+            f"({source_lang_code} -> {target_lang_code} translation prompt replaces them)"
+        )
+    return adapted
+
+
+def _translation_content_text(content: ChatTemplateValue | None) -> str:
+    """Normalize message content (string or typed parts) to plain text."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        texts: list[str] = []
+        for part in content:
+            if isinstance(part, dict):
+                part_text: object | None = part.get("text")
+                if isinstance(part_text, str):
+                    texts.append(part_text)
+            elif isinstance(part, str):
+                texts.append(part)
+        return "\n".join(texts)
+    return str(content)
+
+
 def apply_chat_template(
     tokenizer: TokenizerWrapper,
     task_params: TextGenerationTaskParams,
+    translation: TranslationCardConfig | None = None,
 ) -> str:
     messages: list[dict[str, ChatTemplateValue]] = []
     if task_params.chat_template_messages is not None:
@@ -983,6 +1286,21 @@ def apply_chat_template(
                 logger.warning("Received message with empty content, skipping")
                 continue
             messages.append({"role": msg.role, "content": msg.content})
+
+    if translation is not None:
+        # Per-request language pair overrides the card's default pair.
+        source_lang_code = (
+            task_params.translation_source_lang_code or translation.source_lang_code
+        )
+        target_lang_code = (
+            task_params.translation_target_lang_code or translation.target_lang_code
+        )
+        messages = cast(
+            "list[dict[str, ChatTemplateValue]]",
+            adapt_messages_for_translation_template(
+                messages, source_lang_code, target_lang_code
+            ),
+        )
 
     prompt = render_chat_template(tokenizer, messages, task_params)
     logger.debug(prompt)
