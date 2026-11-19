@@ -4,7 +4,8 @@ Reimplements the mflux-0.24 qwen21 transformer semantics against MLX primitives
 only, shaped for EXO's two-stream joint-block integration:
 - LayerNorm (affine=False) with per-token shared modulation chunks
 - tanh gating on both attention and FFN branches
-- zero-centered RMSNorm q/k normalization (weight + 1)
+- plain RMSNorm q/k normalization (checkpoint weight used directly;
+  only txt_in.text_norm is zero-centered, weight + 1)
 - RoPE with theta 10000, axes (16, 56, 56) over (t, h, w)
 - scale-only output norm + AdaLayerNormContinuous-style final projection
 """
@@ -26,6 +27,7 @@ EPS = 1e-6
 MOD_PER_TOKEN = 4 * INNER_DIM  # modulation output per row (scale1, gate1, scale2, gate2)
 
 TIME_DIM = 256  # sinusoidal timestep features
+MODEL_PRECISION = mx.bfloat16  # mflux 0.24 ModelConfig.precision for qwen21
 
 
 class Qwen21Timesteps(nn.Module):
@@ -46,7 +48,11 @@ class Qwen21Timesteps(nn.Module):
 
     def __call__(self, timestep: mx.array) -> mx.array:
         args = timestep.astype(mx.float32)[:, None] * self.time_factor * self._freqs[None, :]
-        return mx.concatenate([mx.cos(args), mx.sin(args)], axis=-1)
+        # mflux casts the sinusoid features to ModelConfig.precision (bf16)
+        # before the embedder MLP; match it to keep the stream bf16.
+        return mx.concatenate([mx.cos(args), mx.sin(args)], axis=-1).astype(
+            MODEL_PRECISION
+        )
 
 
 class Qwen21TimestepEmbedder(nn.Module):
@@ -188,8 +194,8 @@ class Qwen21Attention(nn.Module):
         self.to_q = nn.Linear(INNER_DIM, INNER_DIM, bias=False)
         self.to_k = nn.Linear(INNER_DIM, INNER_DIM, bias=False)
         self.to_v = nn.Linear(INNER_DIM, INNER_DIM, bias=False)
-        self.norm_q = Qwen21ZeroCenterRMSNorm(HEAD_DIM)
-        self.norm_k = Qwen21ZeroCenterRMSNorm(HEAD_DIM)
+        self.norm_q = nn.RMSNorm(HEAD_DIM, eps=EPS)
+        self.norm_k = nn.RMSNorm(HEAD_DIM, eps=EPS)
         self.to_out = [nn.Linear(INNER_DIM, INNER_DIM, bias=False)]
 
     def project(self, hidden: mx.array) -> tuple[mx.array, mx.array, mx.array]:

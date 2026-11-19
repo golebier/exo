@@ -11,8 +11,8 @@ from pathlib import Path
 from typing import Any
 
 import mlx.core as mx
-from mflux.models.common.config import ModelConfig as MfluxModelConfig
-from mflux.models.common.config.config import Config as MfluxConfig
+import numpy as np
+from PIL import Image
 
 from exo.worker.engines.image.config import ImageModelConfig
 from exo.worker.engines.image.models.base import (
@@ -22,7 +22,7 @@ from exo.worker.engines.image.models.base import (
 )
 from exo.worker.engines.image.models.qwen21 import weights as weights_mod
 from exo.worker.engines.image.models.qwen21.model import Qwen21Model
-from exo.worker.engines.image.models.qwen21.scheduler import install_scheduler
+from exo.worker.engines.image.models.qwen21.scheduler import SAMPLE_SIGMAS
 from exo.worker.engines.image.models.qwen21.text_encoder import encode_prompts
 from exo.worker.engines.image.models.qwen21.transformer import (
     Qwen21Transformer,
@@ -43,7 +43,7 @@ class _LatentCreator:
         return mx.random.normal(
             shape=(1, (height // 16) * (width // 16), 64),
             key=mx.random.key(seed),
-        )
+        ).astype(mx.bfloat16)  # mflux LatentCreator casts to ModelConfig.precision
 
     @staticmethod
     def unpack_latents(latents: mx.array, height: int, width: int) -> mx.array:
@@ -193,7 +193,10 @@ class Qwen21ModelAdapter(ModelAdapter[Qwen21Model, Qwen21Transformer]):
     ) -> mx.array:
         del runtime_config, pooled_prompt_embeds, hidden_states
         batch = 1
-        timestep = mx.full((batch,), float(t), dtype=mx.float32)
+        # The runner passes the raw loop index (0..num_steps-1); map it to the
+        # Turbo sigma value exactly like mflux 0.24 QwenImage21TurboPipeline.
+        idx = min(max(int(t), 0), len(SAMPLE_SIGMAS) - 1)
+        timestep = mx.full((batch,), float(SAMPLE_SIGMAS[idx]), dtype=mx.float32)
         return self._time_text(timestep)
 
     def _time_text(self, timestep: mx.array) -> mx.array:
@@ -248,49 +251,22 @@ class Qwen21ModelAdapter(ModelAdapter[Qwen21Model, Qwen21Transformer]):
         runtime_config: Any,
         seed: int,  # noqa: ARG002
         prompt: str,  # noqa: ARG002
-    ):
+    ) -> Image.Image:
         latents = _LatentCreator.unpack_latents(
             latents, runtime_config.height, runtime_config.width
         )
-        decoded = self._model.vae.decode(latents)
-        from mflux.utils.image_util import ImageUtil  # noqa: PLC0415
-
-        return ImageUtil.to_image(
-            decoded_latents=decoded,
-            config=runtime_config,
-            seed=seed,
-            prompt=prompt,
-            quantization=self._model.bits,
-            lora_paths=self._model.lora_paths,
-            lora_scales=self._model.lora_scales,
-            image_path=runtime_config.image_path,
-            image_strength=runtime_config.image_strength,
-            generation_time=0,
-        ).image
+        decoded = self._model.vae.decode(latents)  # [1, 3, H, W] in [-1, 1]
+        # mflux ImageUtil.to_pil equivalent: denormalize to [0, 1] then to
+        # uint8 BHWC.
+        arr = np.clip(
+            np.asarray(decoded.astype(mx.float32)).transpose(0, 2, 3, 1) / 2 + 0.5,
+            0.0,
+            1.0,
+        )
+        pixels = (arr[0] * 255).round().astype(np.uint8)
+        return Image.fromarray(pixels)
 
     def create_latents(self, seed: int, runtime_config: Any) -> mx.array:
         return _LatentCreator.create_noise(
             seed, runtime_config.height, runtime_config.width
         )
-
-
-def build_runtime_config(
-    model_id: str,
-    height: int,
-    width: int,
-    steps: int,
-    seed: int,
-) -> Any:
-    """mflux Config for qwen21 with the Turbo scheduler injected."""
-    model_config = MfluxModelConfig.from_name(
-        model_name="qwen-image-2.1-turbo", base_model=None
-    )
-    config = MfluxConfig(
-        num_inference_steps=steps,
-        height=height,
-        width=width,
-        guidance=None,
-        seed=seed,
-    )
-    install_scheduler(config)
-    return config, model_config

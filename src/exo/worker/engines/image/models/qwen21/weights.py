@@ -105,10 +105,12 @@ def load_transformer(model_dir: Path) -> Qwen21Transformer:
             "weight": data[f"{f}.attn.to_v.weight"]
         }
         params[f"{p}.attn.norm_q"] = {
-            "weight": data[f"{f}.attn.norm_q.weight"] + 1
+            # Plain RMSNorm weight (mean ~1.14 in the checkpoint); mflux 0.24
+            # maps it directly into nn.RMSNorm with no transform.
+            "weight": data[f"{f}.attn.norm_q.weight"]
         }
         params[f"{p}.attn.norm_k"] = {
-            "weight": data[f"{f}.attn.norm_k.weight"] + 1
+            "weight": data[f"{f}.attn.norm_k.weight"]
         }
         params[f"{p}.attn.to_out.0"] = {
             "weight": data[f"{f}.attn.to_out.0.weight"]

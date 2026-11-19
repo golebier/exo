@@ -11,6 +11,8 @@ short-circuits the property getter).
 
 import mlx.core as mx
 
+# 8 Turbo sigma nodes; the sampler table is nodes + terminal 0.0 (9 entries),
+# exactly like mflux 0.24 Qwen21TurboScheduler (nodes + [0.0]).
 SAMPLE_SIGMAS: tuple[float, ...] = (
     1.0,
     0.978453,
@@ -27,7 +29,7 @@ class Qwen21TurboScheduler:
     """8-step Euler with the upstream Turbo sigma schedule."""
 
     def __init__(self, sigmas: tuple[float, ...] = SAMPLE_SIGMAS) -> None:
-        self._sigmas = tuple(sigmas)
+        self._sigmas = tuple(sigmas) + (0.0,)
 
     @property
     def sigmas(self) -> mx.array:
@@ -44,9 +46,10 @@ class Qwen21TurboScheduler:
         latents: mx.array,
         seed: int | None = None,  # noqa: ARG002 (mflux BaseScheduler signature)
     ) -> mx.array:
-        dt = (self._sigmas[timestep + 1] - self._sigmas[timestep])
-        dt_arr = mx.array(dt, dtype=latents.dtype)
-        return latents + noise.astype(latents.dtype) * dt_arr
+        # Like mflux 0.24: add in float32, then cast back to the stream dtype.
+        dt = self._sigmas[timestep + 1] - self._sigmas[timestep]
+        out = latents.astype(mx.float32) + noise.astype(mx.float32) * dt
+        return out.astype(latents.dtype)
 
     def scale_model_input(self, latents: mx.array, timestep: int) -> mx.array:  # noqa: ARG002
         return latents

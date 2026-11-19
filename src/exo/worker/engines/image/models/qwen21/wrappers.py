@@ -16,7 +16,6 @@ from exo.worker.engines.image.models.qwen21.transformer import (
     HIDDEN_DIM,
     NUM_HEADS,
     Qwen21TransformerBlock,
-    Qwen21ZeroCenterRMSNorm,
     apply_rope_21,
 )
 from exo.worker.engines.image.pipeline.block_wrapper import (
