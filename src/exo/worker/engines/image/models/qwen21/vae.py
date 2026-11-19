@@ -199,6 +199,9 @@ class Qwen21Vae:
 
     def __init__(self) -> None:
         self.decoder = Qwen21VaeDecoder()
+        # Checkpoint top-level `conv2` (64->64 1x1); mflux decode order is
+        # unnormalize -> post_quant_conv -> decoder -> [:, :3].
+        self.post_quant_conv = nn.Conv2d(LATENT_CHANNELS, LATENT_CHANNELS, 1)
 
     def decode(self, latents: mx.array) -> mx.array:
         if latents.ndim == 5:
@@ -208,4 +211,5 @@ class Qwen21Vae:
         mean = mx.array(LATENTS_MEAN, dtype=mx.float32).reshape(1, LATENT_CHANNELS, 1, 1)
         std = mx.array(LATENTS_STD, dtype=mx.float32).reshape(1, LATENT_CHANNELS, 1, 1)
         latents = latents * std + mean
+        latents = conv_nchw(self.post_quant_conv, latents)
         return self.decoder(latents)

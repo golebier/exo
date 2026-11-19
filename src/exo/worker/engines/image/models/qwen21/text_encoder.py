@@ -27,16 +27,12 @@ MROPE_SECTION = (24, 20, 20)
 VOCAB_SIZE = 151936
 MAX_LENGTH = 2048
 
-SYSTEM_PREFIX = (
-    "<|im_start|>system\nDescribe the image by detailing the color, shape, size, "
-    "texture, quantity, text, spatial relationships of the objects and background: "
-    "<|im_end|>\n<|im_start|>user\n"
-)
-
-# mflux 0.24 PROMPT_TEMPLATE_T2I verbatim (leading newline matters).
+# mflux 0.24 Qwen21PromptEncoder verbatim.
+SYSTEM_PROMPT = "Comprehend and analyze the provided prompt."
+SYSTEM_PREFIX = f"<|im_start|>system\n{SYSTEM_PROMPT}<|im_end|>\n"
 PROMPT_TEMPLATE_T2I = (
-    "\nDescribe the image by detailing the color, shape, size, texture, quantity, "
-    "text, spatial relationships of the objects and background: {}"
+    f"<|im_start|>system\n{SYSTEM_PROMPT}<|im_end|>\n"
+    "<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n"
 )
 
 
@@ -255,6 +251,9 @@ class Qwen21Tokenizer:
         return len(input_ids)
 
     def tokenize(self, prompt: str) -> dict[str, np.ndarray]:
+        """Tokenize the FULL rendered template — mflux encodes the whole
+        sequence and drops the system-prefix positions from the hidden states
+        and mask AFTER the tower (dropping before would shift the positions)."""
         rendered = PROMPT_TEMPLATE_T2I.format(prompt)
         encoded = self._tokenizer(  # pyright: ignore[reportAny]
             [rendered],
@@ -262,14 +261,14 @@ class Qwen21Tokenizer:
             truncation=True,
             max_length=MAX_LENGTH,
             return_tensors="np",
-            add_special_tokens=False,
         )
         input_ids = np.asarray(encoded["input_ids"], dtype=np.int64)  # pyright: ignore[reportAny]
         attention_mask = np.asarray(encoded["attention_mask"], dtype=np.int64)  # pyright: ignore[reportAny]
-        # Drop the system prefix tokens (positions 0..prefix_len) as in mflux 0.24.
-        input_ids = input_ids[:, self._prefix_len :]
-        attention_mask = attention_mask[:, self._prefix_len :]
         return {"input_ids": input_ids, "attention_mask": attention_mask}
+
+    @property
+    def prefix_len(self) -> int:
+        return self._prefix_len
 
 
 def encode_prompts(
@@ -284,12 +283,16 @@ def encode_prompts(
         if prompt in prompt_cache:
             results.append(prompt_cache[prompt])
             continue
-        effective = prompt if prompt != "" else " "
-        tokens = tokenizer.tokenize(effective)
+        if not prompt or not prompt.strip():
+            prompt = " "
+        tokens = tokenizer.tokenize(prompt)
         input_ids = mx.array(tokens["input_ids"])
         attention_mask = mx.array(tokens["attention_mask"])
         hidden = encoder(input_ids, attention_mask)
-        pair = (hidden, attention_mask)
+        # Drop the system-prefix positions from embeds AND mask after encoding
+        # (mflux 0.24 Qwen21PromptEncoder.encode_prompt).
+        drop = tokenizer.prefix_len
+        pair = (hidden[:, drop:, :], attention_mask[:, drop:])
         prompt_cache[prompt] = pair
         results.append(pair)
     return results

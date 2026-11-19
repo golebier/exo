@@ -22,7 +22,10 @@ from exo.worker.engines.image.models.base import (
 )
 from exo.worker.engines.image.models.qwen21 import weights as weights_mod
 from exo.worker.engines.image.models.qwen21.model import Qwen21Model
-from exo.worker.engines.image.models.qwen21.scheduler import SAMPLE_SIGMAS
+from exo.worker.engines.image.models.qwen21.scheduler import (
+    Qwen21TurboScheduler,
+    SAMPLE_SIGMAS,
+)
 from exo.worker.engines.image.models.qwen21.text_encoder import encode_prompts
 from exo.worker.engines.image.models.qwen21.transformer import (
     Qwen21Transformer,
@@ -141,6 +144,18 @@ class Qwen21ModelAdapter(ModelAdapter[Qwen21Model, Qwen21Transformer]):
     def _get_latent_creator(self) -> type:
         return _LatentCreator
 
+    def _ensure_turbo_scheduler(self, runtime_config: Any) -> None:
+        """Inject the Turbo schedule into the runner's mflux Config.
+
+        The runner accesses config.scheduler BEFORE the first per-step adapter
+        hook (scale_model_input at the top of the diffusion loop), and the base
+        adapter's create_latents would resolve 'linear' to LinearScheduler. The
+        adapter's own create_latents is the first hook that runs, so the
+        injection happens there (idempotent via the _scheduler attribute).
+        """
+        if getattr(runtime_config, "_scheduler", None) is None:
+            runtime_config._scheduler = Qwen21TurboScheduler()  # noqa: SLF001
+
     def get_joint_block_wrappers(
         self,
         text_seq_len: int,
@@ -214,8 +229,10 @@ class Qwen21ModelAdapter(ModelAdapter[Qwen21Model, Qwen21Transformer]):
         cond_image_grid: tuple[int, int, int] | list[tuple[int, int, int]] | None = None,
         kontext_image_ids: mx.array | None = None,
     ) -> RotaryEmbeddings:
-        del prompt_embeds, cond_image_grid, kontext_image_ids, encoder_hidden_states_mask
-        text_seq_len = 1024  # fixed ladder length (see encode: max_length 2048 minus prefix)
+        del cond_image_grid, kontext_image_ids, encoder_hidden_states_mask
+        # The rope table spans [text | image] positions; the text length is the
+        # (prefix-dropped) prompt length, exactly like mflux pos_embed(text_len, ...).
+        text_seq_len = int(prompt_embeds.shape[1])
         height = runtime_config.height // 16
         width = runtime_config.width // 16
         key = (text_seq_len, height, width)
@@ -267,6 +284,7 @@ class Qwen21ModelAdapter(ModelAdapter[Qwen21Model, Qwen21Transformer]):
         return Image.fromarray(pixels)
 
     def create_latents(self, seed: int, runtime_config: Any) -> mx.array:
+        self._ensure_turbo_scheduler(runtime_config)
         return _LatentCreator.create_noise(
             seed, runtime_config.height, runtime_config.width
         )

@@ -42,7 +42,8 @@ class Qwen21JointBlockWrapper(JointBlockWrapper[Qwen21TransformerBlock]):
     def set_encoder_mask(self, mask: mx.array | None) -> None:
         self._encoder_hidden_states_mask = mask
 
-    def _text_additive_mask(self, joint_seq_len: int) -> mx.array | None:
+    def _joint_valid(self, joint_seq_len: int) -> mx.array | None:
+        """[batch, seq] float validity over [text | image] (image all valid)."""
         mask = self._encoder_hidden_states_mask
         if mask is None:
             return None
@@ -51,11 +52,27 @@ class Qwen21JointBlockWrapper(JointBlockWrapper[Qwen21TransformerBlock]):
         text_valid = mask.astype(mx.float32)
         img_seq_len = joint_seq_len - self._text_seq_len
         ones_img = mx.ones((text_valid.shape[0], img_seq_len), dtype=mx.float32)
-        joint_mask = mx.concatenate([text_valid, ones_img], axis=1)
-        if mx.all(joint_mask >= 0.999):
+        return mx.concatenate([text_valid, ones_img], axis=1)
+
+    def _patch_key_mask(self, joint_seq_len: int) -> mx.array | None:
+        """PATCHED mode: queries are image rows only, so key validity is the
+        whole story (mflux causal clause is trivially true for image rows)."""
+        valid = self._joint_valid(joint_seq_len)
+        if valid is None or bool(mx.all(valid >= 0.999).item()):
             return None
-        additive = (1.0 - joint_mask) * NEG_INF
+        additive = (1.0 - valid) * NEG_INF
         return additive.reshape((additive.shape[0], 1, 1, additive.shape[1]))
+
+    def _block_causal_mask(self, joint_seq_len: int) -> mx.array:
+        """CACHING mode with padding: mflux 0.24 block-causal mask verbatim —
+        allowed = (key <= query) | (query >= text_len), ANDed with key validity.
+        Cast to the bf16 activation stream like mflux (fast SDPA promotion)."""
+        valid = self._joint_valid(joint_seq_len)
+        assert valid is not None
+        idx = mx.arange(joint_seq_len)
+        allowed = (idx[None, :] <= idx[:, None]) | (idx[:, None] >= self._text_seq_len)
+        allowed = allowed[None, None, :, :] & (valid[:, None, None, :] > 0.5)
+        return mx.where(allowed, 0.0, NEG_INF).astype(mx.bfloat16)
 
     def _text_causal_mask(self, batch: int) -> mx.array:
         n = self._text_seq_len
@@ -134,9 +151,16 @@ class Qwen21JointBlockWrapper(JointBlockWrapper[Qwen21TransformerBlock]):
         self, query: mx.array, key: mx.array, value: mx.array
     ) -> mx.array:
         full_seq = key.shape[2]
-        mask = self._text_additive_mask(full_seq)
-        if mask is None and self._text_seq_len > 0:
-            # segmented path: causal over text region, full attention for image
+        if self._mode == BlockWrapperMode.PATCHED:
+            # Patch queries are image rows: they attend everything; only key
+            # validity (padding) applies.
+            mask = self._patch_key_mask(full_seq)
+            return mx.fast.scaled_dot_product_attention(
+                query, key, value, scale=self._head_dim**-0.5, mask=mask
+            )
+        valid = self._joint_valid(full_seq)
+        if valid is None or bool(mx.all(valid >= 0.999).item()):
+            # padding-free: segmented path (causal over text, full for image)
             batch = query.shape[0]
             txt_q = query[:, :, : self._text_seq_len, :]
             txt_k = key[:, :, : self._text_seq_len, :]
@@ -157,6 +181,7 @@ class Qwen21JointBlockWrapper(JointBlockWrapper[Qwen21TransformerBlock]):
             )
             return mx.concatenate([txt_out, img_out], axis=2)
 
+        mask = self._block_causal_mask(full_seq)
         return mx.fast.scaled_dot_product_attention(
             query, key, value, scale=self._head_dim**-0.5, mask=mask
         )
@@ -189,6 +214,6 @@ class Qwen21JointBlockWrapper(JointBlockWrapper[Qwen21TransformerBlock]):
             block.norm2(encoder_hidden_states), txt_scale2
         )
         hidden_states = hidden_states + mx.tanh(img_gate2) * block.ff(img_normed2)
-        encoder_hidden_states = encoder_hidden_states + txt_gate2 * block.ff(txt_normed2)
+        encoder_hidden_states = encoder_hidden_states + mx.tanh(txt_gate2) * block.ff(txt_normed2)
 
         return encoder_hidden_states, hidden_states
