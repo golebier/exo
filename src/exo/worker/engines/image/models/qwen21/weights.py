@@ -282,14 +282,17 @@ def load_vae(model_dir: Path) -> vae_mod.Qwen21Vae:
         "bias": flat("decoder.head.2.bias"),
     }
 
-    # strict load_weights requires full coverage of the target module, so the
-    # decoder gets its map and the wrapper gets post_quant_conv separately.
-    decoder.load_weights(
-        [(k, v) for k, v in params.items() if not k.startswith("post_quant_conv")],
-        strict=True,
-    )
+    # strict load_weights requires full coverage of the target module. Params
+    # are keyed with the full-wrapper scope ('decoder.conv_in', ...); strip the
+    # scope when loading into the decoder module itself.
+    decoder_params = [
+        (k.removeprefix("decoder."), v)
+        for k, v in params.items()
+        if k.startswith("decoder.")
+    ]
+    decoder.load_weights(decoder_params, strict=True)
     wrapper.load_weights(
-        [(k, v) for k, v in params.items() if k.startswith("post_quant_conv")],
+        [(k, v) for k, v in params.items() if k == "post_quant_conv"],
         strict=True,
     )
     mx.eval(wrapper.parameters())
