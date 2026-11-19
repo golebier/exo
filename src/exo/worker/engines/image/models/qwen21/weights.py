@@ -299,6 +299,10 @@ def load_vae(model_dir: Path) -> vae_mod.Qwen21Vae:
         else:
             decoder_params.append((prefix, value))
     decoder.load_weights(decoder_params, strict=True)
+    # Qwen21Vae is a plain wrapper (not nn.Module); route the post_quant_conv
+    # load through the inner decoder module's load_weights bound to the
+    # wrapper so the leaf keys resolve at wrapper scope.
+    wrapper.load_weights = type(wrapper.decoder).load_weights.__get__(wrapper)  # type: ignore[method-assign]
     wrapper.load_weights(
         [
             (f"post_quant_conv.{leaf}", leaf_value)
@@ -306,7 +310,7 @@ def load_vae(model_dir: Path) -> vae_mod.Qwen21Vae:
         ],
         strict=True,
     )
-    mx.eval(wrapper.parameters())
+    mx.eval(wrapper.post_quant_conv.parameters())
     return wrapper
 
 
