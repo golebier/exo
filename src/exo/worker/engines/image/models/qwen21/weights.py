@@ -196,6 +196,14 @@ def load_vae(model_dir: Path) -> vae_mod.Qwen21Vae:
             w = w.reshape(w.shape[0], w.shape[2], w.shape[3], w.shape[4])
         return w
 
+    def conv_weight_post(name: str) -> mx.array:
+        # VAE top-level quant convs ship 5-D [out, in, 1, 1, 1]; squeeze the
+        # singleton temporal axis (keep [out, in]) for the 1x1 conv layer.
+        w = data[name]
+        if w.ndim == 5:
+            w = w.reshape(w.shape[0], w.shape[1])
+        return w
+
     # decoder.conv1 (flat) -> conv_in
     params["decoder.conv_in"] = {
         "weight": conv_weight("decoder.conv1.weight"),
@@ -261,14 +269,29 @@ def load_vae(model_dir: Path) -> vae_mod.Qwen21Vae:
                 "weight": conv_weight(f"{src}.resample.1.weight"),
                 "bias": flat(f"{src}.resample.1.bias"),
             }
+    # post_quant_conv: checkpoint ships it as top-level `conv2` (quant_conv is
+    # the encoder-side `conv1`; the decoder-only engine never uses it).
+    params["post_quant_conv"] = {
+        "weight": conv_weight_post("conv2.weight"),
+        "bias": flat("conv2.bias"),
+    }
     params["decoder.norm_out"] = {"gamma": gamma("decoder.head.0.gamma")}
     params["decoder.conv_out"] = {
         "weight": conv_weight("decoder.head.2.weight"),
         "bias": flat("decoder.head.2.bias"),
     }
 
-    decoder.load_weights(list(params.items()), strict=True)
-    mx.eval(decoder.parameters())
+    # strict load_weights requires full coverage of the target module, so the
+    # decoder gets its map and the wrapper gets post_quant_conv separately.
+    decoder.load_weights(
+        [(k, v) for k, v in params.items() if not k.startswith("post_quant_conv")],
+        strict=True,
+    )
+    wrapper.load_weights(
+        [(k, v) for k, v in params.items() if k.startswith("post_quant_conv")],
+        strict=True,
+    )
+    mx.eval(wrapper.parameters())
     return wrapper
 
 
