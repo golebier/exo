@@ -285,17 +285,25 @@ def load_vae(model_dir: Path) -> vae_mod.Qwen21Vae:
         "bias": flat("decoder.head.2.bias"),
     }
 
-    # strict load_weights requires full coverage of the target module. Params
-    # are keyed with the full-wrapper scope ('decoder.conv_in', ...); strip the
-    # scope when loading into the decoder module itself.
-    decoder_params = [
-        (k.removeprefix("decoder."), v)
-        for k, v in params.items()
-        if k.startswith("decoder.")
-    ]
+    # strict load_weights compares LEAF keys, so dict-valued groups must be
+    # flattened and the full-wrapper scope ('decoder.') stripped first.
+    decoder_params: list[tuple[str, mx.array]] = []
+    for key, value in params.items():
+        if not key.startswith("decoder."):
+            continue
+        prefix = key.removeprefix("decoder.")
+        if isinstance(value, dict):
+            decoder_params.extend(
+                (f"{prefix}.{leaf}", leaf_value) for leaf, leaf_value in value.items()
+            )
+        else:
+            decoder_params.append((prefix, value))
     decoder.load_weights(decoder_params, strict=True)
     wrapper.load_weights(
-        [(k, v) for k, v in params.items() if k == "post_quant_conv"],
+        [
+            (f"post_quant_conv.{leaf}", leaf_value)
+            for leaf, leaf_value in params["post_quant_conv"].items()
+        ],
         strict=True,
     )
     mx.eval(wrapper.parameters())
