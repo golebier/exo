@@ -202,10 +202,11 @@ def load_vae(model_dir: Path) -> vae_mod.Qwen21Vae:
         return w
 
     def conv_weight_post(name: str) -> mx.array:
-        # 1x1 quant convs reduce to [out, in] after squeezing T,kH,kW=1.
+        # 1x1 quant convs: squeeze T -> [out, in, 1, 1], transpose to the MLX
+        # Conv2d layout [out, kH=1, kW=1, in].
         w = data[name]
         if w.ndim == 5:
-            w = w.squeeze(2).squeeze(2).squeeze(2)
+            w = w.squeeze(2).transpose(0, 2, 3, 1)
         return w
 
     # decoder.conv1 (flat) -> conv_in
