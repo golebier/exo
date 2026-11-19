@@ -191,17 +191,18 @@ def load_vae(model_dir: Path) -> vae_mod.Qwen21Vae:
         return g.reshape(-1)
 
     def conv_weight(name: str) -> mx.array:
+        # Conv weights ship as [out, T, kH, kW, in] (MLX conv3d layout, T=1);
+        # the 2-D conv wants [out, kH, kW, in] -> squeeze the temporal axis.
         w = data[name]
-        if w.ndim == 5:  # [out, T, kH, kW, in]
-            w = w.reshape(w.shape[0], w.shape[2], w.shape[3], w.shape[4])
+        if w.ndim == 5:
+            w = w.squeeze(2)
         return w
 
     def conv_weight_post(name: str) -> mx.array:
-        # VAE top-level quant convs ship 5-D [out, in, 1, 1, 1]; squeeze the
-        # singleton temporal axis (keep [out, in]) for the 1x1 conv layer.
+        # 1x1 quant convs: [out, in] after the temporal squeeze.
         w = data[name]
         if w.ndim == 5:
-            w = w.reshape(w.shape[0], w.shape[1])
+            w = w.squeeze(2).squeeze(2).squeeze(2)
         return w
 
     # decoder.conv1 (flat) -> conv_in
