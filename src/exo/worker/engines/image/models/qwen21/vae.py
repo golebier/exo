@@ -24,7 +24,8 @@ class ChannelNorm(nn.Module):
         value = x.astype(mx.float32)
         norm = mx.maximum(mx.sqrt(mx.sum(value * value, axis=1, keepdims=True)), 1e-12)
         value = value / norm
-        return value.astype(x.dtype) * self.scale * self.gamma
+        # NCHW stream: gamma broadcasts as [1, C, 1, 1] (mflux text_mode).
+        return (value * self.scale * self.gamma[None, :, None, None]).astype(x.dtype)
 
 
 def conv_nchw(layer: nn.Conv2d, x: mx.array) -> mx.array:
