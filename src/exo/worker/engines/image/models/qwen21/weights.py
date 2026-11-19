@@ -20,8 +20,6 @@ from mlx import nn
 from exo.worker.engines.image.models.qwen21 import vae as vae_mod
 from exo.worker.engines.image.models.qwen21.transformer import (
     HIDDEN_DIM,
-    MOD_PER_TOKEN,
-    PROJECTED_DIM,
     Qwen21Transformer,
 )
 from exo.worker.engines.image.models.qwen21.text_encoder import Qwen21TextEncoder
@@ -55,49 +53,41 @@ def _dequantize_8bit(
 
 
 def load_transformer(model_dir: Path) -> Qwen21Transformer:
-    """Load the 7.56 GB MLX-8bit transformer with the modulation rename."""
+    """Load the 7.56 GB MLX-8bit transformer (key map verified vs checkpoint)."""
     data = _load_safetensors(model_dir / TRANSFORMER_FILE)
     data = _dequantize_8bit(data, "")
     model = Qwen21Transformer()
     params: dict[str, Any] = {}
 
-    params["time_text_embed.time_embedder.layers.0"] = {
-        "weight": data["time_text_embed.timestep_embedder.linear_1.weight"],
-        "bias": data["time_text_embed.timestep_embedder.linear_1.bias"],
+    # time_text_embed: weightless sinusoid + bias-free embedder (256 -> 4096 -> 4096)
+    params["time_text_embed.timestep_embedder.linear_1"] = {
+        "weight": data["time_text_embed.timestep_embedder.linear_1.weight"]
     }
-    params["time_text_embed.time_embedder.layers.2"] = {
-        "weight": data["time_text_embed.timestep_embedder.linear_2.weight"],
-        "bias": data["time_text_embed.timestep_embedder.linear_2.bias"],
-    }
-    params["time_text_embed.time_proj"] = {
-        "exponent": model.time_text_embed.time_proj.exponent
+    params["time_text_embed.timestep_embedder.linear_2"] = {
+        "weight": data["time_text_embed.timestep_embedder.linear_2.weight"]
     }
     params["txt_in.text_norm"] = {
         "weight": data["txt_in.text_norm.weight"] + 1
     }
     params["txt_in.in_layer"] = {
-        "weight": data["txt_in.in_layer.weight"],
-        "bias": data["txt_in.in_layer.bias"],
+        "weight": data["txt_in.in_layer.weight"]
     }
     params["txt_in.out_layer"] = {
-        "weight": data["txt_in.out_layer.weight"],
-        "bias": data["txt_in.out_layer.bias"],
+        "weight": data["txt_in.out_layer.weight"]
     }
     params["img_in"] = {
-        "weight": data["img_in.weight"],
-        "bias": data["img_in.bias"],
+        "weight": data["img_in.weight"]
     }
+    # checkpoint key modulation.1.* (Sequential(SiLU, Linear)) -> our modulation Linear;
+    # SiLU is applied explicitly in modulation_for()
     params["modulation"] = {
-        "weight": data["modulation.layers.1.weight"].reshape(MOD_PER_TOKEN, PROJECTED_DIM),
-        "bias": data["modulation.layers.1.bias"].reshape(MOD_PER_TOKEN),
+        "weight": data["modulation.1.weight"]
     }
     params["norm_out.linear"] = {
-        "weight": data["norm_out.linear.weight"],
-        "bias": data["norm_out.linear.bias"],
+        "weight": data["norm_out.linear.weight"]
     }
     params["proj_out"] = {
-        "weight": data["proj_out.weight"],
-        "bias": data["proj_out.bias"],
+        "weight": data["proj_out.weight"]
     }
 
     n_layers = len(model.transformer_blocks)
@@ -123,14 +113,14 @@ def load_transformer(model_dir: Path) -> Qwen21Transformer:
         params[f"{p}.attn.to_out.0"] = {
             "weight": data[f"{f}.attn.to_out.0.weight"]
         }
-        params[f"{p}.ff.gate_proj"] = {
-            "weight": data[f"{f}.ff.gate_proj.weight"]
+        params[f"{p}.ff.gate_layer"] = {
+            "weight": data[f"{f}.img_mlp.gate_layer.weight"]
         }
-        params[f"{p}.ff.up_proj"] = {
-            "weight": data[f"{f}.ff.up_proj.weight"]
+        params[f"{p}.ff.proj"] = {
+            "weight": data[f"{f}.img_mlp.proj.weight"]
         }
-        params[f"{p}.ff.down_proj"] = {
-            "weight": data[f"{f}.ff.down_proj.weight"]
+        params[f"{p}.ff.out"] = {
+            "weight": data[f"{f}.img_mlp.out.weight"]
         }
         params[f"{p}.norm2"] = {}
 

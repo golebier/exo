@@ -61,7 +61,7 @@ class Qwen21JointBlockWrapper(JointBlockWrapper[Qwen21TransformerBlock]):
     def _text_causal_mask(self, batch: int) -> mx.array:
         n = self._text_seq_len
         base = mx.triu(mx.full((n, n), NEG_INF, dtype=mx.float32), k=1)
-        return base[None, None, :, :].repeat(batch, axis=0)  # [b,1,n,n]
+        return mx.broadcast_to(base[None, None, :, :], (batch, 1, n, n))
 
     def _rope(
         self,
@@ -170,8 +170,8 @@ class Qwen21JointBlockWrapper(JointBlockWrapper[Qwen21TransformerBlock]):
         text_embeddings: mx.array,  # noqa: ARG002 (kept for interface parity)
     ) -> tuple[mx.array, mx.array]:
         block = self.block
-        txt_attn_out = attn_out[:, : self._text_seq_len, :]
-        img_attn_out = attn_out[:, self._text_seq_len :, :]
+        txt_attn_out = attn_out[:, :, : self._text_seq_len, :]
+        img_attn_out = attn_out[:, :, self._text_seq_len :, :]
 
         txt_out = block.attn.unproject(txt_attn_out)
         img_out = block.attn.unproject(img_attn_out)
@@ -180,8 +180,8 @@ class Qwen21JointBlockWrapper(JointBlockWrapper[Qwen21TransformerBlock]):
         txt_scale2, txt_gate2 = self._txt_mod
         assert img_scale2 is not None and txt_scale2 is not None
 
-        hidden_states = hidden_states + img_gate2 * img_out
-        encoder_hidden_states = encoder_hidden_states + txt_gate2 * txt_out
+        hidden_states = hidden_states + mx.tanh(img_gate2) * img_out
+        encoder_hidden_states = encoder_hidden_states + mx.tanh(txt_gate2) * txt_out
 
         img_normed2 = Qwen21TransformerBlock.modulate(
             block.norm2(hidden_states), img_scale2
@@ -189,7 +189,7 @@ class Qwen21JointBlockWrapper(JointBlockWrapper[Qwen21TransformerBlock]):
         txt_normed2 = Qwen21TransformerBlock.modulate(
             block.norm2(encoder_hidden_states), txt_scale2
         )
-        hidden_states = hidden_states + img_gate2 * block.ff(img_normed2)
+        hidden_states = hidden_states + mx.tanh(img_gate2) * block.ff(img_normed2)
         encoder_hidden_states = encoder_hidden_states + txt_gate2 * block.ff(txt_normed2)
 
         return encoder_hidden_states, hidden_states

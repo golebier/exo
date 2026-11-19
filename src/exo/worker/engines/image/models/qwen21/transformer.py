@@ -9,9 +9,8 @@ only, shaped for EXO's two-stream joint-block integration:
 - scale-only output norm + AdaLayerNormContinuous-style final projection
 """
 
-import math
-
 import mlx.core as mx
+import numpy as np
 from mlx import nn
 
 HIDDEN_DIM = 4096
@@ -26,85 +25,67 @@ EPS = 1e-6
 
 MOD_PER_TOKEN = 4 * INNER_DIM  # modulation output per row (scale1, gate1, scale2, gate2)
 
-TIME_TEXT_LADDER: tuple[int, ...] = (1000, 1024, 1000, 1024, 1000, 1024)
-PROJECTED_DIM = 1024
-TEXT_PROJ_HIDDEN = 512
+TIME_DIM = 256  # sinusoidal timestep features
 
 
 class Qwen21Timesteps(nn.Module):
-    """Sinusoidal timestep features, matching diffusers get_timestep_embedding."""
+    """Sinusoidal timestep features: cos in the first half, sin in the second.
+
+    args = t * 1000 * freqs; freqs = exp(-log(10000) * arange(128)/128).
+    Weightless: no parameters are loaded for this module.
+    """
 
     def __init__(self) -> None:
         super().__init__()
-        half = PROJECTED_DIM // 2
-        exponent = -math.log(10000.0) * mx.arange(half, dtype=mx.float32) / half
-        self.exponent = exponent
+        self.timestep_dim = TIME_DIM
+        self.time_factor = 1000.0
+        half = TIME_DIM // 2
+        self._freqs = mx.array(
+            np.exp(-np.log(10000.0) * np.arange(half, dtype=np.float32) / half)
+        )
 
-    def __call__(self, timesteps: mx.array) -> mx.array:
-        emb = mx.exp(timesteps[:, None].astype(mx.float32) * self.exponent[None, :])
-        return mx.concatenate([mx.sin(emb), mx.cos(emb)], axis=-1)
+    def __call__(self, timestep: mx.array) -> mx.array:
+        args = timestep.astype(mx.float32)[:, None] * self.time_factor * self._freqs[None, :]
+        return mx.concatenate([mx.cos(args), mx.sin(args)], axis=-1)
+
+
+class Qwen21TimestepEmbedder(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.linear_1 = nn.Linear(TIME_DIM, INNER_DIM, bias=False)
+        self.linear_2 = nn.Linear(INNER_DIM, INNER_DIM, bias=False)
+
+    def __call__(self, timesteps_proj: mx.array) -> mx.array:
+        return self.linear_2(nn.silu(self.linear_1(timesteps_proj)))
 
 
 class Qwen21TimeTextEmbed(nn.Module):
-    """Timestep embedding + the [t, 0] text-ladder for shared modulation."""
+    """[t, 0] timestep-row embedder: row 0 = sampled t, row 1 = t=0 (text)."""
 
     def __init__(self) -> None:
         super().__init__()
         self.time_proj = Qwen21Timesteps()
-        self.time_embedder = nn.Sequential(
-            nn.Linear(PROJECTED_DIM, PROJECTED_DIM, bias=True),
-            nn.SiLU(),
-            nn.Linear(PROJECTED_DIM, PROJECTED_DIM, bias=True),
-        )
-
-    def _ladder(self, batch_size: int) -> mx.array:
-        t_ladder = mx.concatenate(
-            [
-                mx.zeros((1,), dtype=mx.float32),
-                mx.full((1,), float(TIME_TEXT_LADDER[0]), dtype=mx.float32),
-                mx.zeros((1,), dtype=mx.float32),
-                mx.full((1,), float(TIME_TEXT_LADDER[2]), dtype=mx.float32),
-                mx.zeros((1,), dtype=mx.float32),
-                mx.full((1,), float(TIME_TEXT_LADDER[4]), dtype=mx.float32),
-            ]
-        )
-        t_ladder = t_ladder.reshape(3, 2)
-        t_ladder = mx.concatenate(
-            [mx.zeros((3, 1), dtype=mx.float32), t_ladder], axis=1
-        )
-        emb = self.time_proj(t_ladder.reshape(-1))
-        emb = self.time_embedder(emb)
-        # Replace the zero rows with the real timestep embedding.
-        zeros = mx.zeros((3, 1), dtype=mx.float32)
-        t_ladder = mx.concatenate([zeros, t_ladder[:, 1:]], axis=1)
-        t_ladder = t_ladder.reshape(-1)
-        first = emb[0:1]
-        return mx.concatenate([first, emb[1:]], axis=0)[None, :, :].repeat(
-            batch_size, axis=0
-        )
+        self.timestep_embedder = Qwen21TimestepEmbedder()
 
     def __call__(self, timestep: mx.array) -> mx.array:
-        """timestep: [batch] float32. Returns [batch, 2, projected_dim]."""
+        """timestep: [batch] float32 -> [batch, 2, inner_dim]."""
         timestep = timestep.astype(mx.float32)
-        batch_size = timestep.shape[0]
-        ladder = self._ladder(batch_size)
-        t_emb = self.time_proj(timestep)
-        t_emb = self.time_embedder(t_emb)  # [batch, projected]
-        first = mx.concatenate(
-            [t_emb[:, None, :], ladder[:, 1:2, :]], axis=1
+        batch = timestep.shape[0]
+        rows = mx.concatenate(
+            [timestep, mx.zeros((batch,), dtype=mx.float32)], axis=0
         )
-        rest = ladder[:, 2:, :]
-        return mx.concatenate([first, rest], axis=1)
+        emb = self.timestep_embedder(self.time_proj(rows))  # [2*batch, inner]
+        return emb.reshape(batch, 2, INNER_DIM)
 
 
 class Qwen21TextProjection(nn.Module):
-    """ZeroCenterRMSNorm -> Linear -> GELU(approx) -> Linear."""
+    """ZeroCenterRMSNorm -> Linear -> GELU(approx) -> Linear (4096 throughout)."""
 
     def __init__(self) -> None:
         super().__init__()
         self.text_norm = Qwen21ZeroCenterRMSNorm(HIDDEN_DIM)
-        self.in_layer = nn.Linear(HIDDEN_DIM, TEXT_PROJ_HIDDEN, bias=True)
-        self.out_layer = nn.Linear(TEXT_PROJ_HIDDEN, INNER_DIM, bias=True)
+        self.in_layer = nn.Linear(HIDDEN_DIM, INNER_DIM, bias=False)
+        self.out_layer = nn.Linear(INNER_DIM, INNER_DIM, bias=False)
 
     def __call__(self, text_hidden: mx.array) -> mx.array:
         hidden = self.text_norm(text_hidden)
@@ -129,11 +110,14 @@ class Qwen21ZeroCenterRMSNorm(nn.Module):
 
 
 class Qwen21Rope:
-    """2.1 RoPE: real-form pair rotation, theta 10000, axes (16, 56, 56).
+    """2.1 RoPE over the joint sequence (mflux-0.24 QwenImage21Layout.create).
 
-    Index space: image positions are 8192 positive then 1024 negative reversed;
-    text tokens advance all three axes from 0; the image frame origin is frozen
-    at the text length and H/W are centred on zero.
+    Joint layout: [text tokens] [image tokens]. The rope angle stream is ONE
+    continuous position cursor:
+    - text tokens occupy positions 0..text_len-1 (all three axes advance together)
+    - the first image token takes position text_len (the t frame position), then
+      h/w centred on zero; the t cursor advances past the image block.
+    Angles: axis0*theta^(-j/8), axis1/2*theta^(-j/28) concatenated -> 64 per pos.
     """
 
     def __init__(self, text_len: int, height: int, width: int) -> None:
@@ -143,53 +127,35 @@ class Qwen21Rope:
         self._cache: dict[int, tuple[mx.array, mx.array]] = {}
 
     @staticmethod
-    def _rope_params(index: mx.array, dim: int, theta: float) -> mx.array:
-        assert dim % 2 == 0
-        half = dim // 2
-        freqs = mx.arange(half, dtype=mx.float32)
-        freqs = mx.exp(-math.log(theta) * freqs / half)
-        freqs = mx.outer(index.astype(mx.float32), freqs)
-        return mx.stack([mx.cos(freqs), mx.sin(freqs)], axis=-1)
-
-    @staticmethod
     def _build_tables(text_len: int, height: int, width: int) -> tuple[mx.array, mx.array]:
-        seq_pos = mx.arange(8192, dtype=mx.float32)
-        seq_neg = mx.arange(1024, dtype=mx.float32)
-        seq_neg = -mx.flip(seq_neg)
-        # axes 0,1,2 = (t, h, w); frame tokens continue after the text tokens.
-        t_ids = mx.concatenate([seq_pos, seq_neg, mx.full((height * width,), -1024.0)])
-        h_ids = mx.concatenate([seq_pos, seq_neg, mx.repeat(mx.arange(height, dtype=mx.float32) - (height // 2), width)])
-        w_ids = mx.concatenate([seq_pos, seq_neg, mx.tile(mx.arange(width, dtype=mx.float32) - (width // 2), height)])
-
-        parts: list[mx.array] = []
-        for ids, dim in zip((t_ids, h_ids, w_ids), ROPE_AXES, strict=True):
-            parts.append(Qwen21Rope._rope_params(ids, dim, ROPE_THETA))
-
-        total = text_len + height * width
-        # text positions: ladder that advances t/h/w together from 0
-        text_ids_t = mx.arange(text_len, dtype=mx.float32)
-        text_parts: list[mx.array] = []
-        for dim in ROPE_AXES:
-            text_parts.append(Qwen21Rope._rope_params(text_ids_t, dim, ROPE_THETA))
-
-        tables = [
-            mx.concatenate([text_parts[i], parts[i][:total - text_len]], axis=0)
-            for i in range(3)
-        ]
-        # axes 1,2 use h/w; text region uses the ladder for all three axes
-        cos_t, sin_t = tables[0][..., 0], tables[0][..., 1]
-        cos_h, sin_h = tables[1][..., 0], tables[1][..., 1]
-        cos_w, sin_w = tables[2][..., 0], tables[2][..., 1]
-        cos = mx.concatenate([cos_t, cos_h, cos_w], axis=-1)
-        sin = mx.concatenate([sin_t, sin_h, sin_w], axis=-1)
+        n = text_len + height * width
+        frame = np.zeros(n, dtype=np.float32)
+        hax = np.zeros(n, dtype=np.float32)
+        wax = np.zeros(n, dtype=np.float32)
+        frame[:text_len] = np.arange(text_len)
+        hax[:text_len] = np.arange(text_len)
+        wax[:text_len] = np.arange(text_len)
+        # image block starts at position text_len (frame frozen at text len)
+        frame[text_len:] = text_len
+        hax[text_len:] = np.repeat(np.arange(-(height - height // 2), height // 2), width)
+        wax[text_len:] = np.tile(np.arange(-(width - width // 2), width // 2), height)
+        angles = np.concatenate(
+            [
+                ax[:, None] * (10000.0 ** (-np.arange(0, dim, 2, dtype=np.float32) / dim))[None]
+                for ax, dim in zip((frame, hax, wax), ROPE_AXES, strict=True)
+            ],
+            axis=-1,
+        )
+        cos = mx.array(np.cos(angles))
+        sin = mx.array(np.sin(angles))
         return cos, sin
 
-    def get(self, device: int = 0) -> tuple[mx.array, mx.array]:
-        if device not in self._cache:
-            self._cache[device] = Qwen21Rope._build_tables(
+    def get(self) -> tuple[mx.array, mx.array]:
+        if 0 not in self._cache:
+            self._cache[0] = Qwen21Rope._build_tables(
                 self._text_len, self._height, self._width
             )
-        return self._cache[device]
+        return self._cache[0]
 
     def image_slice(self, patch_start: int = 0, patch_end: int | None = None) -> slice:
         start = self._text_len + patch_start
@@ -205,8 +171,8 @@ def apply_rope_21(
     x_reshaped = mx.reshape(x_float, (*x.shape[:-1], -1, 2))
     x_real = x_reshaped[..., 0]
     x_imag = x_reshaped[..., 1]
-    freqs_cos = cos_vals[None, :, None, :]
-    freqs_sin = sin_vals[None, :, None, :]
+    freqs_cos = cos_vals[None, None, :, :]
+    freqs_sin = sin_vals[None, None, :, :]
     out_real = x_real * freqs_cos - x_imag * freqs_sin
     out_imag = x_real * freqs_sin + x_imag * freqs_cos
     out_pairs = mx.stack([out_real, out_imag], axis=-1)
@@ -224,7 +190,7 @@ class Qwen21Attention(nn.Module):
         self.to_v = nn.Linear(INNER_DIM, INNER_DIM, bias=False)
         self.norm_q = Qwen21ZeroCenterRMSNorm(HEAD_DIM)
         self.norm_k = Qwen21ZeroCenterRMSNorm(HEAD_DIM)
-        self.to_out = nn.ModuleList([nn.Linear(INNER_DIM, INNER_DIM, bias=False)])
+        self.to_out = [nn.Linear(INNER_DIM, INNER_DIM, bias=False)]
 
     def project(self, hidden: mx.array) -> tuple[mx.array, mx.array, mx.array]:
         batch_size, seq_len, _ = hidden.shape
@@ -248,16 +214,16 @@ class Qwen21Attention(nn.Module):
 
 
 class Qwen21SwiGLUFeedForward(nn.Module):
-    """SwiGLU with separate gate/up projections (2.1 has no packed fused weights)."""
+    """SwiGLU: out(silu(gate_layer(x)) * proj(x)) — checkpoint keys img_mlp.*."""
 
     def __init__(self) -> None:
         super().__init__()
-        self.gate_proj = nn.Linear(INNER_DIM, MLP_HIDDEN, bias=False)
-        self.up_proj = nn.Linear(INNER_DIM, MLP_HIDDEN, bias=False)
-        self.down_proj = nn.Linear(MLP_HIDDEN, INNER_DIM, bias=False)
+        self.gate_layer = nn.Linear(INNER_DIM, MLP_HIDDEN, bias=False)
+        self.proj = nn.Linear(INNER_DIM, MLP_HIDDEN, bias=False)
+        self.out = nn.Linear(MLP_HIDDEN, INNER_DIM, bias=False)
 
     def __call__(self, hidden: mx.array) -> mx.array:
-        return self.down_proj(nn.silu(self.gate_proj(hidden)) * self.up_proj(hidden))
+        return self.out(nn.silu(self.gate_layer(hidden)) * self.proj(hidden))
 
 
 class Qwen21TransformerBlock(nn.Module):
@@ -285,12 +251,15 @@ class Qwen21AdaLayerNormContinuous(nn.Module):
 
     def __init__(self) -> None:
         super().__init__()
-        self.linear = nn.Linear(PROJECTED_DIM, INNER_DIM, bias=True)
+        self.linear = nn.Linear(INNER_DIM, INNER_DIM, bias=False)
         self.norm = nn.LayerNorm(INNER_DIM, affine=False, eps=EPS)
 
     def scale_for(self, temb: mx.array) -> mx.array:
-        """temb: [batch, projected] -> scale [batch, inner_dim]."""
+        """temb: [batch, inner_dim] -> scale [batch, inner_dim]."""
         return self.linear(nn.silu(temb))
+
+    def __call__(self, hidden_states: mx.array, scale: mx.array) -> mx.array:
+        return self.norm(hidden_states) * (1 + scale)
 
 
 def build_transformer() -> nn.Module:
@@ -305,13 +274,13 @@ class Qwen21Transformer(nn.Module):
         super().__init__()
         self.time_text_embed = Qwen21TimeTextEmbed()
         self.txt_in = Qwen21TextProjection()
-        self.img_in = nn.Linear(64, INNER_DIM, bias=True)
-        self.modulation = nn.Linear(PROJECTED_DIM, MOD_PER_TOKEN, bias=True)
+        self.img_in = nn.Linear(64, INNER_DIM, bias=False)
+        self.modulation = nn.Linear(INNER_DIM, MOD_PER_TOKEN, bias=False)
         self.transformer_blocks = [Qwen21TransformerBlock() for _ in range(NUM_LAYERS)]
         self.norm_out = Qwen21AdaLayerNormContinuous()
-        self.proj_out = nn.Linear(INNER_DIM, 64, bias=True)
+        self.proj_out = nn.Linear(INNER_DIM, 64, bias=False)
 
     def modulation_for(self, temb: mx.array) -> mx.array:
-        """temb: [batch, 2, projected] -> per-token mod [batch, 2, 4*inner]."""
-        flat = temb.reshape(-1, PROJECTED_DIM)
+        """temb: [batch, 2, inner_dim] -> per-token mod [batch, 2, 4*inner]."""
+        flat = nn.silu(temb.reshape(-1, INNER_DIM))
         return self.modulation(flat).reshape(temb.shape[0], temb.shape[1], MOD_PER_TOKEN)
