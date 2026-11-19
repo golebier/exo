@@ -191,23 +191,13 @@ def load_vae(model_dir: Path) -> vae_mod.Qwen21Vae:
         return g.reshape(-1)
 
     def conv_weight(name: str) -> mx.array:
-        # Conv weights ship as [out, T, kH, kW, in] (MLX conv3d layout, T=1).
-        # Squeeze the temporal axis -> [out, in, kH, kW], then transpose to the
-        # MLX Conv2d layout [out, kH, kW, in].
+        # Conv weights ship as [out, in, T, kH, kW] (torch conv3d layout, T=1)
+        # or [out, in, kH, kW] (torch conv2d). Convert to the MLX Conv2d
+        # layout [out, kH, kW, in].
         w = data[name]
-        if w.ndim == 5:
-            w = w.squeeze(2)
-        if w.ndim == 4:
-            w = w.transpose(0, 2, 3, 1)
-        return w
-
-    def conv_weight_post(name: str) -> mx.array:
-        # 1x1 quant convs: squeeze T -> [out, in, 1, 1], transpose to the MLX
-        # Conv2d layout [out, kH=1, kW=1, in].
-        w = data[name]
-        if w.ndim == 5:
-            w = w.squeeze(2).transpose(0, 2, 3, 1)
-        return w
+        if w.ndim == 5:  # [out, in, T, kH, kW] -> [out, in, kH, kW]
+            w = w.reshape(w.shape[0], w.shape[1], w.shape[3], w.shape[4])
+        return w.transpose(0, 2, 3, 1)  # [out, kH, kW, in]
 
     # decoder.conv1 (flat) -> conv_in
     params["decoder.conv_in"] = {
@@ -270,14 +260,14 @@ def load_vae(model_dir: Path) -> vae_mod.Qwen21Vae:
                 }
         if block.upsampler is not None:
             src = f"{prefix}.3"
-            params[f"decoder.up_blocks.{n}.upsampler.conv"] = {
+            params[f"decoder.up_blocks.{n}.upsampler.resample.1"] = {
                 "weight": conv_weight(f"{src}.resample.1.weight"),
                 "bias": flat(f"{src}.resample.1.bias"),
             }
     # post_quant_conv: checkpoint ships it as top-level `conv2` (quant_conv is
     # the encoder-side `conv1`; the decoder-only engine never uses it).
     params["post_quant_conv"] = {
-        "weight": conv_weight_post("conv2.weight"),
+        "weight": conv_weight("conv2.weight"),
         "bias": flat("conv2.bias"),
     }
     params["decoder.norm_out"] = {"gamma": gamma("decoder.head.0.gamma")}
@@ -286,11 +276,13 @@ def load_vae(model_dir: Path) -> vae_mod.Qwen21Vae:
         "bias": flat("decoder.head.2.bias"),
     }
 
-    # strict load_weights compares LEAF keys, so dict-valued groups must be
-    # flattened and the full-wrapper scope ('decoder.') stripped first.
+    # strict load_weights compares LEAF keys against the decoder's own scope
+    # (no "decoder." prefix); post_quant_conv sits outside the decoder.
     decoder_params: list[tuple[str, mx.array]] = []
+    post_params: dict[str, mx.array] = {}
     for key, value in params.items():
         if not key.startswith("decoder."):
+            post_params.update(value)  # post_quant_conv
             continue
         prefix = key.removeprefix("decoder.")
         if isinstance(value, dict):
@@ -300,12 +292,10 @@ def load_vae(model_dir: Path) -> vae_mod.Qwen21Vae:
         else:
             decoder_params.append((prefix, value))
     decoder.load_weights(decoder_params, strict=True)
-    # Qwen21Vae is a plain wrapper (not nn.Module); load the 1x1 conv directly.
     wrapper.post_quant_conv.load_weights(
-        [(leaf, value) for leaf, value in params["post_quant_conv"].items()],
-        strict=True,
+        list(post_params.items()), strict=True
     )
-    mx.eval(wrapper.post_quant_conv.parameters())
+    mx.eval(decoder.parameters(), wrapper.post_quant_conv.parameters())
     return wrapper
 
 

@@ -13,7 +13,9 @@ SPATIAL_SCALE = 16
 
 
 class ChannelNorm(nn.Module):
-    """NCHW channel-axis L2 norm (text_mode variant, gamma kept 1-D)."""
+    """NCHW channel-axis L2 norm (text_mode variant; gamma stored 1-D,
+    broadcast as [1,C,1,1] — matches mflux 0.24's NCHW reshaping).
+    """
 
     def __init__(self, channels: int) -> None:
         super().__init__()
@@ -24,8 +26,7 @@ class ChannelNorm(nn.Module):
         value = x.astype(mx.float32)
         norm = mx.maximum(mx.sqrt(mx.sum(value * value, axis=1, keepdims=True)), 1e-12)
         value = value / norm
-        # NCHW stream: gamma broadcasts as [1, C, 1, 1] (mflux text_mode).
-        return (value * self.scale * self.gamma[None, :, None, None]).astype(x.dtype)
+        return value.astype(x.dtype) * self.scale * self.gamma.reshape(1, -1, 1, 1)
 
 
 def conv_nchw(layer: nn.Conv2d, x: mx.array) -> mx.array:
@@ -81,15 +82,19 @@ class MidBlock(nn.Module):
 
 
 class Resample(nn.Module):
-    """Nearest 2x upsample followed by a 3x3 conv (text_mode path: no time_conv)."""
+    """Nearest 2x upsample followed by a 3x3 conv (text_mode path: no time_conv).
+
+    The conv lives at 'resample.1' to match mflux 0.24's nn.Sequential leaf
+    naming, so weight-mapping files can use identical keys for both.
+    """
 
     def __init__(self, dim: int) -> None:
         super().__init__()
-        self.conv = nn.Conv2d(dim, dim, 3, stride=1, padding=1)
+        self.resample = [nn.Identity(), nn.Conv2d(dim, dim, 3, stride=1, padding=1)]
 
     def __call__(self, x: mx.array) -> mx.array:
         x = mx.repeat(mx.repeat(x, 2, axis=2), 2, axis=3)
-        return conv_nchw(self.conv, x)
+        return conv_nchw(self.resample[1], x)
 
 
 class Qwen21DupUp(nn.Module):
@@ -196,12 +201,10 @@ LATENTS_STD: tuple[float, ...] = (
 
 
 class Qwen21Vae:
-    """Wraps the decoder with latent de-normalization (mean/std un-shift)."""
+    """Wraps the decoder + post_quant_conv with latent de-normalization."""
 
     def __init__(self) -> None:
         self.decoder = Qwen21VaeDecoder()
-        # Checkpoint top-level `conv2` (64->64 1x1); mflux decode order is
-        # unnormalize -> post_quant_conv -> decoder -> [:, :3].
         self.post_quant_conv = nn.Conv2d(LATENT_CHANNELS, LATENT_CHANNELS, 1)
 
     def decode(self, latents: mx.array) -> mx.array:
