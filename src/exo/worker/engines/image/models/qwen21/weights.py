@@ -33,9 +33,7 @@ def _load_safetensors(path: Path) -> dict[str, mx.array]:
     return dict(mx.load(str(path)))
 
 
-def _dequantize_8bit(
-    weights: dict[str, mx.array], prefix: str
-) -> dict[str, mx.array]:
+def _dequantize_8bit(weights: dict[str, mx.array], prefix: str) -> dict[str, mx.array]:
     """Expand '<prefix>.weight/scales/biases' triplets into dequantized weights."""
     out: dict[str, mx.array] = {}
     for key in [k for k in weights if k.startswith(prefix) and k.endswith(".weight")]:
@@ -45,9 +43,7 @@ def _dequantize_8bit(
         if scales is None or biases is None:
             out[key] = weights[key]
             continue
-        out[key] = mx.dequantize(
-            weights[key], scales, biases, group_size=64, bits=8
-        )
+        out[key] = mx.dequantize(weights[key], scales, biases, group_size=64, bits=8)
     return out
 
 
@@ -111,37 +107,38 @@ def load_text_encoder(model_dir: Path) -> Qwen21TextEncoder:
     """
     data = _load_safetensors(model_dir / TEXT_ENCODER_FILE)
     model = Qwen21TextEncoder()
-    params: dict[str, Any] = {}
+    params: dict[str, mx.array] = {}
 
-    params["model.embed_tokens"] = {"weight": data["model.embed_tokens.weight"]}
-    params["model.norm"] = {"weight": data["model.norm.weight"]}
+    params["model.embed_tokens.weight"] = data["model.embed_tokens.weight"]
+    params["model.norm.weight"] = data["model.norm.weight"]
     for i in range(36):
         src = f"model.layers.{i}"
-        dst = f"model.layers.{i}"
-        params[f"{dst}.input_layernorm"] = {"weight": data[f"{src}.input_layernorm.weight"]}
-        params[f"{dst}.post_attention_layernorm"] = {
-            "weight": data[f"{src}.post_attention_layernorm.weight"]
-        }
-        params[f"{dst}.self_attn.q_proj"] = {
-            "weight": data[f"{src}.self_attn.q_proj.weight"],
-            "bias": data[f"{src}.self_attn.q_proj.bias"],
-        }
-        params[f"{dst}.self_attn.k_proj"] = {
-            "weight": data[f"{src}.self_attn.k_proj.weight"],
-            "bias": data[f"{src}.self_attn.k_proj.bias"],
-        }
-        params[f"{dst}.self_attn.v_proj"] = {
-            "weight": data[f"{src}.self_attn.v_proj.weight"],
-            "bias": data[f"{src}.self_attn.v_proj.bias"],
-        }
-        params[f"{dst}.self_attn.o_proj"] = {
-            "weight": data[f"{src}.self_attn.o_proj.weight"]
-        }
-        params[f"{dst}.self_attn.q_norm"] = {"weight": data[f"{src}.self_attn.q_norm.weight"]}
-        params[f"{dst}.self_attn.k_norm"] = {"weight": data[f"{src}.self_attn.k_norm.weight"]}
-        params[f"{dst}.mlp.gate_proj"] = {"weight": data[f"{src}.mlp.gate_proj.weight"]}
-        params[f"{dst}.mlp.up_proj"] = {"weight": data[f"{src}.mlp.up_proj.weight"]}
-        params[f"{dst}.mlp.down_proj"] = {"weight": data[f"{src}.mlp.down_proj.weight"]}
+        params[f"{src}.input_layernorm.weight"] = data[f"{src}.input_layernorm.weight"]
+        params[f"{src}.post_attention_layernorm.weight"] = data[
+            f"{src}.post_attention_layernorm.weight"
+        ]
+        # checkpoint (and mflux) carry no attention biases
+        params[f"{src}.self_attn.q_proj.weight"] = data[
+            f"{src}.self_attn.q_proj.weight"
+        ]
+        params[f"{src}.self_attn.k_proj.weight"] = data[
+            f"{src}.self_attn.k_proj.weight"
+        ]
+        params[f"{src}.self_attn.v_proj.weight"] = data[
+            f"{src}.self_attn.v_proj.weight"
+        ]
+        params[f"{src}.self_attn.o_proj.weight"] = data[
+            f"{src}.self_attn.o_proj.weight"
+        ]
+        params[f"{src}.self_attn.q_norm.weight"] = data[
+            f"{src}.self_attn.q_norm.weight"
+        ]
+        params[f"{src}.self_attn.k_norm.weight"] = data[
+            f"{src}.self_attn.k_norm.weight"
+        ]
+        params[f"{src}.mlp.gate_proj.weight"] = data[f"{src}.mlp.gate_proj.weight"]
+        params[f"{src}.mlp.up_proj.weight"] = data[f"{src}.mlp.up_proj.weight"]
+        params[f"{src}.mlp.down_proj.weight"] = data[f"{src}.mlp.down_proj.weight"]
 
     model.load_weights(list(params.items()), strict=True)
     mx.eval(model.parameters())
@@ -181,17 +178,23 @@ def load_vae(model_dir: Path) -> vae_mod.Qwen21Vae:
         "bias": flat("decoder.conv1.bias"),
     }
     # mid block
-    params["decoder.mid_block.resnets.0.norm1"] = {"gamma": gamma("decoder.middle.0.residual.0.gamma")}
+    params["decoder.mid_block.resnets.0.norm1"] = {
+        "gamma": gamma("decoder.middle.0.residual.0.gamma")
+    }
     params["decoder.mid_block.resnets.0.conv1"] = {
         "weight": conv_weight("decoder.middle.0.residual.2.weight"),
         "bias": flat("decoder.middle.0.residual.2.bias"),
     }
-    params["decoder.mid_block.resnets.0.norm2"] = {"gamma": gamma("decoder.middle.0.residual.3.gamma")}
+    params["decoder.mid_block.resnets.0.norm2"] = {
+        "gamma": gamma("decoder.middle.0.residual.3.gamma")
+    }
     params["decoder.mid_block.resnets.0.conv2"] = {
         "weight": conv_weight("decoder.middle.0.residual.6.weight"),
         "bias": flat("decoder.middle.0.residual.6.bias"),
     }
-    params["decoder.mid_block.attentions.0.norm"] = {"gamma": gamma("decoder.middle.1.norm.gamma")}
+    params["decoder.mid_block.attentions.0.norm"] = {
+        "gamma": gamma("decoder.middle.1.norm.gamma")
+    }
     params["decoder.mid_block.attentions.0.to_qkv"] = {
         "weight": conv_weight("decoder.middle.1.to_qkv.weight"),
         "bias": flat("decoder.middle.1.to_qkv.bias"),
@@ -200,12 +203,16 @@ def load_vae(model_dir: Path) -> vae_mod.Qwen21Vae:
         "weight": conv_weight("decoder.middle.1.proj.weight"),
         "bias": flat("decoder.middle.1.proj.bias"),
     }
-    params["decoder.mid_block.resnets.1.norm1"] = {"gamma": gamma("decoder.middle.2.residual.0.gamma")}
+    params["decoder.mid_block.resnets.1.norm1"] = {
+        "gamma": gamma("decoder.middle.2.residual.0.gamma")
+    }
     params["decoder.mid_block.resnets.1.conv1"] = {
         "weight": conv_weight("decoder.middle.2.residual.2.weight"),
         "bias": flat("decoder.middle.2.residual.2.bias"),
     }
-    params["decoder.mid_block.resnets.1.norm2"] = {"gamma": gamma("decoder.middle.2.residual.3.gamma")}
+    params["decoder.mid_block.resnets.1.norm2"] = {
+        "gamma": gamma("decoder.middle.2.residual.3.gamma")
+    }
     params["decoder.mid_block.resnets.1.conv2"] = {
         "weight": conv_weight("decoder.middle.2.residual.6.weight"),
         "bias": flat("decoder.middle.2.residual.6.bias"),
@@ -268,9 +275,7 @@ def load_vae(model_dir: Path) -> vae_mod.Qwen21Vae:
         else:
             decoder_params.append((prefix, value))
     decoder.load_weights(decoder_params, strict=True)
-    wrapper.post_quant_conv.load_weights(
-        list(post_params.items()), strict=True
-    )
+    wrapper.post_quant_conv.load_weights(list(post_params.items()), strict=True)
     mx.eval(decoder.parameters(), wrapper.post_quant_conv.parameters())
     return wrapper
 
