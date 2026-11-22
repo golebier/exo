@@ -26,11 +26,13 @@ MROPE_SECTION = (24, 20, 20)
 VOCAB_SIZE = 151936
 MAX_LENGTH = 2048
 
-# mflux 0.24 Qwen21PromptEncoder verbatim.
-SYSTEM_PROMPT = "Comprehend and analyze the provided prompt."
-SYSTEM_PREFIX = f"<|im_start|>system\n{SYSTEM_PROMPT}<|im_end|>\n"
+SYSTEM_PREFIX = (
+    "<|im_start|>system\nComprehend and analyze the provided prompt.<|im_end|>\n"
+)
+
+# mflux 0.24 PROMPT_TEMPLATE_T2I verbatim (raw form, not apply_chat_template).
 PROMPT_TEMPLATE_T2I = (
-    f"<|im_start|>system\n{SYSTEM_PROMPT}<|im_end|>\n"
+    "<|im_start|>system\nComprehend and analyze the provided prompt.<|im_end|>\n"
     "<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n"
 )
 
@@ -41,10 +43,12 @@ class Qwen3VLRMSNorm(nn.Module):
         self.weight = mx.ones((dim,))
 
     def __call__(self, x: mx.array) -> mx.array:
-        dtype = x.dtype
+        input_dtype = x.dtype
         x = x.astype(mx.float32)
-        out = x * mx.rsqrt(mx.mean(x * x, axis=-1, keepdims=True) + 1e-6)
-        return (self.weight * out).astype(dtype)
+        variance = mx.mean(x * x, axis=-1, keepdims=True)
+        x = x * mx.rsqrt(variance + 1e-6)
+        result = self.weight.astype(mx.float32) * x
+        return result.astype(input_dtype)
 
 
 class Qwen3VLMLP(nn.Module):
@@ -59,58 +63,60 @@ class Qwen3VLMLP(nn.Module):
 
 
 class Qwen3VLRotaryEmbedding:
-    """Interleaved mrope. position_ids: [3, batch, seq] int -> cos/sin [batch, seq, head_dim]."""
+    """Interleaved mrope (mflux 0.24 parity): dim=128 freqs over full head_dim,
+    interleave h/w indices every 3rd within mrope_section*3 span, emb doubled.
+    position_ids: [3, batch, seq] -> cos/sin [batch, seq, head_dim]."""
 
     def __init__(self) -> None:
-        half = HEAD_DIM // 2
-        inv_freq = 1.0 / (
-            ROPE_THETA ** (mx.arange(0, half, dtype=mx.float32) / half)
+        self.inv_freq = 1.0 / (
+            ROPE_THETA ** (mx.arange(0, HEAD_DIM, 2, dtype=mx.float32) / HEAD_DIM)
         )
-        self.inv_freq = inv_freq
 
     def __call__(self, position_ids: mx.array) -> tuple[mx.array, mx.array]:
-        inv_freq = self.inv_freq
-        freqs = mx.outer(position_ids.reshape(-1).astype(mx.float32), inv_freq)
-        freqs = freqs.reshape(3, position_ids.shape[1], position_ids.shape[2], -1)
+        batch = position_ids.shape[1]
+        inv_exp = mx.broadcast_to(
+            self.inv_freq[None, None, :, None].astype(mx.float32),
+            (3, batch, self.inv_freq.shape[0], 1),
+        )
+        pos_exp = position_ids[:, :, None, :].astype(mx.float32)
+        freqs = mx.transpose(mx.matmul(inv_exp, pos_exp), (0, 1, 3, 2))
         freqs_t = freqs[0]
-        offsets = np.cumsum((1,) + MROPE_SECTION[:-1])
-        freqs_h = freqs[1]
-        freqs_w = freqs[2]
-        freqs_int = np.array(freqs_t, copy=False)
-        freqs_h_np = np.array(freqs_h, copy=False)
-        freqs_w_np = np.array(freqs_w, copy=False)
-        idx = np.arange(HEAD_DIM // 2)
-        h_idx = idx[offsets[0] :: 3]
-        w_idx = idx[offsets[1] :: 3]
-        freqs_int[:, :, h_idx] = freqs_h_np[:, :, h_idx]
-        freqs_int[:, :, w_idx] = freqs_w_np[:, :, w_idx]
-        emb = np.concatenate([freqs_int, freqs_int], axis=-1)
-        cos = mx.array(np.cos(emb))
-        sin = mx.array(np.sin(emb))
+        freqs_t_np = np.array(freqs_t, copy=True)
+        for dim, offset in enumerate((1, 2), start=1):
+            length = MROPE_SECTION[dim] * 3
+            indices_np = np.arange(offset, length, 3)
+            freqs_dim_np = np.array(freqs[dim], copy=False)
+            freqs_t_np[..., indices_np] = freqs_dim_np[..., indices_np]
+        emb = np.concatenate([freqs_t_np, freqs_t_np], axis=-1)
+        emb_mx = mx.array(emb)
+        cos = mx.cos(emb_mx)
+        sin = mx.sin(emb_mx)
         return cos, sin
 
 
 def _rotate_half_interleaved(x: mx.array, cos: mx.array, sin: mx.array) -> mx.array:
-    """Interleaved-pair rotation for the Qwen3-VL text rope."""
-    x_float = x.astype(mx.float32)
-    shape = (*x_float.shape[:-1], -1, 2)
-    x_reshaped = mx.reshape(x_float, shape)
-    x_real = x_reshaped[..., 0]
-    x_imag = x_reshaped[..., 1]
-    cos_b = cos[:, :, None, :]  # [batch, seq, 1, head/2]
-    sin_b = sin[:, :, None, :]
-    out_real = x_real * cos_b - x_imag * sin_b
-    out_imag = x_real * sin_b + x_imag * cos_b
-    out = mx.stack([out_real, out_imag], axis=-1)
-    return mx.reshape(out, x_float.shape).astype(x.dtype)
+    """Interleaved-pair rotation for the Qwen3-VL text rope.
+
+    cos/sin: [batch, seq, head_dim] (mflux convention). x: [batch, heads,
+    seq, head_dim] — head axis inserted at unsqueeze_dim=1, matching
+    mflux's _apply_rotary_pos_emb.
+    """
+    cos_b = mx.expand_dims(cos, axis=1)  # [batch, 1, seq, head_dim]
+    sin_b = mx.expand_dims(sin, axis=1)
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    x_rot = mx.concatenate([-x2, x1], axis=-1)
+    # bf16 arithmetic throughout — mflux rotates q/cos/sin in their native dtype
+    return (x * cos_b) + (x_rot * sin_b)
 
 
 class Qwen3VLAttention(nn.Module):
     def __init__(self) -> None:
         super().__init__()
-        self.q_proj = nn.Linear(HIDDEN_DIM, NUM_HEADS * HEAD_DIM, bias=True)
-        self.k_proj = nn.Linear(HIDDEN_DIM, NUM_KV_HEADS * HEAD_DIM, bias=True)
-        self.v_proj = nn.Linear(HIDDEN_DIM, NUM_KV_HEADS * HEAD_DIM, bias=True)
+        # checkpoint (and mflux) carry no attention biases
+        self.q_proj = nn.Linear(HIDDEN_DIM, NUM_HEADS * HEAD_DIM, bias=False)
+        self.k_proj = nn.Linear(HIDDEN_DIM, NUM_KV_HEADS * HEAD_DIM, bias=False)
+        self.v_proj = nn.Linear(HIDDEN_DIM, NUM_KV_HEADS * HEAD_DIM, bias=False)
         self.o_proj = nn.Linear(NUM_HEADS * HEAD_DIM, HIDDEN_DIM, bias=False)
         self.q_norm = Qwen3VLRMSNorm(HEAD_DIM)
         self.k_norm = Qwen3VLRMSNorm(HEAD_DIM)
@@ -123,9 +129,7 @@ class Qwen3VLAttention(nn.Module):
         mask: mx.array | None,
     ) -> mx.array:
         batch_size, seq_len, _ = hidden.shape
-        query = self.q_proj(hidden).reshape(
-            batch_size, seq_len, NUM_HEADS, HEAD_DIM
-        )
+        query = self.q_proj(hidden).reshape(batch_size, seq_len, NUM_HEADS, HEAD_DIM)
         key = self.k_proj(hidden).reshape(batch_size, seq_len, NUM_KV_HEADS, HEAD_DIM)
         value = self.v_proj(hidden).reshape(batch_size, seq_len, NUM_KV_HEADS, HEAD_DIM)
         query = self.q_norm(query)
@@ -188,17 +192,28 @@ class Qwen3VLLanguageModel(nn.Module):
     def _build_mask(
         self, attention_mask: mx.array | None, seq_len: int
     ) -> mx.array | None:
-        batch = 1
-        causal = mx.triu(
-            mx.full((seq_len, seq_len), -mx.inf, dtype=mx.float32), k=1
-        )
+        """mflux 0.24 verbatim: causal + padding additive fp32 mask."""
+        mask_dtype = mx.float32
         if attention_mask is None:
-            return causal[None, None, :, :]
-        valid = attention_mask.astype(mx.float32)  # [batch, seq]
-        pad_additive = (1.0 - valid) * -mx.inf  # [batch, seq]
-        key_mask = pad_additive[:, None, None, :]
-        combined = mx.maximum(causal[None, None, :, :], key_mask)
-        return mx.concatenate([combined] * batch, axis=0)
+            attention_mask = mx.ones((1, seq_len), dtype=mx.int32)
+        padding_mask = mx.where(
+            attention_mask == 1,
+            mx.zeros(attention_mask.shape, dtype=mask_dtype),
+            mx.full(attention_mask.shape, -float("inf"), dtype=mask_dtype),
+        )
+        padding_mask = mx.expand_dims(mx.expand_dims(padding_mask, axis=1), axis=1)
+        idx = mx.arange(seq_len, dtype=mx.int32)
+        causal = mx.where(
+            idx[None, :] > idx[:, None],
+            mx.full((seq_len, seq_len), -float("inf"), dtype=mask_dtype),
+            mx.zeros((seq_len, seq_len), dtype=mask_dtype),
+        )
+        return (
+            mx.broadcast_to(
+                causal[None, None, :, :], (attention_mask.shape[0], 1, seq_len, seq_len)
+            )
+            + padding_mask
+        )
 
     def __call__(
         self,
@@ -210,6 +225,9 @@ class Qwen3VLLanguageModel(nn.Module):
         ladder = mx.arange(seq_len, dtype=mx.float32)[None, :]
         position_ids = mx.stack([ladder, ladder, ladder], axis=0)  # [3, batch, seq]
         cos, sin = self.rope(position_ids)
+        # mflux casts cos/sin to the hidden dtype (bf16) inside the rope call
+        cos = cos.astype(hidden.dtype)
+        sin = sin.astype(hidden.dtype)
         mask = self._build_mask(attention_mask, seq_len)
         for layer in self.layers:
             hidden = layer(hidden, cos, sin, mask)
@@ -250,9 +268,6 @@ class Qwen21Tokenizer:
         return len(input_ids)
 
     def tokenize(self, prompt: str) -> dict[str, np.ndarray]:
-        """Tokenize the FULL rendered template — mflux encodes the whole
-        sequence and drops the system-prefix positions from the hidden states
-        and mask AFTER the tower (dropping before would shift the positions)."""
         rendered = PROMPT_TEMPLATE_T2I.format(prompt)
         encoded = self._tokenizer(  # pyright: ignore[reportAny]
             [rendered],
@@ -260,14 +275,14 @@ class Qwen21Tokenizer:
             truncation=True,
             max_length=MAX_LENGTH,
             return_tensors="np",
+            add_special_tokens=False,
         )
         input_ids = np.asarray(encoded["input_ids"], dtype=np.int64)  # pyright: ignore[reportAny]
         attention_mask = np.asarray(encoded["attention_mask"], dtype=np.int64)  # pyright: ignore[reportAny]
+        # Drop the system prefix tokens (positions 0..prefix_len) as in mflux 0.24.
+        input_ids = input_ids[:, self._prefix_len :]
+        attention_mask = attention_mask[:, self._prefix_len :]
         return {"input_ids": input_ids, "attention_mask": attention_mask}
-
-    @property
-    def prefix_len(self) -> int:
-        return self._prefix_len
 
 
 def encode_prompts(
@@ -282,16 +297,12 @@ def encode_prompts(
         if prompt in prompt_cache:
             results.append(prompt_cache[prompt])
             continue
-        if not prompt or not prompt.strip():
-            prompt = " "
-        tokens = tokenizer.tokenize(prompt)
+        effective = prompt if prompt != "" else " "
+        tokens = tokenizer.tokenize(effective)
         input_ids = mx.array(tokens["input_ids"])
         attention_mask = mx.array(tokens["attention_mask"])
         hidden = encoder(input_ids, attention_mask)
-        # Drop the system-prefix positions from embeds AND mask after encoding
-        # (mflux 0.24 Qwen21PromptEncoder.encode_prompt).
-        drop = tokenizer.prefix_len
-        pair = (hidden[:, drop:, :], attention_mask[:, drop:])
+        pair = (hidden, attention_mask)
         prompt_cache[prompt] = pair
         results.append(pair)
     return results
