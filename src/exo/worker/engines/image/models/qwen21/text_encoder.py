@@ -8,7 +8,6 @@ identical axes, so the interleaved mrope selection collapses to the ladder.
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 import mlx.core as mx

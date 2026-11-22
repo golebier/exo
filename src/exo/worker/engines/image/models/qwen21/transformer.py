@@ -247,7 +247,9 @@ class Qwen21TransformerBlock(nn.Module):
         return normed * (1 + scale)
 
     @staticmethod
-    def split_mod(mod: mx.array) -> tuple[mx.array, mx.array]:
+    def split_mod(
+        mod: mx.array,
+    ) -> tuple[mx.array, mx.array, mx.array, mx.array]:
         scale1, gate1, scale2, gate2 = mx.split(mod, 4, axis=-1)
         return scale1, gate1, scale2, gate2
 

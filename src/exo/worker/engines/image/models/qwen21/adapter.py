@@ -20,16 +20,15 @@ from exo.worker.engines.image.models.base import (
     PromptData,
     RotaryEmbeddings,
 )
-from exo.worker.engines.image.models.qwen21 import weights as weights_mod
 from exo.worker.engines.image.models.qwen21.model import Qwen21Model
 from exo.worker.engines.image.models.qwen21.scheduler import (
-    Qwen21TurboScheduler,
     SAMPLE_SIGMAS,
+    Qwen21TurboScheduler,
 )
 from exo.worker.engines.image.models.qwen21.text_encoder import encode_prompts
 from exo.worker.engines.image.models.qwen21.transformer import (
-    Qwen21Transformer,
     Qwen21Rope,
+    Qwen21Transformer,
 )
 from exo.worker.engines.image.models.qwen21.wrappers import Qwen21JointBlockWrapper
 from exo.worker.engines.image.pipeline.block_wrapper import (
@@ -215,7 +214,6 @@ class Qwen21ModelAdapter(ModelAdapter[Qwen21Model, Qwen21Transformer]):
         return self._time_text(timestep)
 
     def _time_text(self, timestep: mx.array) -> mx.array:
-        batch = timestep.shape[0]
         # Qwen21TimeTextEmbed takes [batch] timestep and returns [batch, 2, projected]
         temb = self._transformer.time_text_embed(timestep)
         self._norm_out_scale = self._transformer.norm_out.scale_for(temb[:, 0, :])

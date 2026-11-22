@@ -65,4 +65,4 @@ def install_scheduler(config: object, scheduler: Qwen21TurboScheduler | None = N
     mflux's Config.scheduler property returns the pre-set _scheduler attribute
     when present, so plain attribute assignment is the integration point.
     """
-    setattr(config, "_scheduler", scheduler or Qwen21TurboScheduler())
+    config._scheduler = scheduler or Qwen21TurboScheduler()

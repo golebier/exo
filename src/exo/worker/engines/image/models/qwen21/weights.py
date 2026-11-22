@@ -15,14 +15,13 @@ from pathlib import Path
 from typing import Any
 
 import mlx.core as mx
-from mlx import nn
 
 from exo.worker.engines.image.models.qwen21 import vae as vae_mod
+from exo.worker.engines.image.models.qwen21.text_encoder import Qwen21TextEncoder
 from exo.worker.engines.image.models.qwen21.transformer import (
     HIDDEN_DIM,
     Qwen21Transformer,
 )
-from exo.worker.engines.image.models.qwen21.text_encoder import Qwen21TextEncoder
 
 # abenzerps flat filenames inside the model repo
 TRANSFORMER_FILE = "qwen-image-2.1-turbo-MLX-8bit.safetensors"
@@ -59,72 +58,43 @@ def load_transformer(model_dir: Path) -> Qwen21Transformer:
     model = Qwen21Transformer()
     params: dict[str, Any] = {}
 
+    # MLX 0.32 load_weights(strict=True) matches FULL leaf keys ("img_in.weight"),
+    # so every entry below is the complete parameter path.
+
     # time_text_embed: weightless sinusoid + bias-free embedder (256 -> 4096 -> 4096)
-    params["time_text_embed.timestep_embedder.linear_1"] = {
-        "weight": data["time_text_embed.timestep_embedder.linear_1.weight"]
-    }
-    params["time_text_embed.timestep_embedder.linear_2"] = {
-        "weight": data["time_text_embed.timestep_embedder.linear_2.weight"]
-    }
-    params["txt_in.text_norm"] = {
-        "weight": data["txt_in.text_norm.weight"] + 1
-    }
-    params["txt_in.in_layer"] = {
-        "weight": data["txt_in.in_layer.weight"]
-    }
-    params["txt_in.out_layer"] = {
-        "weight": data["txt_in.out_layer.weight"]
-    }
-    params["img_in"] = {
-        "weight": data["img_in.weight"]
-    }
+    params["time_text_embed.timestep_embedder.linear_1.weight"] = data[
+        "time_text_embed.timestep_embedder.linear_1.weight"
+    ]
+    params["time_text_embed.timestep_embedder.linear_2.weight"] = data[
+        "time_text_embed.timestep_embedder.linear_2.weight"
+    ]
+    # zero-centered checkpoint weight; the module adds +1 at runtime
+    params["txt_in.text_norm.weight"] = data["txt_in.text_norm.weight"]
+    params["txt_in.in_layer.weight"] = data["txt_in.in_layer.weight"]
+    params["txt_in.out_layer.weight"] = data["txt_in.out_layer.weight"]
+    params["img_in.weight"] = data["img_in.weight"]
     # checkpoint key modulation.1.* (Sequential(SiLU, Linear)) -> our modulation Linear;
     # SiLU is applied explicitly in modulation_for()
-    params["modulation"] = {
-        "weight": data["modulation.1.weight"]
-    }
-    params["norm_out.linear"] = {
-        "weight": data["norm_out.linear.weight"]
-    }
-    params["proj_out"] = {
-        "weight": data["proj_out.weight"]
-    }
+    params["modulation.weight"] = data["modulation.1.weight"]
+    params["norm_out.linear.weight"] = data["norm_out.linear.weight"]
+    params["proj_out.weight"] = data["proj_out.weight"]
 
     n_layers = len(model.transformer_blocks)
     for i in range(n_layers):
         p = f"transformer_blocks.{i}"
-        f = f"transformer_blocks.{i}"
-        params[f"{p}.norm1"] = {}  # affine=False LayerNorm: no params
-        params[f"{p}.attn.to_q"] = {
-            "weight": data[f"{f}.attn.to_q.weight"]
-        }
-        params[f"{p}.attn.to_k"] = {
-            "weight": data[f"{f}.attn.to_k.weight"]
-        }
-        params[f"{p}.attn.to_v"] = {
-            "weight": data[f"{f}.attn.to_v.weight"]
-        }
-        params[f"{p}.attn.norm_q"] = {
-            # Plain RMSNorm weight (mean ~1.14 in the checkpoint); mflux 0.24
-            # maps it directly into nn.RMSNorm with no transform.
-            "weight": data[f"{f}.attn.norm_q.weight"]
-        }
-        params[f"{p}.attn.norm_k"] = {
-            "weight": data[f"{f}.attn.norm_k.weight"]
-        }
-        params[f"{p}.attn.to_out.0"] = {
-            "weight": data[f"{f}.attn.to_out.0.weight"]
-        }
-        params[f"{p}.ff.gate_layer"] = {
-            "weight": data[f"{f}.img_mlp.gate_layer.weight"]
-        }
-        params[f"{p}.ff.proj"] = {
-            "weight": data[f"{f}.img_mlp.proj.weight"]
-        }
-        params[f"{p}.ff.out"] = {
-            "weight": data[f"{f}.img_mlp.out.weight"]
-        }
-        params[f"{p}.norm2"] = {}
+        params[f"{p}.attn.to_q.weight"] = data[f"{p}.attn.to_q.weight"]
+        params[f"{p}.attn.to_k.weight"] = data[f"{p}.attn.to_k.weight"]
+        params[f"{p}.attn.to_v.weight"] = data[f"{p}.attn.to_v.weight"]
+        # Plain RMSNorm weight (mean ~1.14 in the checkpoint); mflux 0.24
+        # maps it directly into nn.RMSNorm with no transform.
+        params[f"{p}.attn.norm_q.weight"] = data[f"{p}.attn.norm_q.weight"]
+        params[f"{p}.attn.norm_k.weight"] = data[f"{p}.attn.norm_k.weight"]
+        params[f"{p}.attn.to_out.0.weight"] = data[f"{p}.attn.to_out.0.weight"]
+        # checkpoint img_mlp.* -> engine ff.* (SwiGLU)
+        params[f"{p}.ff.gate_layer.weight"] = data[f"{p}.img_mlp.gate_layer.weight"]
+        params[f"{p}.ff.proj.weight"] = data[f"{p}.img_mlp.proj.weight"]
+        params[f"{p}.ff.out.weight"] = data[f"{p}.img_mlp.out.weight"]
+        # norm1/norm2 are affine=False LayerNorms: no parameters
 
     model.load_weights(list(params.items()), strict=True)
     mx.eval(model.parameters())
@@ -132,15 +102,21 @@ def load_transformer(model_dir: Path) -> Qwen21Transformer:
 
 
 def load_text_encoder(model_dir: Path) -> Qwen21TextEncoder:
-    """Load the BF16 Qwen3-VL text tower from the abenzerps TE file."""
+    """Load the BF16 Qwen3-VL text tower from the abenzerps TE file.
+
+    The checkpoint's keys are bare ``model.*`` (no ``model.language_model.``
+    prefix): language-tower layers, embed_tokens and norm load directly;
+    ``model.visual.*`` (vision tower) and ``lm_head.weight`` are dropped —
+    the engine needs raw hidden states only.
+    """
     data = _load_safetensors(model_dir / TEXT_ENCODER_FILE)
     model = Qwen21TextEncoder()
     params: dict[str, Any] = {}
 
-    params["model.embed_tokens"] = {"weight": data["model.language_model.embed_tokens.weight"]}
-    params["model.norm"] = {"weight": data["model.language_model.norm.weight"]}
+    params["model.embed_tokens"] = {"weight": data["model.embed_tokens.weight"]}
+    params["model.norm"] = {"weight": data["model.norm.weight"]}
     for i in range(36):
-        src = f"model.language_model.layers.{i}"
+        src = f"model.layers.{i}"
         dst = f"model.layers.{i}"
         params[f"{dst}.input_layernorm"] = {"weight": data[f"{src}.input_layernorm.weight"]}
         params[f"{dst}.post_attention_layernorm"] = {
@@ -315,11 +291,6 @@ def load_tekken_config(model_dir: Path) -> dict[str, Any]:
         cfg = model_dir / "tokenizer_config.json"
     with cfg.open() as f:
         return json.load(f)
-
-
-def zero_center_norm_weight(weight: mx.array) -> mx.array:
-    """Checkpoint stores weight-1 (zero-centered); runtime uses weight+1."""
-    return weight + 1
 
 
 def inner_dim() -> int:

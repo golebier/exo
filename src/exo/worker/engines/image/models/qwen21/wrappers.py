@@ -13,13 +13,11 @@ import mlx.core as mx
 from exo.worker.engines.image.models.base import RotaryEmbeddings
 from exo.worker.engines.image.models.qwen21.transformer import (
     HEAD_DIM,
-    HIDDEN_DIM,
     NUM_HEADS,
     Qwen21TransformerBlock,
     apply_rope_21,
 )
 from exo.worker.engines.image.pipeline.block_wrapper import (
-    BlockWrapperMode,
     JointBlockWrapper,
 )
 
@@ -42,8 +40,7 @@ class Qwen21JointBlockWrapper(JointBlockWrapper[Qwen21TransformerBlock]):
     def set_encoder_mask(self, mask: mx.array | None) -> None:
         self._encoder_hidden_states_mask = mask
 
-    def _joint_valid(self, joint_seq_len: int) -> mx.array | None:
-        """[batch, seq] float validity over [text | image] (image all valid)."""
+    def _text_additive_mask(self, joint_seq_len: int) -> mx.array | None:
         mask = self._encoder_hidden_states_mask
         if mask is None:
             return None
@@ -52,31 +49,23 @@ class Qwen21JointBlockWrapper(JointBlockWrapper[Qwen21TransformerBlock]):
         text_valid = mask.astype(mx.float32)
         img_seq_len = joint_seq_len - self._text_seq_len
         ones_img = mx.ones((text_valid.shape[0], img_seq_len), dtype=mx.float32)
-        return mx.concatenate([text_valid, ones_img], axis=1)
-
-    def _patch_key_mask(self, joint_seq_len: int) -> mx.array | None:
-        """PATCHED mode: queries are image rows only, so key validity is the
-        whole story (mflux causal clause is trivially true for image rows)."""
-        valid = self._joint_valid(joint_seq_len)
-        if valid is None or bool(mx.all(valid >= 0.999).item()):
+        joint_mask = mx.concatenate([text_valid, ones_img], axis=1)
+        if mx.all(joint_mask >= 0.999):
             return None
-        additive = (1.0 - valid) * NEG_INF
-        return additive.reshape((additive.shape[0], 1, 1, additive.shape[1]))
-
-    def _block_causal_mask(self, joint_seq_len: int) -> mx.array:
-        """CACHING mode with padding: mflux 0.24 block-causal mask verbatim —
-        allowed = (key <= query) | (query >= text_len), ANDed with key validity.
-        Cast to the bf16 activation stream like mflux (fast SDPA promotion)."""
-        valid = self._joint_valid(joint_seq_len)
-        assert valid is not None
+        # mflux 0.24 block-causal mask verbatim: allowed =
+        # (key <= query) | (query >= text_len), ANDed with prompt validity;
+        # padded keys become a bf16 -1e9 additive term (mflux casts padding
+        # masks to ModelConfig.precision and SDPA requires promotion to the
+        # bf16 activations).
         idx = mx.arange(joint_seq_len)
         allowed = (idx[None, :] <= idx[:, None]) | (idx[:, None] >= self._text_seq_len)
-        allowed = allowed[None, None, :, :] & (valid[:, None, None, :] > 0.5)
+        allowed = allowed[None, None, :, :] & (joint_mask[:, None, None, :] > 0.5)
         return mx.where(allowed, 0.0, NEG_INF).astype(mx.bfloat16)
 
     def _text_causal_mask(self, batch: int) -> mx.array:
+        # identical construction to mflux's text segment: mask[i, j] = j <= i
         n = self._text_seq_len
-        base = mx.triu(mx.full((n, n), NEG_INF, dtype=mx.float32), k=1)
+        base = mx.arange(n)[None, :] <= mx.arange(n)[:, None]
         return mx.broadcast_to(base[None, None, :, :], (batch, 1, n, n))
 
     def _rope(
@@ -123,8 +112,9 @@ class Qwen21JointBlockWrapper(JointBlockWrapper[Qwen21TransformerBlock]):
         img_scale1, img_gate1, img_scale2, img_gate2 = Qwen21TransformerBlock.split_mod(img_mod)
         txt_scale1, txt_gate1, txt_scale2, txt_gate2 = Qwen21TransformerBlock.split_mod(txt_mod)
 
-        self._img_mod = (img_scale2, img_gate2)
-        self._txt_mod = (txt_scale2, txt_gate2)
+        # gate1 gates the attention residual, gate2 the FF residual (mflux semantics)
+        self._img_mod = (img_gate1, img_scale2, img_gate2)
+        self._txt_mod = (txt_gate1, txt_scale2, txt_gate2)
 
         img_normed = Qwen21TransformerBlock.modulate(block.norm1(hidden_states), img_scale1)
         txt_normed = Qwen21TransformerBlock.modulate(block.norm1(encoder_hidden_states), txt_scale1)
@@ -151,23 +141,16 @@ class Qwen21JointBlockWrapper(JointBlockWrapper[Qwen21TransformerBlock]):
         self, query: mx.array, key: mx.array, value: mx.array
     ) -> mx.array:
         full_seq = key.shape[2]
-        if self._mode == BlockWrapperMode.PATCHED:
-            # Patch queries are image rows: they attend everything; only key
-            # validity (padding) applies.
-            mask = self._patch_key_mask(full_seq)
-            return mx.fast.scaled_dot_product_attention(
-                query, key, value, scale=self._head_dim**-0.5, mask=mask
-            )
-        valid = self._joint_valid(full_seq)
-        if valid is None or bool(mx.all(valid >= 0.999).item()):
-            # padding-free: segmented path (causal over text, full for image)
+        mask = self._text_additive_mask(full_seq)
+        if mask is None and self._text_seq_len > 0:
+            # padding-free segmented path: causal over the text region, full
+            # attention for image rows (image queries see text + image keys,
+            # matching mflux's k[:, :, :end] segment convention)
             batch = query.shape[0]
             txt_q = query[:, :, : self._text_seq_len, :]
             txt_k = key[:, :, : self._text_seq_len, :]
             txt_v = value[:, :, : self._text_seq_len, :]
             img_q = query[:, :, self._text_seq_len :, :]
-            img_k = key[:, :, self._text_seq_len :, :]
-            img_v = value[:, :, self._text_seq_len :, :]
             txt_out = (
                 mx.fast.scaled_dot_product_attention(
                     txt_q, txt_k, txt_v, scale=self._head_dim**-0.5,
@@ -177,11 +160,10 @@ class Qwen21JointBlockWrapper(JointBlockWrapper[Qwen21TransformerBlock]):
                 else txt_q
             )
             img_out = mx.fast.scaled_dot_product_attention(
-                img_q, img_k, img_v, scale=self._head_dim**-0.5
-            )
+                img_q, key, value, scale=self._head_dim**-0.5
+            )  # image rows attend to text+image keys (mflux k[:, :, :end] convention)
             return mx.concatenate([txt_out, img_out], axis=2)
 
-        mask = self._block_causal_mask(full_seq)
         return mx.fast.scaled_dot_product_attention(
             query, key, value, scale=self._head_dim**-0.5, mask=mask
         )
@@ -200,12 +182,12 @@ class Qwen21JointBlockWrapper(JointBlockWrapper[Qwen21TransformerBlock]):
         txt_out = block.attn.unproject(txt_attn_out)
         img_out = block.attn.unproject(img_attn_out)
 
-        img_scale2, img_gate2 = self._img_mod
-        txt_scale2, txt_gate2 = self._txt_mod
+        img_gate1, img_scale2, img_gate2 = self._img_mod
+        txt_gate1, txt_scale2, txt_gate2 = self._txt_mod
         assert img_scale2 is not None and txt_scale2 is not None
 
-        hidden_states = hidden_states + mx.tanh(img_gate2) * img_out
-        encoder_hidden_states = encoder_hidden_states + mx.tanh(txt_gate2) * txt_out
+        hidden_states = hidden_states + mx.tanh(img_gate1) * img_out
+        encoder_hidden_states = encoder_hidden_states + mx.tanh(txt_gate1) * txt_out
 
         img_normed2 = Qwen21TransformerBlock.modulate(
             block.norm2(hidden_states), img_scale2
