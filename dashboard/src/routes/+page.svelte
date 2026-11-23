@@ -33,6 +33,8 @@
     instanceLifetimeUsage,
     idleUnloadInfo,
     loadInstanceWeights,
+    launchProfileEntries,
+    restoreLaunchProfile,
     setIdleUnload,
     instanceActiveSessions,
     instanceActiveUsage,
@@ -1795,6 +1797,43 @@
       });
     } finally {
       launchingModelId = null;
+    }
+  }
+
+  let restoringSession = $state(false);
+
+  async function restoreLastSession() {
+    if (restoringSession) return;
+    restoringSession = true;
+    try {
+      const results = await restoreLaunchProfile();
+      const placed = results.filter((r) => r.action === "placed");
+      const failed = results.filter((r) => r.action === "failed");
+      if (placed.length > 0) {
+        addToast({
+          type: "success",
+          message: `Restoring last session: launching ${placed.length} model${placed.length > 1 ? "s" : ""}`,
+        });
+      }
+      for (const f of failed) {
+        addToast({
+          type: "error",
+          message: `Failed to restore ${f.model_id}: ${f.detail ?? "unknown error"}`,
+        });
+      }
+      if (placed.length === 0 && failed.length === 0) {
+        addToast({
+          type: "info",
+          message: "All models from last session are already running",
+        });
+      }
+    } catch (e) {
+      addToast({
+        type: "error",
+        message: `Restore failed: ${e instanceof Error ? e.message : String(e)}`,
+      });
+    } finally {
+      restoringSession = false;
     }
   }
 
@@ -6721,6 +6760,20 @@
                 </div>
               {/if}
             </div>
+
+            <!-- Restore last session (launch profile) -->
+            {#if launchProfileEntries().length > 0}
+              <button
+                class="w-full flex items-center justify-center gap-2 px-4 py-3 font-mono text-sm tracking-[0.2em] uppercase border border-exo-yellow/40 text-exo-yellow hover:bg-exo-yellow/10 hover:border-exo-yellow/70 transition-all duration-200 cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
+                onclick={restoreLastSession}
+                disabled={restoringSession}
+                title="Re-create every instance from the previous session with the same settings (sharding, instance type, node count, idle-unload)"
+              >
+                {restoringSession
+                  ? "Restoring..."
+                  : `LAUNCH LAST SESSION (${launchProfileEntries().length})`}
+              </button>
+            {/if}
 
             <!-- Selected Model Preview -->
             <div class="space-y-3">

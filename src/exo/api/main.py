@@ -49,6 +49,12 @@ from exo.api.adapters.responses import (
     responses_request_to_text_generation,
 )
 from exo.api.keepalive import with_sse_keepalive
+from exo.api.launch_profile import (
+    LaunchProfileEntry,
+    load_launch_profile,
+    remove_from_launch_profile,
+    upsert_launch_profile,
+)
 from exo.api.types import (
     AddCustomModelParams,
     AdvancedImageParams,
@@ -216,8 +222,17 @@ from exo.shared.types.text_generation import (
     TextGenerationTaskParams,
 )
 from exo.shared.types.worker.downloads import DownloadCompleted
-from exo.shared.types.worker.instances import Instance, InstanceId, InstanceMeta
-from exo.shared.types.worker.shards import Sharding
+from exo.shared.types.worker.instances import (
+    Instance,
+    InstanceId,
+    InstanceMeta,
+    MlxJacclInstance,
+)
+from exo.shared.types.worker.shards import (
+    CfgShardMetadata,
+    PipelineShardMetadata,
+    Sharding,
+)
 from exo.utils.banner import print_startup_banner
 from exo.utils.channels import Receiver, Sender, channel
 from exo.utils.disk_event_log import DiskEventLog
@@ -387,6 +402,9 @@ class API:
         # Pending PlaceInstance commands awaiting their InstanceCreated event,
         # keyed by model id: (policy, monotonic send time).
         self._pending_idle_policies: dict[str, tuple[InstanceIdlePolicy, float]] = {}
+        # Durable launch profile — how instances were placed last session,
+        # used by POST /launch-profile/restore to re-create them in one click.
+        self._launch_profile: dict[str, LaunchProfileEntry] = load_launch_profile()
         # Last activity timestamp per instance (refreshed when busy).
         self._idle_last_activity: dict[InstanceId, float] = {}
         # Instance ids we deleted via idle-unload (for unload-reason attribution).
@@ -449,6 +467,8 @@ class API:
         self.app.get("/instance/{instance_id}/idle-unload")(self.get_idle_unload)
         self.app.put("/instance/{instance_id}/idle-unload")(self.set_idle_unload)
         self.app.post("/instance/{instance_id}/load")(self.load_instance_weights)
+        self.app.get("/launch-profile")(self.get_launch_profile)
+        self.app.post("/launch-profile/restore")(self.restore_launch_profile)
         self.app.get("/v1/instance-links")(self.list_instance_links)
         self.app.post("/v1/instance-links")(self.create_instance_link)
         self.app.put("/v1/instance-links/{link_id}")(self.update_instance_link)
@@ -555,6 +575,16 @@ class API:
                 ),
                 time.time(),
             )
+        self._record_launch(
+            LaunchProfileEntry(
+                model_id=str(payload.model_id),
+                sharding=str(payload.sharding.value),
+                instance_meta=str(payload.instance_meta.value),
+                min_nodes=payload.min_nodes,
+                idle_unload_seconds=idle_unload_seconds,
+                added_at=time.time(),
+            )
+        )
         await self._send(command)
 
         return CreateInstanceResponse(
@@ -580,6 +610,7 @@ class API:
         command = CreateInstance(
             instance=instance,
         )
+        self._record_launch(self._launch_recipe_from_instance(instance))
         await self._send(command)
 
         return CreateInstanceResponse(
@@ -808,10 +839,19 @@ class API:
         if instance_id not in self.state.instances:
             raise HTTPException(status_code=404, detail="Instance not found")
 
+        instance = self.state.instances[instance_id]
         command = DeleteInstance(
             instance_id=instance_id,
         )
         await self._send(command)
+        model_id = str(instance.shard_assignments.model_id)
+        still_running = any(
+            other.instance_id != instance_id
+            and other.shard_assignments.model_id == instance.shard_assignments.model_id
+            for other in self.state.instances.values()
+        )
+        if not still_running:
+            self._launch_profile = remove_from_launch_profile(model_id)
         return DeleteInstanceResponse(
             message="Command received.",
             command_id=command.command_id,
@@ -872,6 +912,11 @@ class API:
         )
         if payload.idle_unload_seconds is not None:
             self._idle_last_activity[instance_id] = time.time()
+        # Keep the durable launch profile in sync so a later "restore last
+        # session" re-applies the same idle-unload timeout.
+        recipe = self._launch_recipe_from_instance(self.state.instances[instance_id])
+        if str(recipe.model_id) in self._launch_profile:
+            self._launch_profile = upsert_launch_profile(recipe)
         return self._idle_unload_info(instance_id)
 
     async def load_instance_weights(self, instance_id: InstanceId) -> IdleUnloadStatus:
@@ -881,6 +926,65 @@ class API:
         if instance_id in self.state.instance_weights_unloaded:
             await self._send(LoadInstanceWeights(instance_id=instance_id))
         return self._idle_unload_info(instance_id)
+
+    def get_launch_profile(self) -> dict[str, list[LaunchProfileEntry]]:
+        return {"entries": list(self._launch_profile.values())}
+
+    async def restore_launch_profile(self) -> dict[str, list[dict[str, str]]]:
+        """One-click restore of the previous session: re-place every model in
+        the durable launch profile that is not currently running, with the
+        exact sharding/instance_meta/min_nodes (and idle-unload policy) it had."""
+        results: list[dict[str, str]] = []
+        for entry in list(self._launch_profile.values()):
+            model_id = ModelId(entry.model_id)
+            if any(
+                instance.shard_assignments.model_id == model_id
+                for instance in self.state.instances.values()
+            ):
+                results.append(
+                    {"model_id": entry.model_id, "action": "already_running"}
+                )
+                continue
+            try:
+                model_card = await ModelCard.load(model_id)
+            except Exception as exc:
+                results.append(
+                    {
+                        "model_id": entry.model_id,
+                        "action": "failed",
+                        "detail": str(exc),
+                    }
+                )
+                continue
+            if entry.idle_unload_seconds is not None:
+                self._pending_idle_policies[str(model_id)] = (
+                    InstanceIdlePolicy(
+                        idle_unload_seconds=entry.idle_unload_seconds,
+                        sharding=entry.sharding,
+                        instance_meta=entry.instance_meta,
+                        min_nodes=entry.min_nodes,
+                    ),
+                    time.time(),
+                )
+            await self._send(
+                PlaceInstance(
+                    model_card=model_card,
+                    sharding=Sharding[entry.sharding],
+                    instance_meta=InstanceMeta[entry.instance_meta],
+                    min_nodes=entry.min_nodes,
+                )
+            )
+            logger.info(
+                f"Launch-profile restore: placing {entry.model_id} "
+                f"({entry.sharding}/{entry.instance_meta}/{entry.min_nodes} nodes"
+                + (
+                    f", idle_unload={entry.idle_unload_seconds}s)"
+                    if entry.idle_unload_seconds is not None
+                    else ")"
+                )
+            )
+            results.append({"model_id": entry.model_id, "action": "placed"})
+        return {"results": results}
 
     async def get_feature_flags(self) -> dict[str, bool]:
         return {
@@ -1496,6 +1600,30 @@ class API:
             )
 
         return await self._collect_text_generation_with_stats(command.command_id)
+
+    def _launch_recipe_from_instance(self, instance: Instance) -> LaunchProfileEntry:
+        """Derive the re-launchable recipe (model/sharding/meta/nodes) from a
+        live instance, including its current idle-unload policy if any."""
+        meta = "MlxJaccl" if isinstance(instance, MlxJacclInstance) else "MlxRing"
+        sharding = "Tensor"
+        for shard in instance.shard_assignments.runner_to_shard.values():
+            if isinstance(shard, (PipelineShardMetadata, CfgShardMetadata)):
+                sharding = "Pipeline"
+                break
+        policy = self.state.instance_idle_policies.get(instance.instance_id)
+        return LaunchProfileEntry(
+            model_id=str(instance.shard_assignments.model_id),
+            sharding=sharding,
+            instance_meta=meta,
+            min_nodes=len(instance.shard_assignments.node_to_runner),
+            idle_unload_seconds=(
+                policy.idle_unload_seconds if policy is not None else None
+            ),
+            added_at=time.time(),
+        )
+
+    def _record_launch(self, entry: LaunchProfileEntry) -> None:
+        self._launch_profile = upsert_launch_profile(entry)
 
     async def _validate_model_has_instance(self, model_id: ModelId) -> ModelId:
         """Validate a model has an active instance.

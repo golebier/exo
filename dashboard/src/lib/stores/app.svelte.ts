@@ -336,6 +336,21 @@ export interface SessionUsageResponse {
 
 // Idle-unload status for one instance, as served by
 // GET /instance/{id}/idle-unload (idle-unload feature).
+export interface LaunchProfileEntry {
+  model_id: string;
+  sharding: string;
+  instance_meta: string;
+  min_nodes: number;
+  idle_unload_seconds: number | null;
+  added_at: number;
+}
+
+export interface RestoreResult {
+  model_id: string;
+  action: "placed" | "already_running" | "failed";
+  detail?: string;
+}
+
 export interface IdleUnloadInfo {
   policySeconds: number | null;
   idleSeconds: number | null;
@@ -1545,6 +1560,15 @@ class AppStore {
         this.idleUnloadInfo = idleInfo;
       } catch {
         // feature missing on older EXO — non-fatal
+      }
+      try {
+        const r = await fetch("/launch-profile");
+        if (r.ok) {
+          const d = (await r.json()) as { entries: LaunchProfileEntry[] };
+          this.launchProfileEntries = d.entries ?? [];
+        }
+      } catch {
+        // non-fatal
       }
       if (data.runners) {
         this.runners = data.runners;
@@ -3644,6 +3668,28 @@ class AppStore {
     return info;
   }
 
+  launchProfileEntries = $state<LaunchProfileEntry[]>([]);
+
+  async fetchLaunchProfile(): Promise<void> {
+    try {
+      const r = await fetch("/launch-profile");
+      if (r.ok) {
+        const d = (await r.json()) as { entries: LaunchProfileEntry[] };
+        this.launchProfileEntries = d.entries ?? [];
+      }
+    } catch {
+      // profile is advisory — ignore fetch failures
+    }
+  }
+
+  async restoreLaunchProfile(): Promise<RestoreResult[]> {
+    const r = await fetch("/launch-profile/restore", { method: "POST" });
+    if (!r.ok) throw new Error(await r.text());
+    const d = (await r.json()) as { results: RestoreResult[] };
+    await this.fetchLaunchProfile();
+    return d.results ?? [];
+  }
+
   async loadInstanceWeights(
     instanceId: string,
   ): Promise<IdleUnloadInfo | null> {
@@ -3897,6 +3943,9 @@ export const setIdleUnload = (
 ) => appStore.setIdleUnload(instanceId, idleUnloadSeconds);
 export const loadInstanceWeights = (instanceId: string) =>
   appStore.loadInstanceWeights(instanceId);
+export const launchProfileEntries = () => appStore.launchProfileEntries;
+export const fetchLaunchProfile = () => appStore.fetchLaunchProfile();
+export const restoreLaunchProfile = () => appStore.restoreLaunchProfile();
 export const idleUnloadInfo = () => appStore.idleUnloadInfo;
 export const setTurboQuant = (
   enabled: boolean,
