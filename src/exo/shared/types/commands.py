@@ -50,6 +50,12 @@ class DeleteInstance(BaseCommand):
     instance_id: InstanceId
 
 
+class LoadInstanceWeights(BaseCommand):
+    """Manual (dashboard/API) request to load an unloaded instance."""
+
+    instance_id: InstanceId
+
+
 class SetInstanceIdlePolicy(BaseCommand):
     instance_id: InstanceId
     policy: InstanceIdlePolicy
@@ -118,6 +124,7 @@ Command = (
     | PlaceInstance
     | CreateInstance
     | DeleteInstance
+    | LoadInstanceWeights
     | SetInstanceIdlePolicy
     | TaskCancelled
     | TaskFinished

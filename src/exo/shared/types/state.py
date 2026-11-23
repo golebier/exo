@@ -55,6 +55,9 @@ class State(FrozenModel):
     instance_idle_policies: Mapping[InstanceId, InstanceIdlePolicy] = {}
     # Lifecycle load/unload counters keyed by "Type::model_id" (durable-style).
     instance_lifecycle: Mapping[str, InstanceLifecycleStats] = {}
+    # Instances whose weights were unloaded (idle sweeper / manual). The
+    # instance record itself stays in `instances`; value = unload reason.
+    instance_weights_unloaded: Mapping[InstanceId, str] = {}
     runners: Mapping[RunnerId, RunnerStatus] = {}
     downloads: Mapping[NodeId, Sequence[DownloadProgress]] = {}
     tasks: Mapping[TaskId, Task] = {}

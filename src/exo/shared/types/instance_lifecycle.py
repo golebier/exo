@@ -35,5 +35,6 @@ class InstanceUnloadReason:
 
     PLACEMENT = "placement"
     IDLE_UNLOAD = "idle_unload"
+    IDLE_RELOAD = "idle_reload"
     MANUAL = "manual"
     ERROR = "error"

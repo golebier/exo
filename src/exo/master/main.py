@@ -28,6 +28,7 @@ from exo.shared.types.commands import (
     ForwarderDownloadCommand,
     ImageEdits,
     ImageGeneration,
+    LoadInstanceWeights,
     PlaceInstance,
     RequestEventLog,
     SendInputChunk,
@@ -38,7 +39,7 @@ from exo.shared.types.commands import (
     TestCommand,
     TextGeneration,
 )
-from exo.shared.types.common import CommandId, NodeId, SessionId, SystemId
+from exo.shared.types.common import CommandId, ModelId, NodeId, SessionId, SystemId
 from exo.shared.types.events import (
     CustomModelCardAdded,
     CustomModelCardDeleted,
@@ -52,6 +53,8 @@ from exo.shared.types.events import (
     InstanceLifecycleRecorded,
     InstanceLinkCreated,
     InstanceLinkDeleted,
+    InstanceWeightsLoadRequested,
+    InstanceWeightsUnloaded,
     LocalForwarderEvent,
     NodeGatheredInfo,
     NodeTimedOut,
@@ -153,7 +156,6 @@ class Master:
         self._pending_traces: dict[TaskId, dict[int, list[TraceEventData]]] = {}
         self._expected_ranks: dict[TaskId, set[int]] = {}
         self._idle_last_activity: dict[InstanceId, float] = {}
-        self._idle_unload_inflight: set[InstanceId] = set()
 
     async def run(self):
         logger.info("Starting Master")
@@ -202,6 +204,8 @@ class Master:
                                     instance.shard_assignments.model_id
                                     == command.task_params.model
                                     and instance.instance_id not in prefill_only
+                                    and instance.instance_id
+                                    not in self.state.instance_weights_unloaded
                                 ):
                                     # count in-flight tasks of that instance
                                     in_flight = {TaskStatus.Pending, TaskStatus.Running}
@@ -217,6 +221,9 @@ class Master:
 
                             # there are no NON-prefill-only instances matching this model ID
                             if not instance_task_counts:
+                                self._reload_unloaded_for_model(
+                                    command.task_params.model, generated_events
+                                )
                                 raise ValueError(
                                     f"No instance found for model {command.task_params.model}"
                                 )
@@ -268,6 +275,9 @@ class Master:
                                     )
 
                             if not instance_task_counts:
+                                self._reload_unloaded_for_model(
+                                    command.task_params.model, generated_events
+                                )
                                 raise ValueError(
                                     f"No instance found for model {command.task_params.model}"
                                 )
@@ -324,6 +334,9 @@ class Master:
                                     )
 
                             if not instance_task_counts:
+                                self._reload_unloaded_for_model(
+                                    command.task_params.model, generated_events
+                                )
                                 raise ValueError(
                                     f"No instance found for model {command.task_params.model}"
                                 )
@@ -459,6 +472,25 @@ class Master:
                             generated_events.append(
                                 InstanceLinkDeleted(link_id=command.link_id)
                             )
+                        case LoadInstanceWeights():
+                            if command.instance_id in self.state.instances:
+                                instance = self.state.instances[command.instance_id]
+                                generated_events.append(
+                                    InstanceWeightsLoadRequested(
+                                        instance_id=command.instance_id
+                                    )
+                                )
+                                generated_events.append(
+                                    InstanceLifecycleRecorded(
+                                        model_id=str(
+                                            instance.shard_assignments.model_id
+                                        ),
+                                        instance_type=type(instance).__name__,
+                                        phase="load",
+                                        reason=InstanceUnloadReason.MANUAL,
+                                        ts=time.time(),
+                                    )
+                                )
                         case SetInstanceIdlePolicy():
                             generated_events.append(
                                 InstanceIdlePolicySet(
@@ -509,19 +541,64 @@ class Master:
                                         if event.instance_id in self.state.instances
                                         else "unknown",
                                         phase="unload",
-                                        reason=(
-                                            InstanceUnloadReason.IDLE_UNLOAD
-                                            if event.instance_id
-                                            in self._idle_unload_inflight
-                                            else InstanceUnloadReason.MANUAL
-                                        ),
+                                        reason=InstanceUnloadReason.MANUAL,
                                         ts=time.time(),
                                     )
                                 )
+                            case InstanceWeightsUnloaded():
+                                instance = self.state.instances.get(event.instance_id)
+                                if instance is not None:
+                                    await self.event_sender.send(
+                                        InstanceLifecycleRecorded(
+                                            model_id=str(
+                                                instance.shard_assignments.model_id
+                                            ),
+                                            instance_type=type(instance).__name__,
+                                            phase="unload",
+                                            reason=InstanceUnloadReason.IDLE_UNLOAD,
+                                            ts=time.time(),
+                                        )
+                                    )
+                            case InstanceWeightsLoadRequested():
+                                instance = self.state.instances.get(event.instance_id)
+                                if instance is not None:
+                                    await self.event_sender.send(
+                                        InstanceLifecycleRecorded(
+                                            model_id=str(
+                                                instance.shard_assignments.model_id
+                                            ),
+                                            instance_type=type(instance).__name__,
+                                            phase="load",
+                                            reason=InstanceUnloadReason.IDLE_RELOAD,
+                                            ts=time.time(),
+                                        )
+                                    )
                             case _:
                                 pass
                 except Exception as e:
                     logger.opt(exception=e).warning("Error in command processor")
+
+    def _reload_unloaded_for_model(
+        self, model_id: ModelId | str, generated_events: list[Event]
+    ) -> None:
+        """Auto-reload an unloaded instance when a request targets its model.
+
+        The request itself fails fast (caller raises); the instance flips
+        back to loaded in the background so the retry/re-request succeeds
+        once the weights are resident again.
+        """
+        for instance_id, instance in self.state.instances.items():
+            if (
+                instance.shard_assignments.model_id == model_id
+                and instance_id in self.state.instance_weights_unloaded
+            ):
+                logger.info(
+                    f"Auto-reloading unloaded instance {instance_id} for {model_id}"
+                )
+                generated_events.append(
+                    InstanceWeightsLoadRequested(instance_id=instance_id)
+                )
+                return
 
     # These plan loops are the cracks showing in our event sourcing architecture - more things could be commands
     async def _plan(self) -> None:
@@ -558,22 +635,12 @@ class Master:
                 logger.info(
                     f"Idle-unloading instance {instance_id} after {int(idle_for)}s idle"
                 )
-                instance = self.state.instances.get(instance_id)
-                self._idle_unload_inflight.add(instance_id)
-                await self.event_sender.send(InstanceDeleted(instance_id=instance_id))
-                if instance is not None:
-                    # The command processor only attributes command-generated
-                    # deletions; the sweeper sends the event itself, so record
-                    # the unload here (state still holds the instance).
-                    await self.event_sender.send(
-                        InstanceLifecycleRecorded(
-                            model_id=str(instance.shard_assignments.model_id),
-                            instance_type=type(instance).__name__,
-                            phase="unload",
-                            reason=InstanceUnloadReason.IDLE_UNLOAD,
-                            ts=time.time(),
-                        )
-                    )
+                # Keep the instance (shard assignments, links, policy survive);
+                # only the weights are freed. Workers see the flag and shut
+                # their runner processes down.
+                await self.event_sender.send(
+                    InstanceWeightsUnloaded(instance_id=instance_id)
+                )
 
             # time out dead nodes
             for node_id, last_seen in self.state.last_seen.items():

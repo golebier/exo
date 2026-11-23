@@ -175,6 +175,7 @@ from exo.shared.types.commands import (
     ForwarderDownloadCommand,
     ImageEdits,
     ImageGeneration,
+    LoadInstanceWeights,
     PlaceInstance,
     SendInputChunk,
     SetInstanceIdlePolicy,
@@ -447,6 +448,7 @@ class API:
         self.app.delete("/instance/{instance_id}")(self.delete_instance)
         self.app.get("/instance/{instance_id}/idle-unload")(self.get_idle_unload)
         self.app.put("/instance/{instance_id}/idle-unload")(self.set_idle_unload)
+        self.app.post("/instance/{instance_id}/load")(self.load_instance_weights)
         self.app.get("/v1/instance-links")(self.list_instance_links)
         self.app.post("/v1/instance-links")(self.create_instance_link)
         self.app.put("/v1/instance-links/{link_id}")(self.update_instance_link)
@@ -832,6 +834,7 @@ class API:
         return IdleUnloadStatus(
             policy_seconds=(policy.idle_unload_seconds if policy is not None else None),
             idle_seconds=idle_for,
+            weights_unloaded=instance_id in self.state.instance_weights_unloaded,
             load_count=stats.load_count if stats is not None else 0,
             unload_count=stats.unload_count if stats is not None else 0,
             last_load_ts=stats.last_load_ts if stats is not None else None,
@@ -869,6 +872,14 @@ class API:
         )
         if payload.idle_unload_seconds is not None:
             self._idle_last_activity[instance_id] = time.time()
+        return self._idle_unload_info(instance_id)
+
+    async def load_instance_weights(self, instance_id: InstanceId) -> IdleUnloadStatus:
+        """Manually load an idle-unloaded instance's weights back into memory."""
+        if instance_id not in self.state.instances:
+            raise HTTPException(status_code=404, detail="Instance not found")
+        if instance_id in self.state.instance_weights_unloaded:
+            await self._send(LoadInstanceWeights(instance_id=instance_id))
         return self._idle_unload_info(instance_id)
 
     async def get_feature_flags(self) -> dict[str, bool]:

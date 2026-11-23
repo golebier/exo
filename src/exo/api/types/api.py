@@ -329,6 +329,7 @@ class IdleUnloadStatus(BaseModel):
 
     policy_seconds: int | None = None
     idle_seconds: float | None = None
+    weights_unloaded: bool = False
     load_count: int = 0
     unload_count: int = 0
     last_load_ts: float | None = None

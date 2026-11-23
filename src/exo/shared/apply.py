@@ -20,6 +20,8 @@ from exo.shared.types.events import (
     InstanceLinkCreated,
     InstanceLinkDeleted,
     InstanceTokensUpdated,
+    InstanceWeightsLoadRequested,
+    InstanceWeightsUnloaded,
     NodeDownloadProgress,
     NodeGatheredInfo,
     NodeTimedOut,
@@ -113,6 +115,10 @@ def event_apply(event: Event, state: State) -> State:
             return apply_instance_idle_policy_set(event, state)
         case InstanceLifecycleRecorded():
             return apply_instance_lifecycle_recorded(event, state)
+        case InstanceWeightsUnloaded():
+            return apply_instance_weights_unloaded(event, state)
+        case InstanceWeightsLoadRequested():
+            return apply_instance_weights_load_requested(event, state)
         case NodeTimedOut():
             return apply_node_timed_out(event, state)
         case NodeDownloadProgress():
@@ -566,6 +572,29 @@ def apply_instance_idle_policy_set(event: InstanceIdlePolicySet, state: State) -
         event.instance_id: event.policy,
     }
     return state.model_copy(update={"instance_idle_policies": new_policies})
+
+
+def apply_instance_weights_unloaded(
+    event: InstanceWeightsUnloaded, state: State
+) -> State:
+    """Mark an instance's weights unloaded; the instance record stays."""
+    new_unloaded: Mapping[InstanceId, str] = {
+        **state.instance_weights_unloaded,
+        event.instance_id: "idle_unload",
+    }
+    return state.model_copy(update={"instance_weights_unloaded": new_unloaded})
+
+
+def apply_instance_weights_load_requested(
+    event: InstanceWeightsLoadRequested, state: State
+) -> State:
+    """Clear the unloaded flag; workers re-spawn runners and reload weights."""
+    new_unloaded: Mapping[InstanceId, str] = {
+        iid: reason
+        for iid, reason in state.instance_weights_unloaded.items()
+        if iid != event.instance_id
+    }
+    return state.model_copy(update={"instance_weights_unloaded": new_unloaded})
 
 
 def apply_instance_lifecycle_recorded(

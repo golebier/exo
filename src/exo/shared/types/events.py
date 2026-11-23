@@ -73,6 +73,23 @@ class InstanceDeleted(BaseEvent):
     instance_id: InstanceId
 
 
+class InstanceWeightsUnloaded(BaseEvent):
+    """Idle-unload sweeper freed this instance's weights from node memory.
+
+    The instance record (and its shard assignments) STAYS in state - only
+    the runner processes holding the weights are shut down. Load it again
+    with InstanceWeightsLoadRequested (automatic on next request).
+    """
+
+    instance_id: InstanceId
+
+
+class InstanceWeightsLoadRequested(BaseEvent):
+    """Request to load an unloaded instance's weights back into memory."""
+
+    instance_id: InstanceId
+
+
 class InstanceIdlePolicySet(BaseEvent):
     """Per-instance idle-unload policy set or updated (API-side sweeper input)."""
 
@@ -198,6 +215,8 @@ Event = (
     | InstanceTokensUpdated
     | InstanceIdlePolicySet
     | InstanceLifecycleRecorded
+    | InstanceWeightsUnloaded
+    | InstanceWeightsLoadRequested
     | RunnerStatusUpdated
     | NodeTimedOut
     | NodeGatheredInfo

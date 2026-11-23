@@ -56,12 +56,16 @@ def plan(
     image_cache: Mapping[Base64ImageHash, Base64Image],
     instance_backoff: KeyedBackoff[InstanceId],
     download_backoff: KeyedBackoff[ModelId],
+    weights_unloaded: Mapping[InstanceId, str] | None = None,
 ) -> Task | None:
+    unloaded = weights_unloaded or {}
     # Python short circuiting OR logic should evaluate these sequentially.
     return (
         _cancel_tasks(runners, tasks)
-        or _kill_runner(runners, all_runners, instances)
-        or _create_runner(node_id, runners, all_runners, instances, instance_backoff)
+        or _kill_runner(runners, all_runners, instances, unloaded)
+        or _create_runner(
+            node_id, runners, all_runners, instances, instance_backoff, unloaded
+        )
         or _model_needs_download(
             node_id, runners, global_download_status, download_backoff
         )
@@ -76,10 +80,14 @@ def _kill_runner(
     runners: Mapping[RunnerId, RunnerSupervisor],
     all_runners: Mapping[RunnerId, RunnerStatus],
     instances: Mapping[InstanceId, Instance],
+    unloaded: Mapping[InstanceId, str],
 ) -> Shutdown | None:
     for runner in runners.values():
         runner_id = runner.bound_instance.bound_runner_id
         if (instance_id := runner.bound_instance.instance.instance_id) not in instances:
+            return Shutdown(instance_id=instance_id, runner_id=runner_id)
+        # idle-unload: instance stays in state, weights are freed
+        if instance_id in unloaded:
             return Shutdown(instance_id=instance_id, runner_id=runner_id)
         if isinstance(runner.status, RunnerFailed):
             return Shutdown(
@@ -106,6 +114,7 @@ def _create_runner(
     all_runners: Mapping[RunnerId, RunnerStatus],
     instances: Mapping[InstanceId, Instance],
     instance_backoff: KeyedBackoff[InstanceId],
+    unloaded: Mapping[InstanceId, str],
 ) -> CreateRunner | None:
     for instance in instances.values():
         runner_id = instance.shard_assignments.node_to_runner.get(node_id, None)
@@ -123,6 +132,10 @@ def _create_runner(
         )
         we_have_failed_before = isinstance(all_runners.get(runner_id), RunnerFailed)
         if instance_has_failed_runner and not we_have_failed_before:
+            continue
+
+        # idle-unloaded: weights freed, do not respawn until a load is requested
+        if instance.instance_id in unloaded:
             continue
 
         if not instance_backoff.should_proceed(instance.instance_id):

@@ -32,6 +32,7 @@
     instanceTokenUsage,
     instanceLifetimeUsage,
     idleUnloadInfo,
+    loadInstanceWeights,
     setIdleUnload,
     instanceActiveSessions,
     instanceActiveUsage,
@@ -7412,6 +7413,39 @@
                                   : ""}</span
                               >
                             </div>
+                            {#if idle.weightsUnloaded}
+                              <div
+                                class="mt-1 flex items-center gap-1.5 text-[11px] font-mono"
+                              >
+                                <span
+                                  class="text-yellow-400"
+                                  title="Instance kept, weights unloaded from memory. It reloads automatically on the next request to this model."
+                                  >unloaded</span
+                                >
+                                <button
+                                  class="text-white/30 hover:text-exo-yellow transition-colors"
+                                  title="Load this instance's weights back into memory now"
+                                  onclick={(e) => {
+                                    e.stopPropagation();
+                                    void loadInstanceWeights(id).then(
+                                      (info) => {
+                                        if (!info) {
+                                          addToast({
+                                            type: "error",
+                                            message: "Failed to load instance",
+                                          });
+                                        } else {
+                                          addToast({
+                                            type: "success",
+                                            message: "Loading instance weights",
+                                          });
+                                        }
+                                      },
+                                    );
+                                  }}>load</button
+                                >
+                              </div>
+                            {/if}
                           {/if}
                           {#if debugEnabled && instanceConnections.length > 0}
                             <div class="mt-2 space-y-1">

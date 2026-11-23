@@ -339,6 +339,7 @@ export interface SessionUsageResponse {
 export interface IdleUnloadInfo {
   policySeconds: number | null;
   idleSeconds: number | null;
+  weightsUnloaded: boolean;
   loadCount: number;
   unloadCount: number;
   lastLoadTs: number | null;
@@ -3643,6 +3644,22 @@ class AppStore {
     return info;
   }
 
+  async loadInstanceWeights(
+    instanceId: string,
+  ): Promise<IdleUnloadInfo | null> {
+    const response = await fetch(
+      `/instance/${encodeURIComponent(instanceId)}/load`,
+      { method: "POST" },
+    );
+    if (!response.ok) return null;
+    const info = (await response.json()) as IdleUnloadInfo;
+    this.idleUnloadInfo = {
+      ...this.idleUnloadInfo,
+      [instanceId]: info,
+    };
+    return info;
+  }
+
   async setMemoryGuard(enabled: boolean): Promise<void> {
     const response = await fetch("/v1/memory-guard", {
       method: "PUT",
@@ -3878,6 +3895,8 @@ export const setIdleUnload = (
   instanceId: string,
   idleUnloadSeconds: number | null,
 ) => appStore.setIdleUnload(instanceId, idleUnloadSeconds);
+export const loadInstanceWeights = (instanceId: string) =>
+  appStore.loadInstanceWeights(instanceId);
 export const idleUnloadInfo = () => appStore.idleUnloadInfo;
 export const setTurboQuant = (
   enabled: boolean,

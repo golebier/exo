@@ -204,6 +204,7 @@ class Worker:
                 self.image_cache,
                 self._instance_backoff,
                 self._download_backoff,
+                self.state.instance_weights_unloaded,
             )
             if task is None:
                 continue
