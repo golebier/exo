@@ -1416,14 +1416,31 @@ class API:
                 }
                 for session_id, entry in sessions.items()
             ]
-        # Durable lifetime totals, mapped to the instances currently in state.
+        # Durable lifetime totals: rows for live instances (keyed by instance
+        # id, as before) PLUS every persisted key under its stable lifetime
+        # key, so the Σ totals survive idle-unload / instance recreation.
         lifetime: dict[str, dict[str, int]] = {}
         for instance_id, instance in self.state.instances.items():
-            usage = self._lifetime_usage.get(self._lifetime_key(instance))
+            key = self._lifetime_key(instance)
+            usage = self._lifetime_usage.get(key)
             if usage is None:
                 continue
-            stats = self.state.instance_lifecycle.get(self._lifetime_key(instance))
+            stats = self.state.instance_lifecycle.get(key)
             lifetime[str(instance_id)] = {
+                "promptTokens": usage.prompt_tokens,
+                "completionTokens": usage.completion_tokens,
+                "requestCount": usage.request_count,
+                "loadCount": stats.load_count if stats is not None else 0,
+                "unloadCount": stats.unload_count if stats is not None else 0,
+            }
+        lifetime_keys_emitted = set(self._lifetime_usage) & {
+            self._lifetime_key(instance) for instance in self.state.instances.values()
+        }
+        for key, usage in self._lifetime_usage.items():
+            if key in lifetime_keys_emitted:
+                continue
+            stats = self.state.instance_lifecycle.get(key)
+            lifetime[key] = {
                 "promptTokens": usage.prompt_tokens,
                 "completionTokens": usage.completion_tokens,
                 "requestCount": usage.request_count,

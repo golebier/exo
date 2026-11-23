@@ -558,8 +558,22 @@ class Master:
                 logger.info(
                     f"Idle-unloading instance {instance_id} after {int(idle_for)}s idle"
                 )
+                instance = self.state.instances.get(instance_id)
                 self._idle_unload_inflight.add(instance_id)
                 await self.event_sender.send(InstanceDeleted(instance_id=instance_id))
+                if instance is not None:
+                    # The command processor only attributes command-generated
+                    # deletions; the sweeper sends the event itself, so record
+                    # the unload here (state still holds the instance).
+                    await self.event_sender.send(
+                        InstanceLifecycleRecorded(
+                            model_id=str(instance.shard_assignments.model_id),
+                            instance_type=type(instance).__name__,
+                            phase="unload",
+                            reason=InstanceUnloadReason.IDLE_UNLOAD,
+                            ts=time.time(),
+                        )
+                    )
 
             # time out dead nodes
             for node_id, last_seen in self.state.last_seen.items():
