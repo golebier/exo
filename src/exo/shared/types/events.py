@@ -7,6 +7,9 @@ from exo.shared.models.model_cards import ModelCard
 from exo.shared.topology import Connection
 from exo.shared.types.chunks import Chunk, InputImageChunk
 from exo.shared.types.common import CommandId, Id, ModelId, NodeId, SessionId, SystemId
+from exo.shared.types.instance_lifecycle import (
+    InstanceIdlePolicy,
+)
 from exo.shared.types.instance_link import InstanceLink, InstanceLinkId
 from exo.shared.types.tasks import Task, TaskId, TaskStatus
 from exo.shared.types.worker.downloads import DownloadProgress
@@ -68,6 +71,29 @@ class InstanceCreated(BaseEvent):
 
 class InstanceDeleted(BaseEvent):
     instance_id: InstanceId
+
+
+class InstanceIdlePolicySet(BaseEvent):
+    """Per-instance idle-unload policy set or updated (API-side sweeper input)."""
+
+    instance_id: InstanceId
+    policy: InstanceIdlePolicy
+
+
+class InstanceLifecycleRecorded(BaseEvent):
+    """A load or unload of an instance, for the durable lifecycle ledger.
+
+    Emitted by the API (on placement ack / idle unload / manual delete) and
+    folded into :class:`~exo.shared.types.instance_lifecycle.InstanceLifecycleStats`
+    keyed by (instance type, model) so the counters survive restarts and
+    instance re-creation.
+    """
+
+    model_id: str
+    instance_type: str
+    phase: str  # "load" | "unload"
+    reason: str  # placement | idle_unload | manual | error
+    ts: float
 
 
 class InstanceTokensUpdated(BaseEvent):
@@ -170,6 +196,8 @@ Event = (
     | InstanceCreated
     | InstanceDeleted
     | InstanceTokensUpdated
+    | InstanceIdlePolicySet
+    | InstanceLifecycleRecorded
     | RunnerStatusUpdated
     | NodeTimedOut
     | NodeGatheredInfo

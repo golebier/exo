@@ -3,7 +3,8 @@ from collections.abc import Generator
 from typing import Annotated, Any, Literal, get_args
 from uuid import uuid4
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic.alias_generators import to_camel
 
 from exo.shared.models.model_cards import ModelCard, ModelId
 from exo.shared.types.common import CommandId, NodeId
@@ -274,6 +275,9 @@ class PlaceInstanceParams(BaseModel):
     sharding: Sharding = Sharding.Pipeline
     instance_meta: InstanceMeta = InstanceMeta.MlxRing
     min_nodes: int = 1
+    # Idle-unload: delete the instance automatically after this many idle
+    # seconds (no in-flight requests). None = never unload (default).
+    idle_unload_seconds: int | None = Field(default=None, ge=5)
 
 
 class CreateInstanceParams(BaseModel):
@@ -308,6 +312,28 @@ class DeleteInstanceResponse(BaseModel):
     message: str
     command_id: CommandId
     instance_id: InstanceId
+
+
+class SetIdleUnloadParams(BaseModel):
+    idle_unload_seconds: int | None = Field(ge=5)
+
+
+class IdleUnloadStatus(BaseModel):
+    """Idle-unload view for one instance (idle policy + lifecycle counters).
+
+    Serialized camelCase (matches the dashboard's consumption of the
+    hand-built ``/session-usage`` payload).
+    """
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
+
+    policy_seconds: int | None = None
+    idle_seconds: float | None = None
+    load_count: int = 0
+    unload_count: int = 0
+    last_load_ts: float | None = None
+    last_unload_ts: float | None = None
+    last_unload_reason: str | None = None
 
 
 class AwaitInstanceReadyMessage(BaseModel):

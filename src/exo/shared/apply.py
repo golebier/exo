@@ -15,6 +15,8 @@ from exo.shared.types.events import (
     InputChunkReceived,
     InstanceCreated,
     InstanceDeleted,
+    InstanceIdlePolicySet,
+    InstanceLifecycleRecorded,
     InstanceLinkCreated,
     InstanceLinkDeleted,
     InstanceTokensUpdated,
@@ -32,6 +34,10 @@ from exo.shared.types.events import (
     TopologyEdgeDeleted,
     TracesCollected,
     TracesMerged,
+)
+from exo.shared.types.instance_lifecycle import (
+    InstanceIdlePolicy,
+    InstanceLifecycleStats,
 )
 from exo.shared.types.instance_link import InstanceLink, InstanceLinkId
 from exo.shared.types.profiling import (
@@ -103,6 +109,10 @@ def event_apply(event: Event, state: State) -> State:
             return apply_instance_deleted(event, state)
         case InstanceTokensUpdated():
             return apply_instance_tokens_updated(event, state)
+        case InstanceIdlePolicySet():
+            return apply_instance_idle_policy_set(event, state)
+        case InstanceLifecycleRecorded():
+            return apply_instance_lifecycle_recorded(event, state)
         case NodeTimedOut():
             return apply_node_timed_out(event, state)
         case NodeDownloadProgress():
@@ -548,3 +558,32 @@ def apply_custom_model_card_deleted(
         if model_id != event.model_id
     }
     return state.model_copy(update={"custom_model_cards": new_cards})
+
+
+def apply_instance_idle_policy_set(event: InstanceIdlePolicySet, state: State) -> State:
+    new_policies: Mapping[InstanceId, InstanceIdlePolicy] = {
+        **state.instance_idle_policies,
+        event.instance_id: event.policy,
+    }
+    return state.model_copy(update={"instance_idle_policies": new_policies})
+
+
+def apply_instance_lifecycle_recorded(
+    event: InstanceLifecycleRecorded, state: State
+) -> State:
+    """Fold one load/unload into the lifecycle ledger keyed by (type, model)."""
+    key = f"{event.instance_type}::{event.model_id}"
+    stats = state.instance_lifecycle.get(key, InstanceLifecycleStats())
+    updates: dict[str, float | int | str | None] = {}
+    if event.phase == "load":
+        updates["load_count"] = stats.load_count + 1
+        updates["last_load_ts"] = event.ts
+    else:
+        updates["unload_count"] = stats.unload_count + 1
+        updates["last_unload_ts"] = event.ts
+        updates["last_unload_reason"] = event.reason
+    new_lifecycle: Mapping[str, InstanceLifecycleStats] = {
+        **state.instance_lifecycle,
+        key: stats.model_copy(update=updates),
+    }
+    return state.model_copy(update={"instance_lifecycle": new_lifecycle})

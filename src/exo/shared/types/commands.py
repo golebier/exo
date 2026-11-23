@@ -7,6 +7,7 @@ from exo.api.types import (
 from exo.shared.models.model_cards import ModelCard, ModelId
 from exo.shared.types.chunks import InputImageChunk
 from exo.shared.types.common import CommandId, NodeId, SystemId
+from exo.shared.types.instance_lifecycle import InstanceIdlePolicy
 from exo.shared.types.instance_link import InstanceLinkId
 from exo.shared.types.text_generation import TextGenerationTaskParams
 from exo.shared.types.worker.instances import Instance, InstanceId, InstanceMeta
@@ -47,6 +48,11 @@ class CreateInstance(BaseCommand):
 
 class DeleteInstance(BaseCommand):
     instance_id: InstanceId
+
+
+class SetInstanceIdlePolicy(BaseCommand):
+    instance_id: InstanceId
+    policy: InstanceIdlePolicy
 
 
 class TaskCancelled(BaseCommand):
@@ -112,6 +118,7 @@ Command = (
     | PlaceInstance
     | CreateInstance
     | DeleteInstance
+    | SetInstanceIdlePolicy
     | TaskCancelled
     | TaskFinished
     | SendInputChunk

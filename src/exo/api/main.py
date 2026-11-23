@@ -2,6 +2,7 @@ import base64
 import contextlib
 import hashlib
 import json
+import os
 import random
 import time
 from collections.abc import AsyncGenerator, Awaitable, Callable, Iterable
@@ -75,6 +76,7 @@ from exo.api.types import (
     FinishReason,
     GenerationStats,
     HuggingFaceSearchResult,
+    IdleUnloadStatus,
     ImageData,
     ImageEditsTaskParams,
     ImageGenerationResponse,
@@ -91,6 +93,7 @@ from exo.api.types import (
     PlaceInstanceParams,
     PlacementPreview,
     PlacementPreviewResponse,
+    SetIdleUnloadParams,
     StartDownloadParams,
     StartDownloadResponse,
     TieredCacheSetting,
@@ -174,6 +177,7 @@ from exo.shared.types.commands import (
     ImageGeneration,
     PlaceInstance,
     SendInputChunk,
+    SetInstanceIdlePolicy,
     SetInstanceLink,
     StartDownload,
     TaskCancelled,
@@ -185,10 +189,12 @@ from exo.shared.types.events import (
     ChunkGenerated,
     Event,
     IndexedEvent,
+    InstanceCreated,
     InstanceDeleted,
     InstanceTokensUpdated,
     TracesMerged,
 )
+from exo.shared.types.instance_lifecycle import InstanceIdlePolicy
 from exo.shared.types.instance_link import InstanceLink, InstanceLinkId
 from exo.shared.types.memory import Memory
 from exo.shared.types.state import State
@@ -197,6 +203,9 @@ from exo.shared.types.tasks import (
 )
 from exo.shared.types.tasks import (
     ImageGeneration as ImageGenerationTask,
+)
+from exo.shared.types.tasks import (
+    TaskStatus,
 )
 from exo.shared.types.tasks import (
     TextGeneration as TextGenerationTask,
@@ -288,6 +297,21 @@ class _LifetimeUsage:
     request_count: int = 0
 
 
+def _env_idle_unload_seconds() -> int | None:
+    """Cluster-wide default idle-unload timeout (seconds) from the environment.
+
+    ``EXO_IDLE_UNLOAD_SECONDS=0`` or an unset/invalid value disables it.
+    """
+    raw = os.environ.get("EXO_IDLE_UNLOAD_SECONDS")
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        return None
+    return value if value >= 5 else None
+
+
 class API:
     def __init__(
         self,
@@ -358,6 +382,15 @@ class API:
         self._image_store = ImageStore(EXO_IMAGE_CACHE_DIR)
         self._tg: TaskGroup = TaskGroup()
 
+        # Idle-unload bookkeeping (API-side).
+        # Pending PlaceInstance commands awaiting their InstanceCreated event,
+        # keyed by model id: (policy, monotonic send time).
+        self._pending_idle_policies: dict[str, tuple[InstanceIdlePolicy, float]] = {}
+        # Last activity timestamp per instance (refreshed when busy).
+        self._idle_last_activity: dict[InstanceId, float] = {}
+        # Instance ids we deleted via idle-unload (for unload-reason attribution).
+        self._idle_unload_inflight: set[InstanceId] = set()
+
     def reset(self, result_clock: int, event_receiver: Receiver[IndexedEvent]):
         logger.info("Resetting API State")
         self._event_log.close()
@@ -412,6 +445,8 @@ class API:
         self.app.get("/instance/await", response_model=None)(self.await_instance)
         self.app.get("/instance/{instance_id}")(self.get_instance)
         self.app.delete("/instance/{instance_id}")(self.delete_instance)
+        self.app.get("/instance/{instance_id}/idle-unload")(self.get_idle_unload)
+        self.app.put("/instance/{instance_id}/idle-unload")(self.set_idle_unload)
         self.app.get("/v1/instance-links")(self.list_instance_links)
         self.app.post("/v1/instance-links")(self.create_instance_link)
         self.app.put("/v1/instance-links/{link_id}")(self.update_instance_link)
@@ -503,6 +538,21 @@ class API:
             instance_meta=payload.instance_meta,
             min_nodes=payload.min_nodes,
         )
+        idle_unload_seconds = (
+            payload.idle_unload_seconds
+            if payload.idle_unload_seconds is not None
+            else _env_idle_unload_seconds()
+        )
+        if idle_unload_seconds is not None:
+            self._pending_idle_policies[str(payload.model_id)] = (
+                InstanceIdlePolicy(
+                    idle_unload_seconds=idle_unload_seconds,
+                    sharding=str(payload.sharding.value),
+                    instance_meta=str(payload.instance_meta.value),
+                    min_nodes=payload.min_nodes,
+                ),
+                time.time(),
+            )
         await self._send(command)
 
         return CreateInstanceResponse(
@@ -701,10 +751,14 @@ class API:
 
         return PlacementPreviewResponse(previews=previews)
 
-    def get_instance(self, instance_id: InstanceId) -> Instance:
+    def get_instance(self, instance_id: InstanceId) -> dict[str, Any]:
         if instance_id not in self.state.instances:
             raise HTTPException(status_code=404, detail="Instance not found")
-        return self.state.instances[instance_id]
+        instance = self.state.instances[instance_id]
+        return {
+            "instance": instance,
+            "idleUnload": self._idle_unload_info(instance_id).model_dump(),
+        }
 
     async def await_instance(
         self,
@@ -761,6 +815,61 @@ class API:
             command_id=command.command_id,
             instance_id=instance_id,
         )
+
+    def _idle_unload_info(self, instance_id: InstanceId) -> IdleUnloadStatus:
+        """Idle-unload policy + lifecycle counters for one instance."""
+        instance = self.state.instances.get(instance_id)
+        if instance is None:
+            raise HTTPException(status_code=404, detail="Instance not found")
+        policy = self.state.instance_idle_policies.get(instance_id)
+        key = f"{type(instance).__name__}::{instance.shard_assignments.model_id}"
+        stats = self.state.instance_lifecycle.get(key)
+        busy = self._instance_busy(instance_id)
+        now = time.time()
+        idle_for: float | None = None
+        if not busy:
+            idle_for = now - self._idle_last_activity.get(instance_id, now)
+        return IdleUnloadStatus(
+            policy_seconds=(policy.idle_unload_seconds if policy is not None else None),
+            idle_seconds=idle_for,
+            load_count=stats.load_count if stats is not None else 0,
+            unload_count=stats.unload_count if stats is not None else 0,
+            last_load_ts=stats.last_load_ts if stats is not None else None,
+            last_unload_ts=stats.last_unload_ts if stats is not None else None,
+            last_unload_reason=stats.last_unload_reason if stats is not None else None,
+        )
+
+    def _instance_busy(self, instance_id: InstanceId) -> bool:
+        """An instance is busy while any of its tasks is pending/running."""
+        return any(
+            task.instance_id == instance_id
+            and task.task_status in (TaskStatus.Pending, TaskStatus.Running)
+            for task in self.state.tasks.values()
+        )
+
+    def get_idle_unload(self, instance_id: InstanceId) -> IdleUnloadStatus:
+        return self._idle_unload_info(instance_id)
+
+    async def set_idle_unload(
+        self, instance_id: InstanceId, payload: SetIdleUnloadParams
+    ) -> IdleUnloadStatus:
+        if instance_id not in self.state.instances:
+            raise HTTPException(status_code=404, detail="Instance not found")
+        policy = InstanceIdlePolicy(idle_unload_seconds=payload.idle_unload_seconds)
+        await self._send(SetInstanceIdlePolicy(instance_id=instance_id, policy=policy))
+        # Optimistic local update so the response reflects the new policy;
+        # the event-sourced state converges to the same value.
+        self.state = self.state.model_copy(
+            update={
+                "instance_idle_policies": {
+                    **self.state.instance_idle_policies,
+                    instance_id: policy,
+                }
+            }
+        )
+        if payload.idle_unload_seconds is not None:
+            self._idle_last_activity[instance_id] = time.time()
+        return self._idle_unload_info(instance_id)
 
     async def get_feature_flags(self) -> dict[str, bool]:
         return {
@@ -1313,10 +1422,13 @@ class API:
             usage = self._lifetime_usage.get(self._lifetime_key(instance))
             if usage is None:
                 continue
+            stats = self.state.instance_lifecycle.get(self._lifetime_key(instance))
             lifetime[str(instance_id)] = {
                 "promptTokens": usage.prompt_tokens,
                 "completionTokens": usage.completion_tokens,
                 "requestCount": usage.request_count,
+                "loadCount": stats.load_count if stats is not None else 0,
+                "unloadCount": stats.unload_count if stats is not None else 0,
             }
         return {"instances": instances, "lifetime": lifetime}
 
@@ -1368,6 +1480,11 @@ class API:
             instance.shard_assignments.model_id == model_id
             for instance in self.state.instances.values()
         ):
+            # Auto re-place after an idle unload: the model is downloaded and
+            # we captured its placement parameters when the policy was set, so
+            # transparently re-place instead of 404-ing the request.
+            if await self._replace_idle_unloaded(model_id):
+                return model_id
             # Check if model is actually downloaded
             model_is_downloaded = any(
                 isinstance(download, DownloadCompleted)
@@ -1382,6 +1499,32 @@ class API:
                 status_code=404, detail=f"No instance found for model {model_id}"
             )
         return model_id
+
+    async def _replace_idle_unloaded(self, model_id: ModelId) -> bool:
+        """Re-place a model that was unloaded by the idle-unload sweeper.
+
+        Returns True when a re-placement command was issued. The pending
+        policy keyed by model id carries the placement parameters captured at
+        the original creation (sharding/instance_meta/min_nodes); re-issuing
+        it also re-arms the idle-unload policy for the new instance.
+        """
+        pending = self._pending_idle_policies.get(str(model_id))
+        if pending is None:
+            return False
+        policy, _sent_at = pending
+        await self._send(
+            PlaceInstance(
+                model_card=await ModelCard.load(model_id),
+                sharding=Sharding[policy.sharding],
+                instance_meta=InstanceMeta[policy.instance_meta],
+                min_nodes=policy.min_nodes,
+            )
+        )
+        logger.info(
+            f"Re-placing idle-unloaded model {model_id} "
+            f"(idle_unload={policy.idle_unload_seconds}s)"
+        )
+        return True
 
     def stream_events(self) -> StreamingResponse:
         def _generate_json_array(events: Iterable[Event]) -> Iterable[str]:
@@ -2345,6 +2488,22 @@ class API:
                 self._event_log.append(i_event.event)
                 self.state = apply(self.state, i_event)
                 event = i_event.event
+
+                if isinstance(event, InstanceCreated):
+                    model_key = str(event.instance.shard_assignments.model_id)
+                    pending = self._pending_idle_policies.pop(model_key, None)
+                    if pending is not None:
+                        policy, _sent = pending
+                        await self._send(
+                            SetInstanceIdlePolicy(
+                                instance_id=event.instance.instance_id,
+                                policy=policy,
+                            )
+                        )
+                    self._idle_last_activity[event.instance.instance_id] = time.time()
+                elif isinstance(event, InstanceDeleted):
+                    self._idle_last_activity.pop(event.instance_id, None)
+                    self._idle_unload_inflight.discard(event.instance_id)
 
                 if isinstance(event, InstanceTokensUpdated):
                     # Fold into the durable lifetime store too — the

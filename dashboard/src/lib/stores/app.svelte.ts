@@ -324,11 +324,26 @@ export interface LifetimeUsageEntry {
   promptTokens: number;
   completionTokens: number;
   requestCount: number;
+  // Lifecycle load/unload counters (idle-unload feature; absent on older EXO).
+  loadCount?: number;
+  unloadCount?: number;
 }
 
 export interface SessionUsageResponse {
   instances: Record<string, SessionUsageEntry[]>;
   lifetime?: Record<string, LifetimeUsageEntry>;
+}
+
+// Idle-unload status for one instance, as served by
+// GET /instance/{id}/idle-unload (idle-unload feature).
+export interface IdleUnloadInfo {
+  policySeconds: number | null;
+  idleSeconds: number | null;
+  loadCount: number;
+  unloadCount: number;
+  lastLoadTs: number | null;
+  lastUnloadTs: number | null;
+  lastUnloadReason: string | null;
 }
 
 // Usage summed over the sessions that are active right now (or were very
@@ -613,6 +628,8 @@ class AppStore {
   rawSessionUsage = $state<Record<string, SessionUsageEntry[]>>({});
   // Durable lifetime token totals per instance (GET /session-usage).
   rawLifetimeUsage = $state<Record<string, LifetimeUsageEntry>>({});
+  // Idle-unload policy + lifecycle info per instance (idle-unload feature).
+  idleUnloadInfo = $state<Record<string, IdleUnloadInfo>>({});
 
   // Number of chat sessions (conversations) attributed to each instance,
   // matched via the conversation's model id to the instance's model id.
@@ -1504,6 +1521,29 @@ class AppStore {
         }
       } catch {
         // endpoint missing or request failed — non-fatal
+      }
+      // Idle-unload info for the instance cards (countdown + counters).
+      try {
+        const idleInfo: Record<string, IdleUnloadInfo> = {};
+        const results = await Promise.all(
+          Object.entries(data.instances ?? {}).map(async ([iid]) => {
+            try {
+              const r = await fetch(
+                `/instance/${encodeURIComponent(iid)}/idle-unload`,
+              );
+              if (!r.ok) return null;
+              return [iid, (await r.json()) as IdleUnloadInfo] as const;
+            } catch {
+              return null;
+            }
+          }),
+        );
+        for (const entry of results) {
+          if (entry) idleInfo[entry[0]] = entry[1];
+        }
+        this.idleUnloadInfo = idleInfo;
+      } catch {
+        // feature missing on older EXO — non-fatal
       }
       if (data.runners) {
         this.runners = data.runners;
@@ -3582,6 +3622,27 @@ class AppStore {
    * next prefill without a restart. Refetches feature flags so the UI reflects
    * the new state immediately.
    */
+  async setIdleUnload(
+    instanceId: string,
+    idleUnloadSeconds: number | null,
+  ): Promise<IdleUnloadInfo | null> {
+    const response = await fetch(
+      `/instance/${encodeURIComponent(instanceId)}/idle-unload`,
+      {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ idle_unload_seconds: idleUnloadSeconds }),
+      },
+    );
+    if (!response.ok) return null;
+    const info = (await response.json()) as IdleUnloadInfo;
+    this.idleUnloadInfo = {
+      ...this.idleUnloadInfo,
+      [instanceId]: info,
+    };
+    return info;
+  }
+
   async setMemoryGuard(enabled: boolean): Promise<void> {
     const response = await fetch("/v1/memory-guard", {
       method: "PUT",
@@ -3813,6 +3874,11 @@ export const deleteInstanceLink = (linkId: string) =>
   appStore.deleteInstanceLink(linkId);
 export const setMemoryGuard = (enabled: boolean) =>
   appStore.setMemoryGuard(enabled);
+export const setIdleUnload = (
+  instanceId: string,
+  idleUnloadSeconds: number | null,
+) => appStore.setIdleUnload(instanceId, idleUnloadSeconds);
+export const idleUnloadInfo = () => appStore.idleUnloadInfo;
 export const setTurboQuant = (
   enabled: boolean,
   bits: number,

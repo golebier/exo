@@ -28,6 +28,7 @@ from .api import ErrorResponse as ErrorResponse
 from .api import FinishReason as FinishReason
 from .api import GenerationStats as GenerationStats
 from .api import HuggingFaceSearchResult as HuggingFaceSearchResult
+from .api import IdleUnloadStatus as IdleUnloadStatus
 from .api import ImageData as ImageData
 from .api import ImageEditsTaskParams as ImageEditsTaskParams
 from .api import ImageGenerationResponse as ImageGenerationResponse
@@ -49,6 +50,7 @@ from .api import PlacementPreview as PlacementPreview
 from .api import PlacementPreviewResponse as PlacementPreviewResponse
 from .api import PowerUsage as PowerUsage
 from .api import PromptTokensDetails as PromptTokensDetails
+from .api import SetIdleUnloadParams as SetIdleUnloadParams
 from .api import StartDownloadParams as StartDownloadParams
 from .api import StartDownloadResponse as StartDownloadResponse
 from .api import StreamingChoiceResponse as StreamingChoiceResponse

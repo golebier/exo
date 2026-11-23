@@ -9,6 +9,10 @@ from exo.shared.models.model_cards import ModelCard
 from exo.shared.topology import Topology, TopologySnapshot
 from exo.shared.types.backends import Backend
 from exo.shared.types.common import ModelId, NodeId
+from exo.shared.types.instance_lifecycle import (
+    InstanceIdlePolicy,
+    InstanceLifecycleStats,
+)
 from exo.shared.types.instance_link import InstanceLink, InstanceLinkId
 from exo.shared.types.profiling import (
     DiskUsage,
@@ -47,6 +51,10 @@ class State(FrozenModel):
     instances: Mapping[InstanceId, Instance] = {}
     # Cumulative in/out token accounting per instance (creation until deletion).
     instance_token_usage: Mapping[InstanceId, InstanceTokenUsage] = {}
+    # Per-instance idle-unload policies (None seconds = never unload).
+    instance_idle_policies: Mapping[InstanceId, InstanceIdlePolicy] = {}
+    # Lifecycle load/unload counters keyed by "Type::model_id" (durable-style).
+    instance_lifecycle: Mapping[str, InstanceLifecycleStats] = {}
     runners: Mapping[RunnerId, RunnerStatus] = {}
     downloads: Mapping[NodeId, Sequence[DownloadProgress]] = {}
     tasks: Mapping[TaskId, Task] = {}

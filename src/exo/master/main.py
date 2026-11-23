@@ -1,3 +1,4 @@
+import time
 from datetime import datetime, timedelta, timezone
 
 import anyio
@@ -30,6 +31,7 @@ from exo.shared.types.commands import (
     PlaceInstance,
     RequestEventLog,
     SendInputChunk,
+    SetInstanceIdlePolicy,
     SetInstanceLink,
     TaskCancelled,
     TaskFinished,
@@ -44,7 +46,10 @@ from exo.shared.types.events import (
     GlobalForwarderEvent,
     IndexedEvent,
     InputChunkReceived,
+    InstanceCreated,
     InstanceDeleted,
+    InstanceIdlePolicySet,
+    InstanceLifecycleRecorded,
     InstanceLinkCreated,
     InstanceLinkDeleted,
     LocalForwarderEvent,
@@ -57,6 +62,7 @@ from exo.shared.types.events import (
     TracesCollected,
     TracesMerged,
 )
+from exo.shared.types.instance_lifecycle import InstanceUnloadReason
 from exo.shared.types.instance_link import InstanceLink
 from exo.shared.types.state import State
 from exo.shared.types.tasks import (
@@ -146,6 +152,8 @@ class Master:
         self._event_log = DiskEventLog(EXO_EVENT_LOG_DIR / "master")
         self._pending_traces: dict[TaskId, dict[int, list[TraceEventData]]] = {}
         self._expected_ranks: dict[TaskId, set[int]] = {}
+        self._idle_last_activity: dict[InstanceId, float] = {}
+        self._idle_unload_inflight: set[InstanceId] = set()
 
     async def run(self):
         logger.info("Starting Master")
@@ -451,6 +459,13 @@ class Master:
                             generated_events.append(
                                 InstanceLinkDeleted(link_id=command.link_id)
                             )
+                        case SetInstanceIdlePolicy():
+                            generated_events.append(
+                                InstanceIdlePolicySet(
+                                    instance_id=command.instance_id,
+                                    policy=command.policy,
+                                )
+                            )
                         case RequestEventLog():
                             # We should just be able to send everything, since other buffers will ignore old messages
                             # rate limit to 1000 at a time
@@ -464,6 +479,47 @@ class Master:
                                 )
                     for event in generated_events:
                         await self.event_sender.send(event)
+                    for event in generated_events:
+                        match event:
+                            case InstanceCreated():
+                                await self.event_sender.send(
+                                    InstanceLifecycleRecorded(
+                                        model_id=str(
+                                            event.instance.shard_assignments.model_id
+                                        ),
+                                        instance_type=type(event.instance).__name__,
+                                        phase="load",
+                                        reason=InstanceUnloadReason.PLACEMENT,
+                                        ts=time.time(),
+                                    )
+                                )
+                            case InstanceDeleted():
+                                await self.event_sender.send(
+                                    InstanceLifecycleRecorded(
+                                        model_id=str(
+                                            self.state.instances[
+                                                event.instance_id
+                                            ].shard_assignments.model_id
+                                        )
+                                        if event.instance_id in self.state.instances
+                                        else "unknown",
+                                        instance_type=type(
+                                            self.state.instances[event.instance_id]
+                                        ).__name__
+                                        if event.instance_id in self.state.instances
+                                        else "unknown",
+                                        phase="unload",
+                                        reason=(
+                                            InstanceUnloadReason.IDLE_UNLOAD
+                                            if event.instance_id
+                                            in self._idle_unload_inflight
+                                            else InstanceUnloadReason.MANUAL
+                                        ),
+                                        ts=time.time(),
+                                    )
+                                )
+                            case _:
+                                pass
                 except Exception as e:
                     logger.opt(exception=e).warning("Error in command processor")
 
@@ -480,10 +536,35 @@ class Master:
                         )
                         break
 
+            # idle-unload sweeper: delete instances whose idle policy elapsed
+            for instance_id in list(self.state.instances):
+                policy = self.state.instance_idle_policies.get(instance_id)
+                if policy is None or policy.idle_unload_seconds is None:
+                    continue
+                # busy while any task is pending/running on the instance
+                busy = any(
+                    task.instance_id == instance_id
+                    and task.task_status in (TaskStatus.Pending, TaskStatus.Running)
+                    for task in self.state.tasks.values()
+                )
+                if busy:
+                    self._idle_last_activity[instance_id] = time.time()
+                    continue
+                idle_for = time.time() - self._idle_last_activity.get(
+                    instance_id, time.time()
+                )
+                if idle_for < policy.idle_unload_seconds:
+                    continue
+                logger.info(
+                    f"Idle-unloading instance {instance_id} after {int(idle_for)}s idle"
+                )
+                self._idle_unload_inflight.add(instance_id)
+                await self.event_sender.send(InstanceDeleted(instance_id=instance_id))
+
             # time out dead nodes
-            for node_id, time in self.state.last_seen.items():
+            for node_id, last_seen in self.state.last_seen.items():
                 now = datetime.now(tz=timezone.utc)
-                if now - time > timedelta(seconds=30):
+                if now - last_seen > timedelta(seconds=30):
                     logger.info(f"Manually removing node {node_id} due to inactivity")
                     await self.event_sender.send(NodeTimedOut(node_id=node_id))
 

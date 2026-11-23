@@ -168,7 +168,9 @@ class TestLifetimeUsage:
         api = _make_api()
         instance = _FakeInstance("m-1")
         api.state = SimpleNamespace(
-            tasks={}, instances={InstanceId("inst-1"): instance}
+            tasks={},
+            instances={InstanceId("inst-1"): instance},
+            instance_lifecycle={},
         )
         api._fold_lifetime_usage(instance, 100, 40)
         result = await api.get_session_usage()
@@ -176,6 +178,8 @@ class TestLifetimeUsage:
             "promptTokens": 100,
             "completionTokens": 40,
             "requestCount": 1,
+            "loadCount": 0,
+            "unloadCount": 0,
         }
 
 

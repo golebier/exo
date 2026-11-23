@@ -31,6 +31,8 @@
     instances,
     instanceTokenUsage,
     instanceLifetimeUsage,
+    idleUnloadInfo,
+    setIdleUnload,
     instanceActiveSessions,
     instanceActiveUsage,
     instanceSessionUsage,
@@ -95,6 +97,7 @@
   const instanceData = $derived(instances());
   const instanceTokenUsageData = $derived(instanceTokenUsage());
   const instanceLifetimeUsageData = $derived(instanceLifetimeUsage());
+  const idleUnloadData = $derived(idleUnloadInfo());
   const instanceActiveSessionsData = $derived(instanceActiveSessions());
   const instanceActiveUsageData = $derived(instanceActiveUsage());
   const runnersData = $derived(runners());
@@ -7307,6 +7310,107 @@
                                   req</span
                                 >
                               </div>
+                            </div>
+                          {/if}
+                          {#if idleUnloadData[id]}
+                            {@const idle = idleUnloadData[id]}
+                            <div
+                              class="mt-1 flex items-center gap-1.5 text-[11px] font-mono"
+                            >
+                              {#if idle.policySeconds != null}
+                                <span
+                                  class={idle.idleSeconds != null &&
+                                  idle.idleSeconds > idle.policySeconds - 30
+                                    ? "text-yellow-400"
+                                    : "text-white/45"}
+                                  title="Idle-unload: unloads this instance from node memory after the idle timeout. Click to edit."
+                                >
+                                  idle-unload {idle.policySeconds}s
+                                </span>
+                                <button
+                                  class="text-white/30 hover:text-exo-yellow transition-colors"
+                                  title="Change idle-unload timeout (seconds)"
+                                  onclick={(e) => {
+                                    e.stopPropagation();
+                                    const next = prompt(
+                                      "Idle-unload timeout in seconds (empty = disable):",
+                                      String(idle.policySeconds ?? ""),
+                                    );
+                                    if (next === null) return;
+                                    const v =
+                                      next.trim() === ""
+                                        ? null
+                                        : Number.parseInt(next, 10);
+                                    if (
+                                      v !== null &&
+                                      (Number.isNaN(v) || v < 5)
+                                    ) {
+                                      addToast({
+                                        type: "error",
+                                        message:
+                                          "Idle-unload timeout must be >= 5s",
+                                      });
+                                      return;
+                                    }
+                                    void setIdleUnload(id, v).then((info) => {
+                                      if (!info) {
+                                        addToast({
+                                          type: "error",
+                                          message: "Failed to set idle-unload",
+                                        });
+                                      }
+                                    });
+                                  }}>edit</button
+                                >
+                              {:else}
+                                <span
+                                  class="text-white/25"
+                                  title="No idle-unload policy. Click to enable."
+                                >
+                                  idle-unload off
+                                </span>
+                                <button
+                                  class="text-white/30 hover:text-exo-yellow transition-colors"
+                                  title="Enable idle-unload (timeout in seconds)"
+                                  onclick={(e) => {
+                                    e.stopPropagation();
+                                    const next = prompt(
+                                      "Idle-unload timeout in seconds:",
+                                      "600",
+                                    );
+                                    if (next === null) return;
+                                    const v = Number.parseInt(next, 10);
+                                    if (Number.isNaN(v) || v < 5) {
+                                      addToast({
+                                        type: "error",
+                                        message:
+                                          "Idle-unload timeout must be >= 5s",
+                                      });
+                                      return;
+                                    }
+                                    void setIdleUnload(id, v).then((info) => {
+                                      if (!info) {
+                                        addToast({
+                                          type: "error",
+                                          message: "Failed to set idle-unload",
+                                        });
+                                      }
+                                    });
+                                  }}>enable</button
+                                >
+                              {/if}
+                              <span class="text-white/20">·</span>
+                              <span
+                                title="How many times this instance has been loaded into memory"
+                                >↑{idle.loadCount} load</span
+                              >
+                              <span class="text-white/20">·</span>
+                              <span
+                                title="How many times this instance has been unloaded (idle, placement, manual, error)"
+                                >↓{idle.unloadCount} unload{idle.lastUnloadReason
+                                  ? ` (${idle.lastUnloadReason})`
+                                  : ""}</span
+                              >
                             </div>
                           {/if}
                           {#if debugEnabled && instanceConnections.length > 0}

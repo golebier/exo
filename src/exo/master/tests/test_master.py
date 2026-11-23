@@ -22,6 +22,7 @@ from exo.shared.types.events import (
     GlobalForwarderEvent,
     IndexedEvent,
     InstanceCreated,
+    InstanceLifecycleRecorded,
     LocalForwarderEvent,
     NodeGatheredInfo,
     TaskCreated,
@@ -191,18 +192,21 @@ async def test_master():
                 ),
             )
         )
-        while len(_get_events()) < 4:
+        while len(_get_events()) < 5:
             await anyio.sleep(0.01)
 
         events = _get_events()
-        assert len(events) == 4
+        assert len(events) == 5
         assert events[0].idx == 0
         assert events[1].idx == 1
         assert events[2].idx == 2
         assert events[3].idx == 3
+        assert events[4].idx == 4
         assert isinstance(events[0].event, NodeGatheredInfo)
         assert isinstance(events[1].event, NodeGatheredInfo)
         assert isinstance(events[2].event, InstanceCreated)
+        assert isinstance(events[3].event, InstanceLifecycleRecorded)
+        assert events[3].event.phase == "load"
         created_instance = events[2].event.instance
         assert isinstance(created_instance, MlxRingInstance)
         runner_id = list(created_instance.shard_assignments.runner_to_shard.keys())[0]
@@ -236,10 +240,10 @@ async def test_master():
         assert len(created_instance.hosts_by_node[node_id]) == 1
         assert created_instance.hosts_by_node[node_id][0].ip == "0.0.0.0"
         assert created_instance.ephemeral_port > 0
-        assert isinstance(events[3].event, TaskCreated)
-        assert events[3].event.task.task_status == TaskStatus.Pending
-        assert isinstance(events[3].event.task, TextGenerationTask)
-        assert events[3].event.task.task_params == TextGenerationTaskParams(
+        assert isinstance(events[4].event, TaskCreated)
+        assert events[4].event.task.task_status == TaskStatus.Pending
+        assert isinstance(events[4].event.task, TextGenerationTask)
+        assert events[4].event.task.task_params == TextGenerationTaskParams(
             model=ModelId("llama-3.2-1b"),
             input=[
                 InputMessage(
