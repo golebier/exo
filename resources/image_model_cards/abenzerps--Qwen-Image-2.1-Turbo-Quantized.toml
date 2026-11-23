@@ -1,0 +1,39 @@
+model_id = "abenzerps/Qwen-Image-2.1-Turbo-Quantized"
+n_layers = 32
+hidden_size = 1
+supports_tensor = false
+tasks = ["TextToImage"]
+family = "qwen21"
+quantization = "8bit"
+base_model = "Qwen-Image 2.1 Turbo"
+capabilities = ["image_gen"]
+backends = ["MlxMetal"]
+
+[storage_size]
+in_bytes = 24183123968
+
+[[components]]
+component_name = "text_encoder"
+component_path = "text_encoders/"
+n_layers = 36
+can_shard = false
+
+[components.storage_size]
+in_bytes = 16583123968
+
+[[components]]
+component_name = "transformer"
+component_path = "./"
+n_layers = 32
+can_shard = false
+
+[components.storage_size]
+in_bytes = 7559920536
+
+[[components]]
+component_name = "vae"
+component_path = "vae/"
+can_shard = false
+
+[components.storage_size]
+in_bytes = 644000000

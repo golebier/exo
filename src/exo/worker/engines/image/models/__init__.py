@@ -16,6 +16,10 @@ from exo.worker.engines.image.models.qwen import (
     QwenEditModelAdapter,
     QwenModelAdapter,
 )
+from exo.worker.engines.image.models.qwen21 import (
+    QWEN21_IMAGE_CONFIG,
+    Qwen21ModelAdapter,
+)
 
 __all__: list[str] = []
 
@@ -31,6 +35,7 @@ _ADAPTER_REGISTRY: dict[str, AdapterFactory] = {
     "flux-kontext": FluxKontextModelAdapter,
     "qwen-edit": QwenEditModelAdapter,
     "qwen": QwenModelAdapter,
+    "qwen21": Qwen21ModelAdapter,
 }
 
 # Config registry: maps model ID patterns to configs
@@ -40,6 +45,7 @@ _CONFIG_REGISTRY: dict[str, ImageModelConfig] = {
     "flux.1-kontext": FLUX_KONTEXT_CONFIG,  # Must come before "flux.1-dev" for pattern matching
     "flux.1-krea-dev": FLUX_DEV_CONFIG,  # Must come before "flux.1-dev" for pattern matching
     "flux.1-dev": FLUX_DEV_CONFIG,
+    "qwen-image-2.1": QWEN21_IMAGE_CONFIG,  # Must come before "qwen-image" for pattern matching
     "qwen-image-edit": QWEN_IMAGE_EDIT_CONFIG,  # Must come before "qwen-image" for pattern matching
     "qwen-image": QWEN_IMAGE_CONFIG,
 }
