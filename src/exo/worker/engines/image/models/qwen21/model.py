@@ -32,7 +32,7 @@ class NoOpContext:
     def before_loop(self, latents: object) -> None:  # noqa: ARG002
         return None
 
-    def in_loop(self, t: int, latents: object) -> None:  # noqa: ARG002
+    def in_loop(self, t: int, latents: object, time_steps: object) -> None:  # noqa: ARG002
         return None
 
     def interruption(self, t: int, latents: object) -> None:  # noqa: ARG002
