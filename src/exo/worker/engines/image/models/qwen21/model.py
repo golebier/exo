@@ -21,11 +21,32 @@ from exo.worker.engines.image.models.qwen21.transformer import Qwen21Transformer
 from exo.worker.engines.image.models.qwen21.vae import Qwen21Vae
 
 
-class NoOpCallbacks:
-    """GenerationContext replacement: only .start() is observed by the runner."""
+class NoOpContext:
+    """GenerationContext replacement for the diffusion loop.
 
-    def start(self, seed: int, prompt: str, config: object) -> None:  # noqa: ARG002
+    The runner calls ctx.before_loop / ctx.in_loop / ctx.interruption /
+    ctx.after_loop around the per-step loop (pipeline/runner.py). All are
+    no-ops for this engine (no partial-image streaming, no telemetry).
+    """
+
+    def before_loop(self, latents: object) -> None:  # noqa: ARG002
         return None
+
+    def in_loop(self, t: int, latents: object) -> None:  # noqa: ARG002
+        return None
+
+    def interruption(self, t: int, latents: object) -> None:  # noqa: ARG002
+        return None
+
+    def after_loop(self, latents: object) -> None:  # noqa: ARG002
+        return None
+
+
+class NoOpCallbacks:
+    """Callback surface observed by the runner; start() returns the ctx."""
+
+    def start(self, seed: int, prompt: str, config: object) -> NoOpContext:  # noqa: ARG002
+        return NoOpContext()
 
     def step(self, step_index: int, total_steps: int) -> None:  # noqa: ARG002
         return None
@@ -80,5 +101,7 @@ class Qwen21Model:
         return self.transformer.parameters()
 
 
-def build_model(model_id: str, local_path: Path, quantize: int | None = None) -> Qwen21Model:
+def build_model(
+    model_id: str, local_path: Path, quantize: int | None = None
+) -> Qwen21Model:
     return Qwen21Model(model_id, local_path, quantize)
