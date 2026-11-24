@@ -313,18 +313,23 @@ class _LifetimeUsage:
     request_count: int = 0
 
 
-def _env_idle_unload_seconds() -> int | None:
-    """Cluster-wide default idle-unload timeout (seconds) from the environment.
+DEFAULT_IDLE_UNLOAD_SECONDS = 1800
 
-    ``EXO_IDLE_UNLOAD_SECONDS=0`` or an unset/invalid value disables it.
+
+def _env_idle_unload_seconds() -> int | None:
+    """Cluster-wide default idle-unload timeout (seconds).
+
+    Default is 30 minutes: instances idle longer than this get their weights
+    freed from memory (the instance itself stays). Override with
+    ``EXO_IDLE_UNLOAD_SECONDS``; ``0`` disables the default entirely.
     """
     raw = os.environ.get("EXO_IDLE_UNLOAD_SECONDS")
-    if not raw:
-        return None
+    if raw is None or raw == "":
+        return DEFAULT_IDLE_UNLOAD_SECONDS
     try:
         value = int(raw)
     except ValueError:
-        return None
+        return DEFAULT_IDLE_UNLOAD_SECONDS
     return value if value >= 5 else None
 
 
@@ -956,10 +961,15 @@ class API:
                     }
                 )
                 continue
-            if entry.idle_unload_seconds is not None:
+            effective_idle = (
+                entry.idle_unload_seconds
+                if entry.idle_unload_seconds is not None
+                else _env_idle_unload_seconds()
+            )
+            if effective_idle is not None:
                 self._pending_idle_policies[str(model_id)] = (
                     InstanceIdlePolicy(
-                        idle_unload_seconds=entry.idle_unload_seconds,
+                        idle_unload_seconds=effective_idle,
                         sharding=entry.sharding,
                         instance_meta=entry.instance_meta,
                         min_nodes=entry.min_nodes,
@@ -978,8 +988,8 @@ class API:
                 f"Launch-profile restore: placing {entry.model_id} "
                 f"({entry.sharding}/{entry.instance_meta}/{entry.min_nodes} nodes"
                 + (
-                    f", idle_unload={entry.idle_unload_seconds}s)"
-                    if entry.idle_unload_seconds is not None
+                    f", idle_unload={effective_idle}s)"
+                    if effective_idle is not None
                     else ")"
                 )
             )

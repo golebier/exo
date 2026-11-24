@@ -5735,6 +5735,123 @@
                             </div>
                           </div>
                         {/if}
+                        {#if idleUnloadData[id]}
+                          {@const idle = idleUnloadData[id]}
+                          <div
+                            class="mt-1 flex flex-wrap items-center gap-1.5 text-[11px] font-mono text-white/55"
+                          >
+                            {#if idle.policySeconds != null}
+                              <span
+                                title="Idle-unload timeout for this instance. Weights are freed from memory after this many idle seconds (the instance itself stays)."
+                              >
+                                idle-unload
+                                {idle.policySeconds >= 60
+                                  ? `${Math.round(idle.policySeconds / 60)}m`
+                                  : `${idle.policySeconds}s`}{#if idle.weightsUnloaded}
+                                  <span class="text-yellow-400">· unloaded</span
+                                  >
+                                  <button
+                                    class="text-white/30 hover:text-exo-yellow transition-colors"
+                                    title="Load this instance's weights back into memory now"
+                                    onclick={(e) => {
+                                      e.stopPropagation();
+                                      void loadInstanceWeights(id).then(
+                                        (info) => {
+                                          if (!info) {
+                                            addToast({
+                                              type: "error",
+                                              message:
+                                                "Failed to load instance",
+                                            });
+                                          }
+                                        },
+                                      );
+                                    }}>load</button
+                                  >
+                                {:else if idle.idleSeconds != null}
+                                  <span class="text-white/35"
+                                    >({Math.floor(
+                                      idle.idleSeconds / 60,
+                                    )}:{String(
+                                      Math.floor(idle.idleSeconds % 60),
+                                    ).padStart(2, "0")} idle)</span
+                                  >
+                                {/if}</span
+                              >
+                              <button
+                                class="text-white/30 hover:text-exo-yellow transition-colors"
+                                title="Change idle-unload timeout (seconds). Empty = disable."
+                                onclick={(e) => {
+                                  e.stopPropagation();
+                                  const next = prompt(
+                                    "Idle-unload timeout in seconds (empty = disable):",
+                                    String(idle.policySeconds ?? ""),
+                                  );
+                                  if (next === null) return;
+                                  const v =
+                                    next.trim() === ""
+                                      ? null
+                                      : Number.parseInt(next, 10);
+                                  if (
+                                    v !== null &&
+                                    (Number.isNaN(v) || v < 5)
+                                  ) {
+                                    addToast({
+                                      type: "error",
+                                      message:
+                                        "Idle-unload timeout must be >= 5s",
+                                    });
+                                    return;
+                                  }
+                                  void setIdleUnload(id, v).then((info) => {
+                                    if (!info) {
+                                      addToast({
+                                        type: "error",
+                                        message: "Failed to set idle-unload",
+                                      });
+                                    }
+                                  });
+                                }}>edit</button
+                              >
+                            {:else}
+                              <span
+                                class="text-white/25"
+                                title="No idle-unload policy. Weights stay in memory forever. Click to enable."
+                              >
+                                idle-unload off
+                              </span>
+                              <button
+                                class="text-white/30 hover:text-exo-yellow transition-colors"
+                                title="Enable idle-unload (timeout in seconds). Weights are freed after this many idle seconds."
+                                onclick={(e) => {
+                                  e.stopPropagation();
+                                  const next = prompt(
+                                    "Idle-unload timeout in seconds:",
+                                    "600",
+                                  );
+                                  if (next === null) return;
+                                  const v = Number.parseInt(next, 10);
+                                  if (Number.isNaN(v) || v < 5) {
+                                    addToast({
+                                      type: "error",
+                                      message:
+                                        "Idle-unload timeout must be >= 5s",
+                                    });
+                                    return;
+                                  }
+                                  void setIdleUnload(id, v).then((info) => {
+                                    if (!info) {
+                                      addToast({
+                                        type: "error",
+                                        message: "Failed to set idle-unload",
+                                      });
+                                    }
+                                  });
+                                }}>enable</button
+                              >
+                            {/if}
+                          </div>
+                        {/if}
                         {#if debugEnabled && instanceConnections.length > 0}
                           <div class="mt-2 space-y-1">
                             {#each instanceConnections as conn}
