@@ -75,6 +75,7 @@ from exo.shared.types.tasks import (
     ImageGeneration as ImageGenerationTask,
 )
 from exo.shared.types.tasks import (
+    Shutdown,
     TaskId,
     TaskStatus,
 )
@@ -221,8 +222,8 @@ class Master:
 
                             # there are no NON-prefill-only instances matching this model ID
                             if not instance_task_counts:
-                                self._reload_unloaded_for_model(
-                                    command.task_params.model, generated_events
+                                await self._reload_unloaded_for_model(
+                                    command.task_params.model
                                 )
                                 raise ValueError(
                                     f"No instance found for model {command.task_params.model}"
@@ -275,8 +276,8 @@ class Master:
                                     )
 
                             if not instance_task_counts:
-                                self._reload_unloaded_for_model(
-                                    command.task_params.model, generated_events
+                                await self._reload_unloaded_for_model(
+                                    command.task_params.model
                                 )
                                 raise ValueError(
                                     f"No instance found for model {command.task_params.model}"
@@ -334,8 +335,8 @@ class Master:
                                     )
 
                             if not instance_task_counts:
-                                self._reload_unloaded_for_model(
-                                    command.task_params.model, generated_events
+                                await self._reload_unloaded_for_model(
+                                    command.task_params.model
                                 )
                                 raise ValueError(
                                     f"No instance found for model {command.task_params.model}"
@@ -578,14 +579,13 @@ class Master:
                 except Exception as e:
                     logger.opt(exception=e).warning("Error in command processor")
 
-    def _reload_unloaded_for_model(
-        self, model_id: ModelId | str, generated_events: list[Event]
-    ) -> None:
+    async def _reload_unloaded_for_model(self, model_id: ModelId | str) -> None:
         """Auto-reload an unloaded instance when a request targets its model.
 
         The request itself fails fast (caller raises); the instance flips
         back to loaded in the background so the retry/re-request succeeds
-        once the weights are resident again.
+        once the weights are resident again. The event is sent directly —
+        a fail-fast raise must never swallow it.
         """
         for instance_id, instance in self.state.instances.items():
             if (
@@ -595,7 +595,7 @@ class Master:
                 logger.info(
                     f"Auto-reloading unloaded instance {instance_id} for {model_id}"
                 )
-                generated_events.append(
+                await self.event_sender.send(
                     InstanceWeightsLoadRequested(instance_id=instance_id)
                 )
                 return
@@ -613,23 +613,29 @@ class Master:
                         )
                         break
 
-            # idle-unload sweeper: delete instances whose idle policy elapsed
+            # idle-unload sweeper: free the weights of idle instances
             for instance_id in list(self.state.instances):
                 policy = self.state.instance_idle_policies.get(instance_id)
                 if policy is None or policy.idle_unload_seconds is None:
                     continue
-                # busy while any task is pending/running on the instance
+                # Start the idle clock at the first sweeper tick — instances
+                # that never ran a task since master boot would otherwise
+                # never reach their timeout.
+                self._idle_last_activity.setdefault(instance_id, time.time())
+                # Busy while a task that consumes or loads weights is
+                # pending/running. Shutdown is worker-side runner teardown
+                # (it can linger as Running) and must NOT look like usage,
+                # or the instance could never unload again after a reload.
                 busy = any(
                     task.instance_id == instance_id
                     and task.task_status in (TaskStatus.Pending, TaskStatus.Running)
+                    and not isinstance(task, Shutdown)
                     for task in self.state.tasks.values()
                 )
                 if busy:
                     self._idle_last_activity[instance_id] = time.time()
                     continue
-                idle_for = time.time() - self._idle_last_activity.get(
-                    instance_id, time.time()
-                )
+                idle_for = time.time() - self._idle_last_activity[instance_id]
                 if idle_for < policy.idle_unload_seconds:
                     continue
                 logger.info(
@@ -640,6 +646,17 @@ class Master:
                 # their runner processes down.
                 await self.event_sender.send(
                     InstanceWeightsUnloaded(instance_id=instance_id)
+                )
+                await self.event_sender.send(
+                    InstanceLifecycleRecorded(
+                        model_id=str(
+                            self.state.instances[instance_id].shard_assignments.model_id
+                        ),
+                        instance_type=type(self.state.instances[instance_id]).__name__,
+                        phase="unload",
+                        reason=InstanceUnloadReason.IDLE_UNLOAD,
+                        ts=time.time(),
+                    )
                 )
 
             # time out dead nodes

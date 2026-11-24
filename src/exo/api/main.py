@@ -212,6 +212,7 @@ from exo.shared.types.tasks import (
     ImageGeneration as ImageGenerationTask,
 )
 from exo.shared.types.tasks import (
+    Shutdown,
     TaskStatus,
 )
 from exo.shared.types.tasks import (
@@ -888,10 +889,15 @@ class API:
         )
 
     def _instance_busy(self, instance_id: InstanceId) -> bool:
-        """An instance is busy while any of its tasks is pending/running."""
+        """An instance is busy while any of its tasks is pending/running.
+
+        Shutdown is worker-side runner teardown and can linger as Running —
+        it is not usage, so it never counts as busy.
+        """
         return any(
             task.instance_id == instance_id
             and task.task_status in (TaskStatus.Pending, TaskStatus.Running)
+            and not isinstance(task, Shutdown)
             for task in self.state.tasks.values()
         )
 
