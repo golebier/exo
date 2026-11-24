@@ -281,12 +281,28 @@ def load_vae(model_dir: Path) -> vae_mod.Qwen21Vae:
 
 
 def load_processor_dir(model_dir: Path) -> Path:
-    """Resolve the processor dir (abenzerps ships it at <model>/processor)."""
+    """Resolve the processor dir for the Qwen2.5 prompt tokenizer.
+
+    Resolution order:
+    1. <model>/processor (mflux-style repos, e.g. mlx-community--Qwen-Image-*)
+    2. <model> root (repos shipping tokenizer_config.json directly)
+    3. Sibling repo's tokenizer dir under the shared models root - the
+       abenzerps quant repos ship NO tokenizer files at all, but every
+       Qwen-Image repo uses the identical Qwen2.5 tokenizer (exolabs ships
+       it at exolabs--Qwen-Image/tokenizer).
+    """
     processor = model_dir / "processor"
     if processor.is_dir():
         return processor
     if (model_dir / "tokenizer_config.json").is_file():
         return model_dir
+    candidates = [
+        model_dir.parent / "exolabs--Qwen-Image" / "tokenizer",
+        *sorted(model_dir.parent.glob("*/tokenizer")),
+    ]
+    for candidate in candidates:
+        if (candidate / "tokenizer_config.json").is_file():
+            return candidate
     raise FileNotFoundError(f"No processor directory under {model_dir}")
 
 
