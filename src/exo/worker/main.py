@@ -30,6 +30,7 @@ from exo.shared.types.events import (
     InstanceDeleted,
     NodeDownloadProgress,
     NodeGatheredInfo,
+    RunnerStatusUpdated,
     TaskCreated,
     TaskStatusUpdated,
     TopologyEdgeCreated,
@@ -52,7 +53,7 @@ from exo.shared.types.text_generation import Base64Image, Base64ImageHash
 from exo.shared.types.topology import Connection, SocketConnection
 from exo.shared.types.worker.downloads import DownloadCompleted
 from exo.shared.types.worker.instances import InstanceId
-from exo.shared.types.worker.runners import RunnerId
+from exo.shared.types.worker.runners import RunnerId, RunnerShutdown
 from exo.utils.channels import Receiver, Sender, channel
 from exo.utils.info_gatherer.info_gatherer import GatheredInfo, InfoGatherer
 from exo.utils.info_gatherer.net_profile import check_reachable
@@ -284,6 +285,21 @@ class Worker:
                     try:
                         with fail_after(3):
                             await runner.start_task(task)
+                        # The runner process dies right after shutdown() and
+                        # its final status event races with process death -
+                        # resolve the Shutdown task and retire the runner in
+                        # state explicitly, or both linger as Running /
+                        # ShuttingDown forever.
+                        await self.event_sender.send(
+                            TaskStatusUpdated(
+                                task_id=task.task_id, task_status=TaskStatus.Complete
+                            )
+                        )
+                        await self.event_sender.send(
+                            RunnerStatusUpdated(
+                                runner_id=runner_id, runner_status=RunnerShutdown()
+                            )
+                        )
                     except TimeoutError:
                         await self.event_sender.send(
                             TaskStatusUpdated(

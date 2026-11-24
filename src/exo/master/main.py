@@ -615,6 +615,11 @@ class Master:
 
             # idle-unload sweeper: free the weights of idle instances
             for instance_id in list(self.state.instances):
+                if instance_id in self.state.instance_weights_unloaded:
+                    # Already unloaded (weights are back only after an
+                    # InstanceWeightsLoadRequested clears the flag) - re-emitting
+                    # the unload every tick would spam workers and the event log.
+                    continue
                 policy = self.state.instance_idle_policies.get(instance_id)
                 if policy is None or policy.idle_unload_seconds is None:
                     continue

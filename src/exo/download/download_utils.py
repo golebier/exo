@@ -921,12 +921,23 @@ async def download_shard(
     )
 
     # For image models, skip root-level safetensors files since weights
-    # are stored in component subdirectories (e.g., transformer/, vae/)
+    # are stored in component subdirectories (e.g., transformer/, vae/).
+    # EXCEPTION: a component may live at the repo root (component_path './'
+    # or '.') - its file is identified by matching the component's
+    # storage_size, and must NOT be skipped (e.g. abenzerps qwen21 turbo).
     if is_image_model(shard):
+        components = shard.model_card.components or []
+        root_component_sizes = {
+            c.storage_size.in_bytes
+            for c in components
+            if c.component_path in ("./", ".")
+        }
         filtered_file_list = [
             f
             for f in filtered_file_list
-            if "/" in f.path or not f.path.endswith(".safetensors")
+            if "/" in f.path
+            or not f.path.endswith(".safetensors")
+            or f.size in root_component_sizes
         ]
 
     # Pick a writable directory with enough free space.
