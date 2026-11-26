@@ -56,6 +56,12 @@ from exo.api.launch_profile import (
     remove_from_launch_profile,
     upsert_launch_profile,
 )
+from exo.api.sessions import (
+    SessionSnapshot,
+    delete_session,
+    load_sessions,
+    save_session,
+)
 from exo.api.types import (
     AddCustomModelParams,
     AdvancedImageParams,
@@ -537,6 +543,13 @@ class API:
         self.app.post("/instance/{instance_id}/load")(self.load_instance_weights)
         self.app.get("/launch-profile")(self.get_launch_profile)
         self.app.post("/launch-profile/restore")(self.restore_launch_profile)
+        self.app.post("/launch-profile/restore/{model_id}")(
+            self.restore_launch_profile_one
+        )
+        self.app.get("/v1/sessions")(self.get_sessions)
+        self.app.post("/v1/sessions")(self.create_session)
+        self.app.delete("/v1/sessions/{session_id}")(self.delete_saved_session)
+        self.app.post("/v1/sessions/{session_id}/launch")(self.launch_session_model)
         self.app.get("/v1/instance-links")(self.list_instance_links)
         self.app.post("/v1/instance-links")(self.create_instance_link)
         self.app.put("/v1/instance-links/{link_id}")(self.update_instance_link)
@@ -1066,6 +1079,104 @@ class API:
             )
             results.append({"model_id": entry.model_id, "action": "placed"})
         return {"results": results}
+
+    async def _launch_profile_entry(self, entry: LaunchProfileEntry) -> str:
+        """Place ONE launch-recipe entry with its saved settings. Returns the
+        action taken: "placed" or "already_running". Raises on failure."""
+        model_id = ModelId(entry.model_id)
+        if any(
+            instance.shard_assignments.model_id == model_id
+            for instance in self.state.instances.values()
+        ):
+            return "already_running"
+        await ModelCard.load(model_id)
+        effective_idle = (
+            entry.idle_unload_seconds
+            if entry.idle_unload_seconds is not None
+            else _env_idle_unload_seconds()
+        )
+        if effective_idle is not None:
+            self._pending_idle_policies[str(model_id)] = (
+                InstanceIdlePolicy(
+                    idle_unload_seconds=effective_idle,
+                    sharding=entry.sharding,
+                    instance_meta=entry.instance_meta,
+                    min_nodes=entry.min_nodes,
+                ),
+                time.time(),
+            )
+        await self._send(
+            PlaceInstance(
+                model_card=await ModelCard.load(model_id),
+                sharding=Sharding[entry.sharding],
+                instance_meta=InstanceMeta[entry.instance_meta],
+                min_nodes=entry.min_nodes,
+            )
+        )
+        logger.info(
+            f"Launch entry: placing {entry.model_id} "
+            f"({entry.sharding}/{entry.instance_meta}/{entry.min_nodes} nodes"
+            + (
+                f", idle_unload={effective_idle}s)"
+                if effective_idle is not None
+                else ")"
+            )
+        )
+        return "placed"
+
+    async def restore_launch_profile_one(self, model_id: str) -> dict[str, str]:
+        """Restore ONE model from the last session (launch profile) with its
+        saved settings — the one-by-one counterpart of restore_launch_profile."""
+        entry = self._launch_profile.get(model_id)
+        if entry is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Model {model_id} is not in the last session",
+            )
+        try:
+            action = await self._launch_profile_entry(entry)
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+        return {"model_id": model_id, "action": action}
+
+    async def get_sessions(self) -> dict[str, object]:
+        """Saved sessions + the auto-maintained last session (launch profile)."""
+        return {
+            "lastSession": {"entries": list(self._launch_profile.values())},
+            "sessions": load_sessions(),
+        }
+
+    async def create_session(self, payload: dict[str, str]) -> SessionSnapshot:
+        """Snapshot the current last-session entries under a user-chosen name."""
+        name = str(payload.get("name") or "").strip()
+        if not name:
+            raise HTTPException(status_code=400, detail="Session name is required")
+        sessions = save_session(name, list(self._launch_profile.values()))
+        return sessions[-1]
+
+    async def delete_saved_session(self, session_id: str) -> dict[str, object]:
+        sessions = delete_session(session_id)
+        return {"sessions": sessions}
+
+    async def launch_session_model(
+        self, session_id: str, payload: dict[str, str]
+    ) -> dict[str, str]:
+        """Launch ONE model from a saved session with its saved settings."""
+        session = next((s for s in load_sessions() if s.id == session_id), None)
+        if session is None:
+            raise HTTPException(status_code=404, detail="Session not found")
+        model_id = str(payload.get("model_id") or "")
+        entry = next((e for e in session.entries if e.model_id == model_id), None)
+        if entry is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Model {model_id} is not in session {session_id}",
+            )
+        try:
+            action = await self._launch_profile_entry(entry)
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+        return {"model_id": model_id, "action": action}
 
     async def get_feature_flags(self) -> dict[str, bool]:
         return {

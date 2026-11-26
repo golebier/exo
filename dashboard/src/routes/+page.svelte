@@ -88,6 +88,7 @@
   } from "$lib/stores/app.svelte";
   import { addToast, dismissByMessage } from "$lib/stores/toast.svelte";
   import HeaderNav from "$lib/components/HeaderNav.svelte";
+  import SessionRestorePanel from "$lib/components/SessionRestorePanel.svelte";
   import DeviceIcon from "$lib/components/DeviceIcon.svelte";
   import { fade, fly, slide } from "svelte/transition";
   import { tweened } from "svelte/motion";
@@ -7318,6 +7319,9 @@
                 {@render clusterWarningsCompact()}
               </div>
             </button>
+
+            <!-- Sessions: last session + saved sessions, launch one by one -->
+            <SessionRestorePanel instanceCount={Object.keys(instanceData).length} />
 
             <!-- Instances Section (only shown when instances exist) -->
             {#if instanceCount > 0}

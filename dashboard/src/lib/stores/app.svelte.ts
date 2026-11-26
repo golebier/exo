@@ -733,6 +733,13 @@ class AppStore {
   runners = $state<Record<string, unknown>>({});
   instanceLinks = $state<Record<string, RawInstanceLink>>({});
   featureFlags = $state<Record<string, boolean>>({});
+  sessions = $state<{
+    lastSession: { entries: SessionEntry[] };
+    sessions: SavedSession[];
+  }>({
+    lastSession: { entries: [] },
+    sessions: [],
+  });
   clusterSettings = $state<{
     memoryGuard: boolean;
     ramGuardPercent: number | null;
@@ -1480,6 +1487,7 @@ class AppStore {
     this.fetchState();
     this.fetchFeatureFlags();
     this.fetchClusterSettings();
+    this.fetchSessions();
     this.fetchAppVersion();
     this.fetchInterval = setInterval(() => this.fetchState(), 1000);
   }
@@ -1500,6 +1508,81 @@ class AppStore {
     } catch {
       // Silently ignore — defaults to all-disabled.
     }
+  }
+
+  async fetchSessions() {
+    try {
+      const response = await fetch("/v1/sessions");
+      if (!response.ok) return;
+      this.sessions = await response.json();
+    } catch {
+      // Silently ignore — defaults hold.
+    }
+  }
+
+  async launchSessionModel(
+    sessionId: string,
+    modelId: string,
+  ): Promise<{ model_id: string; action: string }> {
+    const response = await fetch(`/v1/sessions/${sessionId}/launch`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model_id: modelId }),
+    });
+    const result = (await response.json()) as {
+      model_id?: string;
+      action?: string;
+      detail?: string;
+    };
+    if (!response.ok) {
+      throw new Error(result.detail || `Launch failed: ${response.status}`);
+    }
+    return { model_id: modelId, action: result.action || "placed" };
+  }
+
+  async launchLastSessionModel(
+    modelId: string,
+  ): Promise<{ model_id: string; action: string }> {
+    const response = await fetch(
+      `/launch-profile/restore/${encodeURIComponent(modelId)}`,
+      { method: "POST" },
+    );
+    const result = (await response.json()) as {
+      model_id?: string;
+      action?: string;
+      detail?: string;
+    };
+    if (!response.ok) {
+      throw new Error(result.detail || `Launch failed: ${response.status}`);
+    }
+    return { model_id: modelId, action: result.action || "placed" };
+  }
+
+  async saveSession(name: string): Promise<unknown> {
+    const response = await fetch("/v1/sessions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name }),
+    });
+    if (!response.ok) {
+      throw new Error(
+        `Failed to save session: ${response.status} ${await response.text()}`,
+      );
+    }
+    await this.fetchSessions();
+    return await response.json();
+  }
+
+  async deleteSession(sessionId: string): Promise<void> {
+    const response = await fetch(`/v1/sessions/${sessionId}`, {
+      method: "DELETE",
+    });
+    if (!response.ok) {
+      throw new Error(
+        `Failed to delete session: ${response.status} ${await response.text()}`,
+      );
+    }
+    await this.fetchSessions();
   }
 
   async fetchClusterSettings() {
@@ -3964,6 +4047,27 @@ export const runners = () => appStore.runners;
 export const instanceLinks = () => appStore.instanceLinks;
 export const featureFlags = () => appStore.featureFlags;
 export const clusterSettings = () => appStore.clusterSettings;
+export const sessions = () => appStore.sessions;
+export const launchLastSessionModel = appStore.launchLastSessionModel.bind(appStore);
+export const launchSessionModel = appStore.launchSessionModel.bind(appStore);
+export const saveSession = appStore.saveSession.bind(appStore);
+export const deleteSession = appStore.deleteSession.bind(appStore);
+
+export interface SessionEntry {
+  model_id: string;
+  sharding: string;
+  instance_meta: string;
+  min_nodes: number;
+  idle_unload_seconds: number | null;
+  added_at: number;
+}
+
+export interface SavedSession {
+  id: string;
+  name: string;
+  created_at: number;
+  entries: SessionEntry[];
+}
 export const appVersion = () => appStore.appVersion;
 export const createInstanceLink = (
   prefillInstances: string[],
