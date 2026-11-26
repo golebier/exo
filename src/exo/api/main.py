@@ -15,7 +15,7 @@ from typing import Annotated, Any, Literal, cast
 from uuid import uuid4
 
 import anyio
-from anyio import BrokenResourceError, ClosedResourceError
+from anyio import BrokenResourceError, ClosedResourceError, fail_after
 from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
@@ -1856,6 +1856,31 @@ class API:
         scheme = "https" if request.url.scheme == "https" else "http"
         return f"{scheme}://{host}/v1/images/{image_id}"
 
+    async def _wait_for_loaded_instance(
+        self, model_id: ModelId, timeout_s: float = 120.0
+    ) -> None:
+        """Block until some instance of the model has live runners.
+
+        Used after the validate/re-place path so the master definitely sees
+        a usable instance when the generation command arrives. Raises 503
+        on timeout instead of hanging the client forever.
+        """
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            for instance_id, instance in self.state.instances.items():
+                if (
+                    instance.shard_assignments.model_id == model_id
+                    and instance_id not in self.state.instance_weights_unloaded
+                    and len(instance.shard_assignments.node_to_runner) > 0
+                ):
+                    return
+            await anyio.sleep(2)
+        raise HTTPException(
+            status_code=503,
+            detail=f"Model {model_id} did not get a loaded instance "
+            f"within {int(timeout_s)}s - try again shortly",
+        )
+
     async def image_generations(
         self, request: Request, payload: ImageGenerationTaskParams
     ) -> ImageGenerationResponse | StreamingResponse:
@@ -1872,6 +1897,15 @@ class API:
                 "advanced_params": _ensure_seed(payload.advanced_params),
             }
         )
+
+        # Cold-start race: _validate_model_has_instance may have just
+        # re-placed the model; the master applies PlaceInstance a moment
+        # later. Sending the ImageGeneration command immediately used to
+        # race the InstanceCreated event, hit "No instance found" in the
+        # master and silently drop the task while this handler waited on
+        # the chunk queue forever (observed on .174, 2026-11-26). Wait
+        # until a runner actually exists for the model.
+        await self._wait_for_loaded_instance(ModelId(payload.model))
 
         command = ImageGeneration(
             task_params=payload,
@@ -2034,36 +2068,46 @@ class API:
                 ImageChunk | ErrorChunk
             ]()
 
-            while images_complete < num_images:
-                with recv as chunks:
-                    async for chunk in chunks:
-                        if chunk.finish_reason == "error":
-                            raise HTTPException(
-                                status_code=500,
-                                detail=chunk.error_message or "Internal server error",
+            # Hard deadline: if the master drops the task (e.g. a race at
+            # placement time), this loop used to wait on the chunk channel
+            # forever and the HTTP client hung indefinitely. 900s matches
+            # the longest sane image batch.
+            with fail_after(900):
+                while images_complete < num_images:
+                    with recv as chunks:
+                        async for chunk in chunks:
+                            if chunk.finish_reason == "error":
+                                raise HTTPException(
+                                    status_code=500,
+                                    detail=chunk.error_message
+                                    or "Internal server error",
+                                )
+
+                            if chunk.is_partial:
+                                continue
+
+                            if chunk.image_index not in image_chunks:
+                                image_chunks[chunk.image_index] = {}
+                                image_total_chunks[chunk.image_index] = (
+                                    chunk.total_chunks
+                                )
+                                image_formats[chunk.image_index] = chunk.format
+
+                            image_chunks[chunk.image_index][chunk.chunk_index] = (
+                                chunk.data
                             )
 
-                        if chunk.is_partial:
-                            continue
+                            if capture_stats and chunk.stats is not None:
+                                stats = chunk.stats
 
-                        if chunk.image_index not in image_chunks:
-                            image_chunks[chunk.image_index] = {}
-                            image_total_chunks[chunk.image_index] = chunk.total_chunks
-                            image_formats[chunk.image_index] = chunk.format
+                            if (
+                                len(image_chunks[chunk.image_index])
+                                == image_total_chunks[chunk.image_index]
+                            ):
+                                images_complete += 1
 
-                        image_chunks[chunk.image_index][chunk.chunk_index] = chunk.data
-
-                        if capture_stats and chunk.stats is not None:
-                            stats = chunk.stats
-
-                        if (
-                            len(image_chunks[chunk.image_index])
-                            == image_total_chunks[chunk.image_index]
-                        ):
-                            images_complete += 1
-
-                        if images_complete >= num_images:
-                            break
+                            if images_complete >= num_images:
+                                break
 
             images: list[ImageData] = []
             for image_idx in range(num_images):
