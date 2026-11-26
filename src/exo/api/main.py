@@ -543,9 +543,6 @@ class API:
         self.app.post("/instance/{instance_id}/load")(self.load_instance_weights)
         self.app.get("/launch-profile")(self.get_launch_profile)
         self.app.post("/launch-profile/restore")(self.restore_launch_profile)
-        self.app.post("/launch-profile/restore/{model_id}")(
-            self.restore_launch_profile_one
-        )
         self.app.get("/v1/sessions")(self.get_sessions)
         self.app.post("/v1/sessions")(self.create_session)
         self.app.delete("/v1/sessions/{session_id}")(self.delete_saved_session)
@@ -1019,10 +1016,17 @@ class API:
     def get_launch_profile(self) -> dict[str, list[LaunchProfileEntry]]:
         return {"entries": list(self._launch_profile.values())}
 
-    async def restore_launch_profile(self) -> dict[str, list[dict[str, str]]]:
+    async def restore_launch_profile(
+        self, payload: dict[str, str] | None = None
+    ) -> dict[str, list[dict[str, str]]] | dict[str, str]:
         """One-click restore of the previous session: re-place every model in
         the durable launch profile that is not currently running, with the
-        exact sharding/instance_meta/min_nodes (and idle-unload policy) it had."""
+        exact sharding/instance_meta/min_nodes (and idle-unload policy) it had.
+        A JSON body {"model_id": "..."} launches only that one entry."""
+        if payload and payload.get("model_id"):
+            return await self.restore_launch_profile_one(
+                str(payload["model_id"])
+            )
         results: list[dict[str, str]] = []
         for entry in list(self._launch_profile.values()):
             model_id = ModelId(entry.model_id)

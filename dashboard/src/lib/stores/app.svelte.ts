@@ -1543,10 +1543,11 @@ class AppStore {
   async launchLastSessionModel(
     modelId: string,
   ): Promise<{ model_id: string; action: string }> {
-    const response = await fetch(
-      `/launch-profile/restore/${encodeURIComponent(modelId)}`,
-      { method: "POST" },
-    );
+    const response = await fetch("/launch-profile/restore", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model_id: modelId }),
+    });
     const result = (await response.json()) as {
       model_id?: string;
       action?: string;
