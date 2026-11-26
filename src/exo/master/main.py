@@ -694,11 +694,17 @@ class Master:
                 )
 
             # RAM guard sweeper: when a node's RAM usage crosses the guard
-            # threshold, free the weights of the least-recently-active loaded
-            # instance on that node (one per tick — the next tick re-checks
-            # with fresh memory numbers). This is the last line of defense
-            # against a reload/large-model fit thrashing the node into a
-            # swap storm that takes the whole machine down.
+            # threshold, DESTROY the largest instance on that node (one per
+            # tick — the next tick re-reads memory and destroys the next if
+            # still over). Destroying (deleting the whole instance, not just
+            # unloading its weights) is deliberate: the runner process is
+            # killed outright and its memory is guaranteed released, while
+            # an idle-unload relies on a graceful runner shutdown that can
+            # leave the node at high RAM. Busy instances are victims of last
+            # resort — machine survival beats an in-flight generation. This
+            # is the last line of defense against a reload/large-model fit
+            # thrashing the node into a swap storm that takes the whole
+            # machine down.
             guard_percent = self.state.ram_guard_percent
             if guard_percent is not None:
                 node_busy: dict[InstanceId, bool] = {
@@ -718,38 +724,39 @@ class Master:
                     used_pct = (total - available) / total * 100
                     if used_pct < guard_percent:
                         continue
-                    # Victim: largest loaded instance on this node that has
-                    # no in-flight task (unloading mid-generation would crash
-                    # the worker). Unloaded instances are not candidates.
-                    victims: list[tuple[int, InstanceId]] = []
+                    # Victim: the largest loaded instance hosted on this
+                    # node; unloaded instances are not candidates. Prefer a
+                    # victim with no in-flight task, but if every loaded
+                    # instance is busy, destroy the largest anyway.
+                    candidates: list[tuple[bool, int, InstanceId]] = []
                     for instance_id, instance in self.state.instances.items():
                         if instance_id in self.state.instance_weights_unloaded:
                             continue
                         if node_id not in instance.shard_assignments.node_to_runner:
                             continue
-                        if node_busy.get(instance_id, False):
-                            continue
                         card = card_cache.get(instance.shard_assignments.model_id)
                         size = card.storage_size.in_bytes if card else 0
-                        victims.append((size, instance_id))
-                    if not victims:
+                        candidates.append(
+                            (node_busy.get(instance_id, False), size, instance_id)
+                        )
+                    if not candidates:
                         logger.warning(
                             f"RAM guard: node {node_id} at {used_pct:.0f}% RAM "
-                            "but no safely unloadable instance found"
+                            "but no loaded instance to destroy"
                         )
                         continue
-                    victims.sort(reverse=True)
-                    victim_id = victims[0][1]
+                    candidates.sort(key=lambda c: (c[0], -c[1]))
+                    victim_busy, victim_size, victim_id = candidates[0]
                     victim_model = str(
                         self.state.instances[victim_id].shard_assignments.model_id
                     )
                     logger.warning(
                         f"RAM guard: node {node_id} at {used_pct:.0f}% RAM "
-                        f"(threshold {guard_percent}%) - unloading {victim_model} "
-                        f"({victim_id})"
-                    )
-                    await self.event_sender.send(
-                        InstanceWeightsUnloaded(instance_id=victim_id)
+                        f"(threshold {guard_percent}%) - destroying instance "
+                        f"{victim_model} ({victim_id}, "
+                        f"{victim_size / 2**30:.0f} GiB"
+                        + (", busy" if victim_busy else "")
+                        + ")"
                     )
                     await self.event_sender.send(
                         InstanceLifecycleRecorded(
@@ -762,7 +769,8 @@ class Master:
                             ts=time.time(),
                         )
                     )
-                    break  # one unload per tick; next tick re-reads memory
+                    await self.event_sender.send(InstanceDeleted(instance_id=victim_id))
+                    break  # one destroy per tick; next tick re-reads memory
 
             # Converge zombie instances: an instance whose every host node
             # has left the topology can never run again, but it also never

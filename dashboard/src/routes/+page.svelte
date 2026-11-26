@@ -1002,7 +1002,7 @@
     }
   }
 
-  // RAM guard state (cluster-level; master unloads weights at threshold)
+  // RAM guard state (cluster-level; master destroys largest instances at threshold)
   let ramGuardSaving = $state(false);
   let ramGuardValue = $state<number | null>(null);
   let ramGuardLoaded = $state(false);
@@ -6571,9 +6571,11 @@
                       class="text-[10px] text-white/40 font-mono mt-1.5 leading-snug"
                     >
                       When a node's RAM usage hits this percent, the master
-                      unloads its idlest large models one at a time until
-                      usage falls below. Prevents reloads from thrashing the
-                      machine into a swap storm. Off = never auto-unload.
+                      DESTROYS its largest instances (highest memory first,
+                      one per cycle) until usage falls below. Destruction is
+                      guaranteed to free RAM - the runner process is killed
+                      outright, not gracefully unloaded. Busy instances are
+                      killed last. Off = never auto-destroy.
                     </div>
                   </div>
 
