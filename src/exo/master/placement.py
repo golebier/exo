@@ -316,10 +316,12 @@ def delete_instance(
     current_instances: Mapping[InstanceId, Instance],
 ) -> dict[InstanceId, Instance]:
     target_instances = dict(deepcopy(current_instances))
-    if command.instance_id in target_instances:
-        del target_instances[command.instance_id]
-        return target_instances
-    raise ValueError(f"Instance {command.instance_id} not found")
+    # Idempotent: deleting an already-deleted instance must be a no-op, not
+    # an error. Retry loops and flapping clients can deliver the same
+    # deletion repeatedly; a raise here aborts the command processor's
+    # current batch and makes the deletion loop never converge.
+    target_instances.pop(command.instance_id, None)
+    return target_instances
 
 
 def get_transition_events(

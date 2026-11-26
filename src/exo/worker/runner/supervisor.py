@@ -11,6 +11,8 @@ from anyio import (
     BrokenResourceError,
     CancelScope,
     ClosedResourceError,
+    WouldBlock,
+    current_time,
 )
 from loguru import logger
 
@@ -304,17 +306,35 @@ class RunnerSupervisor:
             self.cancelled.add(task_id)
             return
         self.cancelled.add(task_id)
-        with anyio.move_on_after(0.5) as scope:
+        # Cancelling is best-effort: the cancel queue only backs up while the
+        # runner is mid-generation, and it drains as soon as the runner's
+        # cancel loop reads again. A blocked send must NEVER escalate to a
+        # runner restart — retry with backoff instead, dropping the cancel
+        # if the task completes or the queue stays blocked. A stale cancel
+        # is harmless; killing a healthy runner is not.
+        deadline = current_time() + 30.0
+        delay = 0.05
+        while True:
+            if task_id in self.completed:
+                return
             try:
-                await self._cancel_sender.send_async(task_id)
+                self._cancel_sender.send_nowait(task_id)
+                return
+            except WouldBlock:
+                if current_time() >= deadline:
+                    logger.error(
+                        f"RunnerSupervisor cancel queue blocked for 30s, "
+                        f"dropping cancel for {task_id}"
+                    )
+                    return
+                await anyio.sleep(delay)
+                delay = min(delay * 2, 1.0)
             except ClosedResourceError:
                 # typically occurs when trying to shut down a failed instance
                 logger.warning(
                     f"Cancelling task {task_id} failed, runner closed communication"
                 )
-        if scope.cancel_called:
-            logger.error("RunnerSupervisor cancel pipe blocked")
-            await self._check_runner(TimeoutError("cancel pipe blocked"))
+                return
 
     async def _forward_events(self):
         try:

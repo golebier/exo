@@ -9,13 +9,12 @@ from queue import Empty, Full
 from types import CoroutineType, TracebackType
 from typing import Any, Callable, NoReturn, Self, cast, overload, override
 
+import anyio
 from anyio import (
     BrokenResourceError,
-    CapacityLimiter,
     ClosedResourceError,
     EndOfStream,
     WouldBlock,
-    to_thread,
 )
 from anyio.streams.memory import (
     MemoryObjectReceiveStream as AnyioReceiver,
@@ -267,9 +266,20 @@ class MpSender[T]:
             self._state.buffer.put(item, block=True)
 
     async def send_async(self, item: T) -> None:
-        await to_thread.run_sync(
-            self.send, item, limiter=CapacityLimiter(1), abandon_on_cancel=True
-        )
+        # Poll instead of parking a worker thread: a blocked send must stay
+        # cancellable and must never hold a shared thread-pool token for the
+        # duration of the block (abandoned run_sync calls keep their thread
+        # running and starve the pool for everything else on the process).
+        # mp.Queue.put with an unbounded buffer only blocks in pathological
+        # cases, so the ramping sleep is a safety valve, not the hot path.
+        delay = 0.005
+        while True:
+            try:
+                self.send_nowait(item)
+                return
+            except WouldBlock:
+                await anyio.sleep(delay)
+                delay = min(delay * 2, 0.1)
 
     def close(self) -> None:
         if not self._state.closed.is_set():
@@ -314,16 +324,18 @@ class MpReceiver[T]:
     _state: MpState[T] = field()
 
     def receive_nowait(self) -> T:
-        if self._state.closed.is_set():
-            raise ClosedResourceError
-
         try:
+            # Drain buffered items even when the sender has already closed —
+            # close() appends the end-of-stream marker AFTER whatever was
+            # queued, so buffered messages must still come out first.
             item = self._state.buffer.get(block=False)
             if isinstance(item, _MpEndOfStream):
                 self.close()
                 raise EndOfStream
             return item
         except Empty:
+            if self._state.closed.is_set():
+                raise ClosedResourceError from None
             raise WouldBlock from None
         except ValueError as e:
             print("Unreachable code path - let me know!")
@@ -346,9 +358,17 @@ class MpReceiver[T]:
             return item
 
     async def receive_async(self) -> T:
-        return await to_thread.run_sync(
-            self.receive, limiter=CapacityLimiter(1), abandon_on_cancel=True
-        )
+        # Poll instead of parking a worker thread on mp.Queue.get(): a receive
+        # that waits for the next item must not consume a shared thread-pool
+        # token indefinitely (see send_async note). Event latency stays low
+        # via the ramping sleep (1 ms floor, 100 ms ceiling).
+        delay = 0.001
+        while True:
+            try:
+                return self.receive_nowait()
+            except WouldBlock:
+                await anyio.sleep(delay)
+                delay = min(delay * 2, 0.1)
 
     def close(self) -> None:
         if not self._state.closed.is_set():

@@ -8,7 +8,7 @@ from subprocess import CalledProcessError
 from typing import Self, cast
 
 import anyio
-from anyio import fail_after, open_process, to_thread
+from anyio import CapacityLimiter, fail_after, open_process, to_thread
 from anyio.streams.buffered import BufferedByteReceiveStream
 from loguru import logger
 from pydantic import ValidationError
@@ -41,6 +41,12 @@ from .system_info import (
 )
 
 IS_DARWIN = sys.platform == "darwin"
+
+# Gathers must never depend on the process-wide anyio thread pool: when other
+# subsystems starve it, every monitor loop times out at once, gathered-info
+# events stop flowing, and the master treats the node as stale. Keep the
+# blocking gather work on a small dedicated limiter instead.
+_GATHER_POOL = CapacityLimiter(4)
 
 
 async def _get_thunderbolt_devices() -> set[str] | None:
@@ -329,7 +335,7 @@ class NodeDiskUsage(TaggedModel):
     async def gather(cls) -> Self:
         return cls(
             disk_usage=await to_thread.run_sync(
-                DiskUsage.from_path, EXO_DEFAULT_MODELS_DIR
+                DiskUsage.from_path, EXO_DEFAULT_MODELS_DIR, limiter=_GATHER_POOL
             )
         )
 

@@ -82,7 +82,11 @@ from exo.shared.types.tasks import (
 from exo.shared.types.tasks import (
     TextGeneration as TextGenerationTask,
 )
-from exo.shared.types.worker.instances import InstanceId
+from exo.shared.types.worker.instances import (
+    InstanceId,
+    MlxJacclInstance,
+    MlxRingInstance,
+)
 from exo.utils.channels import Receiver, Sender
 from exo.utils.disk_event_log import DiskEventLog
 from exo.utils.event_buffer import MultiSourceBuffer
@@ -157,6 +161,13 @@ class Master:
         self._pending_traces: dict[TaskId, dict[int, list[TraceEventData]]] = {}
         self._expected_ranks: dict[TaskId, set[int]] = {}
         self._idle_last_activity: dict[InstanceId, float] = {}
+        # Consecutive stale observations per node before removal. A single
+        # stale window is not enough: a transient gather stall (thread-pool
+        # starvation, short GC pause, busy subprocess) can exceed one window
+        # while the node is otherwise healthy. Removing on the first miss
+        # causes node flapping — the node re-registers on the next gather,
+        # its instances resurrect, and any pending deletions loop forever.
+        self._node_stale_strikes: dict[NodeId, int] = {}
 
     async def run(self):
         logger.info("Starting Master")
@@ -664,12 +675,46 @@ class Master:
                     )
                 )
 
+            # Converge zombie instances: an instance whose every host node
+            # has left the topology can never run again, but it also never
+            # times out on its own — it resurrects whenever a stale worker
+            # re-registers, and any pending deletion loops forever. Delete
+            # it directly so state converges even if command processing is
+            # degraded. Idle-unloaded instances keep their hosts and are
+            # untouched by this check. NOTE: the "kill broken instances"
+            # block above only inspects nodes that still hold runners
+            # (node_to_runner); this block covers instances whose hosts are
+            # entirely gone, including ones never re-assigned after flap.
+            topology_nodes = set(self.state.topology.list_nodes())
+            for instance_id, instance in self.state.instances.items():
+                match instance:
+                    case MlxRingInstance():
+                        host_nodes = set(instance.hosts_by_node.keys())
+                    case MlxJacclInstance():
+                        host_nodes = set(instance.jaccl_coordinators.keys())
+                if not host_nodes & topology_nodes:
+                    logger.warning(
+                        f"Deleting zombie instance {instance_id} — all host "
+                        f"nodes {host_nodes} are absent from the topology"
+                    )
+                    await self.event_sender.send(
+                        InstanceDeleted(instance_id=instance_id)
+                    )
+
             # time out dead nodes
             for node_id, last_seen in self.state.last_seen.items():
                 now = datetime.now(tz=timezone.utc)
                 if now - last_seen > timedelta(seconds=30):
-                    logger.info(f"Manually removing node {node_id} due to inactivity")
-                    await self.event_sender.send(NodeTimedOut(node_id=node_id))
+                    strikes = self._node_stale_strikes.get(node_id, 0) + 1
+                    self._node_stale_strikes[node_id] = strikes
+                    if strikes >= 6:
+                        logger.info(
+                            f"Manually removing node {node_id} due to inactivity "
+                            f"(stale for {strikes} consecutive windows)"
+                        )
+                        await self.event_sender.send(NodeTimedOut(node_id=node_id))
+                else:
+                    self._node_stale_strikes.pop(node_id, None)
 
             await anyio.sleep(10)
 

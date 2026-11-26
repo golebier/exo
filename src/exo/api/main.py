@@ -5,6 +5,7 @@ import json
 import os
 import random
 import time
+from collections import deque
 from collections.abc import AsyncGenerator, Awaitable, Callable, Iterable
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -334,6 +335,63 @@ def _env_idle_unload_seconds() -> int | None:
     return value if value >= 5 else None
 
 
+def _client_key(request: Request) -> str:
+    """Stable per-client key for rate limiting (proxy-aware)."""
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+def _env_probe_rpm_limit() -> int:
+    """Per-client rate limit (requests/minute) for tiny non-streaming requests.
+
+    Health-probe style clients (``max_tokens`` <= 4, non-streaming) that poll
+    every few seconds can pile thousands of start-then-cancel generations on
+    a loaded model, starving every other task. After ``EXO_PROBE_RPM``
+    probe-shaped requests within a 60 s window from one client, further ones
+    get 429 + Retry-Until. ``0`` disables the guard entirely.
+    """
+    raw = os.environ.get("EXO_PROBE_RPM")
+    if raw is None or raw == "":
+        return 12
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 12
+
+
+class _ProbeRateGuard:
+    """Rolling per-client window over probe-shaped chat requests."""
+
+    WINDOW_SECONDS = 60.0
+
+    def __init__(self, limit: int) -> None:
+        self._limit = limit
+        self._hits: dict[str, deque[float]] = {}
+
+    def is_probe(self, payload_max_tokens: int | None, stream: bool) -> bool:
+        return not stream and payload_max_tokens is not None and payload_max_tokens <= 4
+
+    def check(self, client_key: str, now: float) -> tuple[bool, int]:
+        """Returns (allowed, retry_after_seconds)."""
+        if self._limit <= 0:
+            return True, 0
+        window = self._hits.setdefault(client_key, deque())
+        cutoff = now - self.WINDOW_SECONDS
+        while window and window[0] < cutoff:
+            window.popleft()
+        if len(window) >= self._limit:
+            retry_after = int(self.WINDOW_SECONDS - (now - window[0])) + 1
+            return False, max(retry_after, 1)
+        window.append(now)
+        # Opportunistic cleanup so idle clients don't accumulate.
+        if len(self._hits) > 512:
+            for key in [k for k, w in self._hits.items() if not w]:
+                self._hits.pop(key, None)
+        return True, 0
+
+
 class API:
     def __init__(
         self,
@@ -367,6 +425,8 @@ class API:
         self._command_inflight_usage: dict[CommandId, _CommandInflightUsage] = {}
         # Durable lifetime totals (survive restarts / instance recreation).
         self._lifetime_usage: dict[str, _LifetimeUsage] = self._load_lifetime_usage()
+        # Per-client guard against tiny health-probe request storms.
+        self._probe_guard = _ProbeRateGuard(_env_probe_rpm_limit())
 
         self.paused: bool = False
         self.paused_ev: anyio.Event = anyio.Event()
@@ -1355,6 +1415,19 @@ class API:
         self, payload: ChatCompletionRequest, request: Request
     ) -> ChatCompletionResponse | StreamingResponse:
         """OpenAI Chat Completions API - adapter."""
+        if self._probe_guard.is_probe(payload.max_tokens, bool(payload.stream)):
+            allowed, retry_after = self._probe_guard.check(
+                _client_key(request), time.time()
+            )
+            if not allowed:
+                raise HTTPException(
+                    status_code=429,
+                    detail=(
+                        "Too many tiny non-streaming requests from this client; "
+                        "slow down or raise max_tokens"
+                    ),
+                    headers={"Retry-After": str(retry_after)},
+                )
         session_id = self._session_id_from_request(request)
         task_params = await chat_request_to_text_generation(payload)
         validated_model = await self._validate_model_has_instance(task_params.model)
@@ -2474,6 +2547,25 @@ class API:
     async def get_models(self, status: str | None = Query(default=None)) -> ModelList:
         """Returns list of available models, optionally filtered by being downloaded."""
         cards = await model_cards.card_cache.list_all()
+
+        # Always list models that are actually serving: a running instance's
+        # card can be absent from the card cache (e.g. a custom card that
+        # never synced to this node), and clients rely on this listing to
+        # decide whether a model is usable. A serving model missing from
+        # /v1/models makes pollers treat the backend as not-ready.
+        serving_cards: dict[str, ModelCard] = {}
+        for instance in self.state.instances.values():
+            for shard in instance.shard_assignments.runner_to_shard.values():
+                serving_cards.setdefault(
+                    str(shard.model_card.model_id), shard.model_card
+                )
+        if status != "downloaded":
+            cached_ids = {str(card.model_id) for card in cards}
+            cards = list(cards) + [
+                card
+                for model_id, card in sorted(serving_cards.items())
+                if model_id not in cached_ids
+            ]
 
         if status == "downloaded":
             downloaded_model_ids: set[str] = set()
