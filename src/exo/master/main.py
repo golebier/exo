@@ -72,19 +72,21 @@ from exo.shared.types.instance_lifecycle import InstanceUnloadReason
 from exo.shared.types.instance_link import InstanceLink
 from exo.shared.types.state import State
 from exo.shared.types.tasks import (
+    DownloadModel,
+    Shutdown,
+    TaskId,
+    TaskStatus,
+)
+from exo.shared.types.tasks import (
     ImageEdits as ImageEditsTask,
 )
 from exo.shared.types.tasks import (
     ImageGeneration as ImageGenerationTask,
 )
 from exo.shared.types.tasks import (
-    Shutdown,
-    TaskId,
-    TaskStatus,
-)
-from exo.shared.types.tasks import (
     TextGeneration as TextGenerationTask,
 )
+from exo.shared.types.worker.downloads import DownloadCompleted
 from exo.shared.types.worker.instances import (
     InstanceId,
     MlxJacclInstance,
@@ -672,6 +674,17 @@ class Master:
                         break
 
             # idle-unload sweeper: free the weights of idle instances
+            # Models whose transfer already finished (DownloadCompleted in
+            # state.downloads): a DownloadModel task stuck in Running after
+            # a lost status event must not count as usage below, or the
+            # idle clock never starts and the instance never unloads
+            # (observed on .174, 2026-11-26).
+            completed_download_models = {
+                dp.shard_metadata.model_card.model_id
+                for dps in self.state.downloads.values()
+                for dp in dps
+                if isinstance(dp, DownloadCompleted)
+            }
             for instance_id in list(self.state.instances):
                 if instance_id in self.state.instance_weights_unloaded:
                     # Already unloaded (weights are back only after an
@@ -693,6 +706,11 @@ class Master:
                     task.instance_id == instance_id
                     and task.task_status in (TaskStatus.Pending, TaskStatus.Running)
                     and not isinstance(task, Shutdown)
+                    and not (
+                        isinstance(task, DownloadModel)
+                        and task.shard_metadata.model_card.model_id
+                        in completed_download_models
+                    )
                     for task in self.state.tasks.values()
                 )
                 if busy:

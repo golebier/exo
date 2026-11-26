@@ -51,9 +51,9 @@ from exo.shared.types.profiling import (
     ThunderboltBridgeStatus,
 )
 from exo.shared.types.state import State
-from exo.shared.types.tasks import Task, TaskId, TaskStatus
+from exo.shared.types.tasks import DownloadModel, Task, TaskId, TaskStatus
 from exo.shared.types.topology import Connection, RDMAConnection
-from exo.shared.types.worker.downloads import DownloadProgress
+from exo.shared.types.worker.downloads import DownloadCompleted, DownloadProgress
 from exo.shared.types.worker.instances import Instance, InstanceId
 from exo.shared.types.worker.runners import (
     RunnerId,
@@ -188,7 +188,32 @@ def apply_node_download_progress(event: NodeDownloadProgress, state: State) -> S
         **state.downloads,
         node_id: current,
     }
-    return state.model_copy(update={"downloads": new_downloads})
+
+    # A DownloadCompleted progress means the transfer is finished, but the
+    # DownloadModel task that requested it is only completed by the worker
+    # when the model was ALREADY fully on disk before the task ran. When the
+    # model went through a real download, the coordinator's completion event
+    # used to leave the task Running forever - which made the idle-unload
+    # sweeper's busy check reset the idle clock every tick, so the instance
+    # could never unload (observed on .174, 2026-11-26). Complete the task
+    # here; this is deterministic on event-log replay.
+    new_tasks = state.tasks
+    if isinstance(dp, DownloadCompleted):
+        completed: dict[TaskId, Task] = {}
+        for tid, task in state.tasks.items():
+            if (
+                task.task_status in (TaskStatus.Running, TaskStatus.Pending)
+                and isinstance(task, DownloadModel)
+                and task.shard_metadata.model_card.model_id
+                == dp.shard_metadata.model_card.model_id
+            ):
+                completed[tid] = task.model_copy(
+                    update={"task_status": TaskStatus.Complete}
+                )
+        if completed:
+            new_tasks = {**state.tasks, **completed}
+
+    return state.model_copy(update={"downloads": new_downloads, "tasks": new_tasks})
 
 
 def apply_task_created(event: TaskCreated, state: State) -> State:
