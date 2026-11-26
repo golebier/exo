@@ -733,6 +733,17 @@ class AppStore {
   runners = $state<Record<string, unknown>>({});
   instanceLinks = $state<Record<string, RawInstanceLink>>({});
   featureFlags = $state<Record<string, boolean>>({});
+  clusterSettings = $state<{
+    memoryGuard: boolean;
+    ramGuardPercent: number | null;
+    turboquant: { enabled: boolean; bits: number; skipLast: boolean };
+    tieredCache: { enabled: boolean };
+  }>({
+    memoryGuard: false,
+    ramGuardPercent: null,
+    turboquant: { enabled: false, bits: 4, skipLast: true },
+    tieredCache: { enabled: false },
+  });
   appVersion = $state<string>("");
   downloads = $state<Record<string, unknown[]>>({});
   nodeDisk = $state<
@@ -1468,6 +1479,7 @@ class AppStore {
   startPolling() {
     this.fetchState();
     this.fetchFeatureFlags();
+    this.fetchClusterSettings();
     this.fetchAppVersion();
     this.fetchInterval = setInterval(() => this.fetchState(), 1000);
   }
@@ -1487,6 +1499,16 @@ class AppStore {
       this.featureFlags = await response.json();
     } catch {
       // Silently ignore — defaults to all-disabled.
+    }
+  }
+
+  async fetchClusterSettings() {
+    try {
+      const response = await fetch("/v1/cluster-settings");
+      if (!response.ok) return;
+      this.clusterSettings = await response.json();
+    } catch {
+      // Silently ignore — defaults hold.
     }
   }
 
@@ -3941,6 +3963,7 @@ export const instanceSessionUsage = () => appStore.rawSessionUsage;
 export const runners = () => appStore.runners;
 export const instanceLinks = () => appStore.instanceLinks;
 export const featureFlags = () => appStore.featureFlags;
+export const clusterSettings = () => appStore.clusterSettings;
 export const appVersion = () => appStore.appVersion;
 export const createInstanceLink = (
   prefillInstances: string[],

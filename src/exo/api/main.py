@@ -542,6 +542,7 @@ class API:
         self.app.put("/v1/instance-links/{link_id}")(self.update_instance_link)
         self.app.delete("/v1/instance-links/{link_id}")(self.delete_instance_link)
         self.app.get("/v1/feature-flags")(self.get_feature_flags)
+        self.app.get("/v1/cluster-settings")(self.get_cluster_settings)
         self.app.put("/v1/memory-guard")(self.set_memory_guard)
         self.app.get("/v1/ram-guard")(self.get_ram_guard)
         self.app.put("/v1/ram-guard")(self.set_ram_guard)
@@ -1072,6 +1073,18 @@ class API:
             "prefillMemoryGuard": memory_guard.is_guard_enabled(),
             "turboquantKv": turboquant.is_turboquant_enabled(),
             "tieredKvCache": turboquant.is_tiered_cache_enabled(),
+        }
+
+    async def get_cluster_settings(self) -> dict[str, object]:
+        """Live snapshot of the cluster-level guard/KV-cache settings for the
+        dashboard per-instance badges (one fetch instead of four)."""
+        return {
+            "memoryGuard": memory_guard.is_guard_enabled(),
+            "ramGuardPercent": self.state.ram_guard_percent,
+            "turboquant": turboquant.turboquant_settings(),
+            "tieredCache": {
+                "enabled": turboquant.is_tiered_cache_enabled(),
+            },
         }
 
     async def get_ram_guard(self) -> dict[str, int | None]:

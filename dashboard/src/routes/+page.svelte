@@ -77,6 +77,7 @@
     nodeIdentities,
     isConnected,
     featureFlags,
+    clusterSettings,
     setMemoryGuard, setRamGuard,
     setTurboQuant,
     setTieredCache,
@@ -1045,6 +1046,33 @@
   let turboquantBits = $state<number>(4);
   let turboquantSkipLast = $state<boolean>(true);
   const turboquantEnabled = $derived(featureFlags()["turboquantKv"] === true);
+
+  // Per-instance settings badges (cluster-level settings, live via /v1/cluster-settings):
+  const instanceSettingsBadges = $derived.by(() => {
+    const badges: { label: string; title: string; on: boolean }[] = [];
+    const cs = clusterSettings();
+    badges.push({
+      label: cs.memoryGuard ? "MemGuard ON" : "MemGuard OFF",
+      title: "Prefill memory guard (cluster-level)",
+      on: cs.memoryGuard,
+    });
+    badges.push({
+      label: cs.ramGuardPercent != null ? `RAM ${cs.ramGuardPercent}%` : "RAM Guard OFF",
+      title: "RAM guard unload threshold (cluster-level)",
+      on: cs.ramGuardPercent != null,
+    });
+    badges.push({
+      label: cs.turboquant.enabled ? `TQ KV ${cs.turboquant.bits}b` : "TQ KV OFF",
+      title: "TurboQuant KV cache compression (applies on next model load)",
+      on: cs.turboquant.enabled,
+    });
+    badges.push({
+      label: cs.tieredCache.enabled ? "Tiered KV ON" : "Tiered KV OFF",
+      title: "Tiered KV cache (Hot RAM / Cold SSD)",
+      on: cs.tieredCache.enabled,
+    });
+    return badges;
+  });
 
   function loadTurboQuantDefaults(): TurboQuantDefaults {
     try {
@@ -5657,6 +5685,14 @@
                           <span
                             >{instanceInfo.sharding} &middot; {instanceInfo.instanceType}</span
                           >
+                          {#each instanceSettingsBadges as badge (badge.label)}
+                            <span
+                              class="px-1.5 py-0.5 text-[10px] tracking-wider uppercase rounded {badge.on
+                                ? 'bg-exo-yellow/10 text-exo-yellow/80'
+                                : 'bg-white/5 text-white/25'}"
+                              title={badge.title}>{badge.label}</span
+                            >
+                          {/each}
                           <span
                             class="px-1.5 py-0.5 text-[10px] tracking-wider uppercase rounded transition-all duration-300 {isDownloading
                               ? 'bg-blue-500/15 text-blue-400'
@@ -7444,6 +7480,14 @@
                             <span
                               >{instanceInfo.sharding} &middot; {instanceInfo.instanceType}</span
                             >
+                            {#each instanceSettingsBadges as badge (badge.label)}
+                              <span
+                                class="px-1.5 py-0.5 text-[10px] tracking-wider uppercase rounded {badge.on
+                                  ? 'bg-exo-yellow/10 text-exo-yellow/80'
+                                  : 'bg-white/5 text-white/25'}"
+                                title={badge.title}>{badge.label}</span
+                              >
+                            {/each}
                             <span
                               class="px-1.5 py-0.5 text-[10px] tracking-wider uppercase rounded transition-all duration-300 {isDownloading
                                 ? 'bg-blue-500/15 text-blue-400'
