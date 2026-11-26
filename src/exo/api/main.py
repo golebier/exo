@@ -1748,7 +1748,20 @@ class API:
             instance.instance_id not in self.state.instance_weights_unloaded
             for instance in matching
         ):
-            if matching and await self._replace_idle_unloaded(model_id):
+            if matching:
+                # Reload the EXISTING unloaded instance(s) instead of
+                # re-placing a fresh one: the instance record keeps its
+                # shard assignments, RDMA links and idle policy, so all
+                # per-model settings survive the reload. Creating a new
+                # instance per cold request used to both lose those
+                # settings and pile up zombie instance records
+                # (observed on .174, 2026-11-26). The caller waits for a
+                # live runner via _wait_for_loaded_instance.
+                for instance in matching:
+                    if instance.instance_id in self.state.instance_weights_unloaded:
+                        await self._send(
+                            LoadInstanceWeights(instance_id=instance.instance_id)
+                        )
                 return model_id
             if not matching:
                 # Auto re-place after an idle unload: the model is downloaded and
