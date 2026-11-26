@@ -357,6 +357,13 @@ class InstanceLinkBody(BaseModel):
     decode_instances: list[InstanceId]
 
 
+class RamGuardSetting(BaseModel):
+    """Cluster-wide RAM guard: unload instance weights on a node when its RAM
+    usage reaches this percent, until it falls below. None disables."""
+
+    percent: int | None = Field(default=None, ge=50, le=99)
+
+
 class MemoryGuardSetting(BaseModel):
     """Body for the runtime prefill-memory-guard toggle (task #11)."""
 

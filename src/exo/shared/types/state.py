@@ -55,6 +55,10 @@ class State(FrozenModel):
     instance_idle_policies: Mapping[InstanceId, InstanceIdlePolicy] = {}
     # Lifecycle load/unload counters keyed by "Type::model_id" (durable-style).
     instance_lifecycle: Mapping[str, InstanceLifecycleStats] = {}
+    # Cluster-wide RAM guard: when a node's RAM usage reaches this percent,
+    # the master unloads the least-recently-active loaded instances on that
+    # node until usage falls below the threshold. None = disabled.
+    ram_guard_percent: int | None = None
     # Instances whose weights were unloaded (idle sweeper / manual). The
     # instance record itself stays in `instances`; value = unload reason.
     instance_weights_unloaded: Mapping[InstanceId, str] = {}

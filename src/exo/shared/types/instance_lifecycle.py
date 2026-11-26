@@ -37,4 +37,5 @@ class InstanceUnloadReason:
     IDLE_UNLOAD = "idle_unload"
     IDLE_RELOAD = "idle_reload"
     MANUAL = "manual"
+    RAM_GUARD = "ram_guard"
     ERROR = "error"

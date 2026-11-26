@@ -77,7 +77,7 @@
     nodeIdentities,
     isConnected,
     featureFlags,
-    setMemoryGuard,
+    setMemoryGuard, setRamGuard,
     setTurboQuant,
     setTieredCache,
     fetchTieredCacheStatus,
@@ -999,6 +999,34 @@
       await setMemoryGuard(!memoryGuardEnabled);
     } finally {
       memoryGuardSaving = false;
+    }
+  }
+
+  // RAM guard state (cluster-level; master unloads weights at threshold)
+  let ramGuardSaving = $state(false);
+  let ramGuardValue = $state<number | null>(null);
+  let ramGuardLoaded = $state(false);
+  async function loadRamGuard() {
+    if (ramGuardLoaded) return;
+    try {
+      const r = await fetch("/v1/ram-guard");
+      if (r.ok) {
+        const j = await r.json();
+        ramGuardValue = j.ramGuardPercent ?? null;
+      }
+    } finally {
+      ramGuardLoaded = true;
+    }
+  }
+  loadRamGuard();
+  async function saveRamGuard(val: number | null) {
+    if (ramGuardSaving) return;
+    ramGuardSaving = true;
+    try {
+      await setRamGuard(val);
+      ramGuardValue = val;
+    } finally {
+      ramGuardSaving = false;
     }
   }
 
@@ -6509,6 +6537,43 @@
                       <code class="text-exo-yellow/80"
                         >EXO_MEMORY_GUARD_TIER</code
                       >.
+                    </div>
+                  </div>
+
+                  <!-- RAM guard (cluster-wide; protects the node) -->
+                  <div>
+                    <div class="text-xs text-white/50 font-mono mb-2">
+                      RAM Guard:
+                    </div>
+                    <div class="flex gap-2 items-center">
+                      {#each [80, 85, 90, 95] as pct (pct)}
+                        <button
+                          onclick={() => saveRamGuard(pct)}
+                          disabled={ramGuardSaving}
+                          class="py-1.5 px-3 text-xs font-mono border rounded transition-all duration-200 cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed {ramGuardValue === pct
+                            ? 'bg-exo-yellow text-black border-exo-yellow font-bold'
+                            : 'bg-transparent text-white/70 border-exo-medium-gray/50 hover:border-exo-yellow/50'}"
+                        >
+                          {pct}%
+                        </button>
+                      {/each}
+                      <button
+                        onclick={() => saveRamGuard(null)}
+                        disabled={ramGuardSaving}
+                        class="py-1.5 px-3 text-xs font-mono border rounded transition-all duration-200 cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed {ramGuardValue === null
+                          ? 'bg-exo-yellow text-black border-exo-yellow font-bold'
+                          : 'bg-transparent text-white/70 border-exo-medium-gray/50 hover:border-exo-yellow/50'}"
+                      >
+                        Off
+                      </button>
+                    </div>
+                    <div
+                      class="text-[10px] text-white/40 font-mono mt-1.5 leading-snug"
+                    >
+                      When a node's RAM usage hits this percent, the master
+                      unloads its idlest large models one at a time until
+                      usage falls below. Prevents reloads from thrashing the
+                      machine into a swap storm. Off = never auto-unload.
                     </div>
                   </div>
 

@@ -3721,6 +3721,24 @@ class AppStore {
   }
 
   /**
+   * Cluster-wide RAM guard: master unloads loaded instance weights on a node
+   * whose RAM usage reaches `percent` (percent=0/null disables). Setting
+   * persists in event-sourced state, so it survives restarts.
+   */
+  async setRamGuard(percent: number | null): Promise<void> {
+    const response = await fetch(`${this.baseUrl}/v1/ram-guard`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ percent }),
+    });
+    if (!response.ok) {
+      throw new Error(
+        `Failed to set ram guard: ${response.status} ${await response.text()}`,
+      );
+    }
+  }
+
+  /**
    * Runtime-toggle TurboQuant KV-cache compression (#07). Mirrors oMLX's
    * ``turboquant_kv_enabled`` / ``turboquant_kv_bits`` / ``turboquant_skip_last``.
    * Takes effect on the next model load. Refetches feature flags so the UI
@@ -3937,6 +3955,8 @@ export const deleteInstanceLink = (linkId: string) =>
   appStore.deleteInstanceLink(linkId);
 export const setMemoryGuard = (enabled: boolean) =>
   appStore.setMemoryGuard(enabled);
+export const setRamGuard = (percent: number | null) =>
+  appStore.setRamGuard(percent);
 export const setIdleUnload = (
   instanceId: string,
   idleUnloadSeconds: number | null,

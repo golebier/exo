@@ -61,6 +61,13 @@ class SetInstanceIdlePolicy(BaseCommand):
     policy: InstanceIdlePolicy
 
 
+class SetRamGuard(BaseCommand):
+    """Set the cluster-wide RAM guard threshold (percent of RAM used at which
+    the master starts unloading model weights). None disables the guard."""
+
+    percent: int | None
+
+
 class TaskCancelled(BaseCommand):
     cancelled_command_id: CommandId
 
@@ -126,6 +133,7 @@ Command = (
     | DeleteInstance
     | LoadInstanceWeights
     | SetInstanceIdlePolicy
+    | SetRamGuard
     | TaskCancelled
     | TaskFinished
     | SendInputChunk

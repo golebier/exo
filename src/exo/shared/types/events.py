@@ -97,6 +97,12 @@ class InstanceIdlePolicySet(BaseEvent):
     policy: InstanceIdlePolicy
 
 
+class RamGuardSet(BaseEvent):
+    """Cluster-wide RAM guard threshold set (percent used -> unload weights)."""
+
+    percent: int | None
+
+
 class InstanceLifecycleRecorded(BaseEvent):
     """A load or unload of an instance, for the durable lifecycle ledger.
 
@@ -214,6 +220,7 @@ Event = (
     | InstanceDeleted
     | InstanceTokensUpdated
     | InstanceIdlePolicySet
+    | RamGuardSet
     | InstanceLifecycleRecorded
     | InstanceWeightsUnloaded
     | InstanceWeightsLoadRequested

@@ -18,6 +18,7 @@ from exo.routing.event_router import (
 )
 from exo.shared.apply import apply
 from exo.shared.constants import EXO_EVENT_LOG_DIR, EXO_TRACING_ENABLED
+from exo.shared.models.model_cards import card_cache
 from exo.shared.types.commands import (
     AddCustomModelCard,
     CreateInstance,
@@ -34,6 +35,7 @@ from exo.shared.types.commands import (
     SendInputChunk,
     SetInstanceIdlePolicy,
     SetInstanceLink,
+    SetRamGuard,
     TaskCancelled,
     TaskFinished,
     TestCommand,
@@ -58,6 +60,7 @@ from exo.shared.types.events import (
     LocalForwarderEvent,
     NodeGatheredInfo,
     NodeTimedOut,
+    RamGuardSet,
     TaskCreated,
     TaskDeleted,
     TaskStatusUpdated,
@@ -521,6 +524,10 @@ class Master:
                                     policy=command.policy,
                                 )
                             )
+                        case SetRamGuard():
+                            generated_events.append(
+                                RamGuardSet(percent=command.percent)
+                            )
                         case RequestEventLog():
                             # We should just be able to send everything, since other buffers will ignore old messages
                             # rate limit to 1000 at a time
@@ -685,6 +692,77 @@ class Master:
                         ts=time.time(),
                     )
                 )
+
+            # RAM guard sweeper: when a node's RAM usage crosses the guard
+            # threshold, free the weights of the least-recently-active loaded
+            # instance on that node (one per tick — the next tick re-checks
+            # with fresh memory numbers). This is the last line of defense
+            # against a reload/large-model fit thrashing the node into a
+            # swap storm that takes the whole machine down.
+            guard_percent = self.state.ram_guard_percent
+            if guard_percent is not None:
+                node_busy: dict[InstanceId, bool] = {
+                    instance_id: any(
+                        task.instance_id == instance_id
+                        and task.task_status in (TaskStatus.Pending, TaskStatus.Running)
+                        and not isinstance(task, Shutdown)
+                        for task in self.state.tasks.values()
+                    )
+                    for instance_id in self.state.instances
+                }
+                for node_id, mem in list(self.state.node_memory.items()):
+                    total = mem.ram_total.in_bytes
+                    available = mem.ram_available.in_bytes
+                    if total <= 0:
+                        continue
+                    used_pct = (total - available) / total * 100
+                    if used_pct < guard_percent:
+                        continue
+                    # Victim: largest loaded instance on this node that has
+                    # no in-flight task (unloading mid-generation would crash
+                    # the worker). Unloaded instances are not candidates.
+                    victims: list[tuple[int, InstanceId]] = []
+                    for instance_id, instance in self.state.instances.items():
+                        if instance_id in self.state.instance_weights_unloaded:
+                            continue
+                        if node_id not in instance.shard_assignments.node_to_runner:
+                            continue
+                        if node_busy.get(instance_id, False):
+                            continue
+                        card = card_cache.get(instance.shard_assignments.model_id)
+                        size = card.storage_size.in_bytes if card else 0
+                        victims.append((size, instance_id))
+                    if not victims:
+                        logger.warning(
+                            f"RAM guard: node {node_id} at {used_pct:.0f}% RAM "
+                            "but no safely unloadable instance found"
+                        )
+                        continue
+                    victims.sort(reverse=True)
+                    victim_id = victims[0][1]
+                    victim_model = str(
+                        self.state.instances[victim_id].shard_assignments.model_id
+                    )
+                    logger.warning(
+                        f"RAM guard: node {node_id} at {used_pct:.0f}% RAM "
+                        f"(threshold {guard_percent}%) - unloading {victim_model} "
+                        f"({victim_id})"
+                    )
+                    await self.event_sender.send(
+                        InstanceWeightsUnloaded(instance_id=victim_id)
+                    )
+                    await self.event_sender.send(
+                        InstanceLifecycleRecorded(
+                            model_id=victim_model,
+                            instance_type=type(
+                                self.state.instances[victim_id]
+                            ).__name__,
+                            phase="unload",
+                            reason=InstanceUnloadReason.RAM_GUARD,
+                            ts=time.time(),
+                        )
+                    )
+                    break  # one unload per tick; next tick re-reads memory
 
             # Converge zombie instances: an instance whose every host node
             # has left the topology can never run again, but it also never

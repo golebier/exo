@@ -100,6 +100,7 @@ from exo.api.types import (
     PlaceInstanceParams,
     PlacementPreview,
     PlacementPreviewResponse,
+    RamGuardSetting,
     SetIdleUnloadParams,
     StartDownloadParams,
     StartDownloadResponse,
@@ -187,6 +188,7 @@ from exo.shared.types.commands import (
     SendInputChunk,
     SetInstanceIdlePolicy,
     SetInstanceLink,
+    SetRamGuard,
     StartDownload,
     TaskCancelled,
     TaskFinished,
@@ -541,6 +543,8 @@ class API:
         self.app.delete("/v1/instance-links/{link_id}")(self.delete_instance_link)
         self.app.get("/v1/feature-flags")(self.get_feature_flags)
         self.app.put("/v1/memory-guard")(self.set_memory_guard)
+        self.app.get("/v1/ram-guard")(self.get_ram_guard)
+        self.app.put("/v1/ram-guard")(self.set_ram_guard)
         self.app.put("/v1/turboquant")(self.set_turboquant)
         self.app.put("/v1/tiered-cache")(self.set_tiered_cache)
         self.app.get("/v1/tiered-cache")(self.get_tiered_cache)
@@ -1069,6 +1073,15 @@ class API:
             "turboquantKv": turboquant.is_turboquant_enabled(),
             "tieredKvCache": turboquant.is_tiered_cache_enabled(),
         }
+
+    async def get_ram_guard(self) -> dict[str, int | None]:
+        return {"ramGuardPercent": self.state.ram_guard_percent}
+
+    async def set_ram_guard(self, body: RamGuardSetting) -> dict[str, int | None]:
+        await self._send(SetRamGuard(percent=body.percent))
+        # Optimistic local update; event-sourced state converges to it.
+        self.state = self.state.model_copy(update={"ram_guard_percent": body.percent})
+        return {"ramGuardPercent": body.percent}
 
     async def set_memory_guard(self, body: MemoryGuardSetting) -> dict[str, bool]:
         """Runtime toggle for the prefill memory guard (task #11).

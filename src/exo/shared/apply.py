@@ -25,6 +25,7 @@ from exo.shared.types.events import (
     NodeDownloadProgress,
     NodeGatheredInfo,
     NodeTimedOut,
+    RamGuardSet,
     RunnerStatusUpdated,
     TaskAcknowledged,
     TaskCreated,
@@ -113,6 +114,8 @@ def event_apply(event: Event, state: State) -> State:
             return apply_instance_tokens_updated(event, state)
         case InstanceIdlePolicySet():
             return apply_instance_idle_policy_set(event, state)
+        case RamGuardSet():
+            return apply_ram_guard_set(event, state)
         case InstanceLifecycleRecorded():
             return apply_instance_lifecycle_recorded(event, state)
         case InstanceWeightsUnloaded():
@@ -572,6 +575,10 @@ def apply_instance_idle_policy_set(event: InstanceIdlePolicySet, state: State) -
         event.instance_id: event.policy,
     }
     return state.model_copy(update={"instance_idle_policies": new_policies})
+
+
+def apply_ram_guard_set(event: RamGuardSet, state: State) -> State:
+    return state.model_copy(update={"ram_guard_percent": event.percent})
 
 
 def apply_instance_weights_unloaded(
