@@ -270,11 +270,18 @@ class Master:
                             )
                             self.command_task_mapping[command.command_id] = task_id
                         case ImageGeneration():
+                            unloaded_match = False
                             for instance in self.state.instances.values():
                                 if (
                                     instance.shard_assignments.model_id
                                     == command.task_params.model
                                 ):
+                                    if (
+                                        instance.instance_id
+                                        in self.state.instance_weights_unloaded
+                                    ):
+                                        unloaded_match = True
+                                        continue
                                     in_flight = {TaskStatus.Pending, TaskStatus.Running}
                                     task_count = sum(
                                         1
@@ -287,9 +294,13 @@ class Master:
                                     )
 
                             if not instance_task_counts:
-                                await self._reload_unloaded_for_model(
-                                    command.task_params.model
-                                )
+                                # Unloaded instances still have records in state, so an
+                                # unloaded match must trigger a reload here or requests
+                                # will be pinned to a zombie instance forever.
+                                if unloaded_match:
+                                    await self._reload_unloaded_for_model(
+                                        command.task_params.model
+                                    )
                                 raise ValueError(
                                     f"No instance found for model {command.task_params.model}"
                                 )

@@ -1721,24 +1721,37 @@ class API:
 
         Raises HTTPException 404 if no instance is found for the model.
         """
-        if not any(
-            instance.shard_assignments.model_id == model_id
+        matching = [
+            instance
             for instance in self.state.instances.values()
+            if instance.shard_assignments.model_id == model_id
+        ]
+        # An idle-unloaded instance still has a record in state, but its
+        # weights are gone and its runner is shut down — assigning a task to
+        # it pins the request to a zombie forever. Only LOADED instances
+        # satisfy validation; unloaded-only falls through to the re-place
+        # path below (or a fast 404 — never an infinite wait).
+        if not any(
+            instance.instance_id not in self.state.instance_weights_unloaded
+            for instance in matching
         ):
-            # Auto re-place after an idle unload: the model is downloaded and
-            # we captured its placement parameters when the policy was set, so
-            # transparently re-place instead of 404-ing the request.
-            if await self._replace_idle_unloaded(model_id):
+            if matching and await self._replace_idle_unloaded(model_id):
                 return model_id
-            # Check if model is actually downloaded
-            model_is_downloaded = any(
-                isinstance(download, DownloadCompleted)
-                and download.shard_metadata.model_card.model_id == model_id
-                for node_downloads in self.state.downloads.values()
-                for download in node_downloads
-            )
-            if not model_is_downloaded:
-                await self._trigger_notify_user_to_download_model(model_id)
+            if not matching:
+                # Auto re-place after an idle unload: the model is downloaded and
+                # we captured its placement parameters when the policy was set, so
+                # transparently re-place instead of 404-ing the request.
+                if await self._replace_idle_unloaded(model_id):
+                    return model_id
+                # Check if model is actually downloaded
+                model_is_downloaded = any(
+                    isinstance(download, DownloadCompleted)
+                    and download.shard_metadata.model_card.model_id == model_id
+                    for node_downloads in self.state.downloads.values()
+                    for download in node_downloads
+                )
+                if not model_is_downloaded:
+                    await self._trigger_notify_user_to_download_model(model_id)
 
             raise HTTPException(
                 status_code=404, detail=f"No instance found for model {model_id}"
