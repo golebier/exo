@@ -616,18 +616,47 @@ class Master:
         once the weights are resident again. The event is sent directly —
         a fail-fast raise must never swallow it.
         """
+        # Memory preflight: a blind auto-reload is exactly how a swap storm
+        # starts - loading tens of GB into a node that has no headroom
+        # thrashes macOS into swapping out sshd/launchd and wedges the whole
+        # machine. Only reload if every host node would stay under the cap
+        # (the RAM guard threshold if set, else a conservative 90%). The
+        # caller still fails the request fast; once memory is freed the
+        # retry succeeds.
+        reload_cap = self.state.ram_guard_percent or 90
         for instance_id, instance in self.state.instances.items():
             if (
-                instance.shard_assignments.model_id == model_id
-                and instance_id in self.state.instance_weights_unloaded
+                instance.shard_assignments.model_id != model_id
+                or instance_id not in self.state.instance_weights_unloaded
             ):
-                logger.info(
-                    f"Auto-reloading unloaded instance {instance_id} for {model_id}"
-                )
-                await self.event_sender.send(
-                    InstanceWeightsLoadRequested(instance_id=instance_id)
-                )
-                return
+                continue
+            card = card_cache.get(instance.shard_assignments.model_id)
+            size = card.storage_size.in_bytes if card else 0
+            blocked = False
+            for node_id in instance.shard_assignments.node_to_runner:
+                mem = self.state.node_memory.get(node_id)
+                if mem is None or mem.ram_total.in_bytes <= 0:
+                    continue
+                total = mem.ram_total.in_bytes
+                used = total - mem.ram_available.in_bytes
+                projected_pct = (used + size) / total * 100
+                if projected_pct > reload_cap:
+                    logger.warning(
+                        f"Refusing auto-reload of {model_id} ({instance_id}) "
+                        f"on node {node_id}: projected {projected_pct:.0f}% "
+                        f"RAM (cap {reload_cap}%) - free memory first"
+                    )
+                    blocked = True
+                    break
+            if blocked:
+                continue
+            logger.info(
+                f"Auto-reloading unloaded instance {instance_id} for {model_id}"
+            )
+            await self.event_sender.send(
+                InstanceWeightsLoadRequested(instance_id=instance_id)
+            )
+            return
 
     # These plan loops are the cracks showing in our event sourcing architecture - more things could be commands
     async def _plan(self) -> None:
