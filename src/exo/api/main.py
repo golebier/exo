@@ -1780,9 +1780,26 @@ class API:
         it also re-arms the idle-unload policy for the new instance.
         """
         pending = self._pending_idle_policies.get(str(model_id))
-        if pending is None:
-            return False
-        policy, _sent_at = pending
+        if pending is not None:
+            policy, _sent_at = pending
+        else:
+            # The pending policy was consumed when the instance was created;
+            # the durable copy lives in state.instance_idle_policies (per
+            # instance). Without this fallback a cold request right after an
+            # idle unload 404s instead of transparently re-placing
+            # (observed on .174, 2026-11-26).
+            policy = next(
+                (
+                    p
+                    for iid, p in self.state.instance_idle_policies.items()
+                    if iid in self.state.instances
+                    and str(self.state.instances[iid].shard_assignments.model_id)
+                    == str(model_id)
+                ),
+                None,
+            )
+            if policy is None:
+                return False
         await self._send(
             PlaceInstance(
                 model_card=await ModelCard.load(model_id),
