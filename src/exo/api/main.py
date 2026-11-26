@@ -1800,6 +1800,14 @@ class API:
             )
             if policy is None:
                 return False
+            # Re-arm the pending policy: it was consumed when the original
+            # instance was created, and without it the re-placed instance
+            # would get no SetInstanceIdlePolicy and never idle-unload
+            # (observed on .174, 2026-11-26).
+            self._pending_idle_policies[str(model_id)] = (
+                policy,
+                time.time(),
+            )
         await self._send(
             PlaceInstance(
                 model_card=await ModelCard.load(model_id),
