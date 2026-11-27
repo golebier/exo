@@ -6982,19 +6982,11 @@
               {/if}
             </div>
 
-            <!-- Restore last session (launch profile) -->
-            {#if launchProfileEntries().length > 0}
-              <button
-                class="w-full flex items-center justify-center gap-2 px-4 py-3 font-mono text-sm tracking-[0.2em] uppercase border border-exo-yellow/40 text-exo-yellow hover:bg-exo-yellow/10 hover:border-exo-yellow/70 transition-all duration-200 cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
-                onclick={restoreLastSession}
-                disabled={restoringSession}
-                title="Re-create every instance from the previous session with the same settings (sharding, instance type, node count, idle-unload)"
-              >
-                {restoringSession
-                  ? "Restoring..."
-                  : `LAUNCH LAST SESSION (${launchProfileEntries().length})`}
-              </button>
-            {/if}
+            <!-- Sessions: last session + saved sessions, per-model checkboxes,
+                 launch ONE BY ONE or the checked set sequentially -->
+            <SessionRestorePanel
+              instanceCount={Object.keys(instanceData).length}
+            />
 
             <!-- Selected Model Preview -->
             <div class="space-y-3">
